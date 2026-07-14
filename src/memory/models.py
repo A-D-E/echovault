@@ -55,6 +55,19 @@ class RawMemoryInput:
     last_verified: Optional[str] = None
 
 
+@dataclass(frozen=True)
+class MemoryOperation:
+    """Immutable provenance record for a memory operation."""
+
+    operation_id: str
+    source: Optional[str]
+    action: str
+    request_fingerprint: str
+    timestamp: str
+    branch: Optional[str] = None
+    commit_sha: Optional[str] = None
+
+
 @dataclass
 class Memory:
     """A memory record with all metadata and references."""
@@ -85,6 +98,13 @@ class Memory:
     branch: Optional[str] = None
     links: list[str] = field(default_factory=list)
     last_verified: Optional[str] = None
+    creator_source: Optional[str] = None
+    last_updated_by: Optional[str] = None
+    contributors: list[str] = field(default_factory=list)
+    operations: list[MemoryOperation] = field(default_factory=list)
+    content_fingerprint: Optional[str] = None
+    history_complete: bool = True
+    updated_count: int = 0
 
     @staticmethod
     def from_raw(raw: RawMemoryInput, project: str, file_path: str = "") -> Memory:
@@ -116,6 +136,13 @@ class Memory:
             confidence=raw.confidence, valid_from=raw.valid_from,
             valid_until=raw.valid_until, commit_sha=raw.commit_sha,
             branch=raw.branch, links=raw.links, last_verified=raw.last_verified,
+            creator_source=raw.source,
+            last_updated_by=raw.source,
+            contributors=[raw.source] if raw.source else [],
+            operations=[],
+            content_fingerprint=None,
+            history_complete=True,
+            updated_count=0,
         )
 
 

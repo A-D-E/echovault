@@ -2,13 +2,79 @@
 
 import os
 import tempfile
+from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
-from memory.markdown import render_section, write_session_memory
-from memory.models import Memory
+from memory.markdown import (
+    SessionDocument,
+    SessionEntry,
+    parse_session_file,
+    render_section,
+    render_session_document,
+    write_session_memory,
+)
+from memory.models import Memory, MemoryOperation
+
+
+def document_with(memory: Memory) -> SessionDocument:
+    """Build a one-entry schema-v2 document for rendering tests."""
+    return SessionDocument(
+        project=memory.project,
+        created=memory.created_at,
+        tags=memory.tags,
+        sources=[memory.source] if memory.source else [],
+        title="2026-07-14 Session",
+        entries=[
+            SessionEntry(
+                id=memory.id,
+                title=memory.title,
+                what=memory.what,
+                why=memory.why,
+                impact=memory.impact,
+                source=memory.source,
+                details=None,
+                category=memory.category,
+                status=memory.status,
+                archived_at=memory.archived_at,
+                archive_reason=memory.archive_reason,
+                superseded_by=memory.superseded_by,
+                section_anchor=memory.section_anchor,
+                metadata={
+                    "project": memory.project,
+                    "tags": memory.tags,
+                    "category": memory.category,
+                    "related_files": memory.related_files,
+                    "section_anchor": memory.section_anchor,
+                    "created_at": memory.created_at,
+                    "updated_at": memory.updated_at,
+                    "status": memory.status,
+                    "archived_at": memory.archived_at,
+                    "archive_reason": memory.archive_reason,
+                    "superseded_by": memory.superseded_by,
+                    "structured_data": memory.structured_data,
+                    "confidence": memory.confidence,
+                    "valid_from": memory.valid_from,
+                    "valid_until": memory.valid_until,
+                    "commit_sha": memory.commit_sha,
+                    "branch": memory.branch,
+                    "links": memory.links,
+                    "last_verified": memory.last_verified,
+                    "creator_source": memory.creator_source,
+                    "last_updated_by": memory.last_updated_by,
+                    "contributors": memory.contributors,
+                    "operations": [asdict(operation) for operation in memory.operations],
+                    "content_fingerprint": memory.content_fingerprint,
+                    "history_complete": memory.history_complete,
+                    "updated_count": memory.updated_count,
+                },
+                metadata_complete=True,
+            )
+        ],
+        schema_version=2,
+    )
 
 
 @pytest.fixture
@@ -359,3 +425,123 @@ tags: [legacy]
         content = file_path.read_text(encoding="utf-8")
         assert "старый текст" in content
         assert "новый текст — ✓" in content
+
+
+def test_schema_v2_round_trip_preserves_every_memory_field(
+    tmp_path: Path, sample_memory: Memory
+) -> None:
+    details = "Context:\n\nExact details body."
+    sample_memory.project = "api--111111111111"
+    sample_memory.source = "cursor"
+    sample_memory.category = "decision"
+    sample_memory.tags = ["API", "validation"]
+    sample_memory.related_files = ["src/api/routes.py"]
+    sample_memory.created_at = "2026-07-14T10:00:00+00:00"
+    sample_memory.updated_at = "2026-07-14T11:00:00+00:00"
+    sample_memory.status = "archived"
+    sample_memory.archived_at = "2026-07-14T11:30:00+00:00"
+    sample_memory.archive_reason = "superseded"
+    sample_memory.superseded_by = "memory-2"
+    sample_memory.structured_data = {
+        "constraints": ["Never expose internal models"],
+        "steps": ["Validate output"],
+    }
+    sample_memory.confidence = 0.95
+    sample_memory.valid_from = "2026-07-14"
+    sample_memory.valid_until = "2027-07-14"
+    sample_memory.commit_sha = "abc123"
+    sample_memory.branch = "main"
+    sample_memory.links = ["https://example.test/decision"]
+    sample_memory.last_verified = "2026-07-14T10:30:00+00:00"
+    sample_memory.creator_source = "cursor"
+    sample_memory.last_updated_by = "gemini-cli"
+    sample_memory.contributors = ["cursor", "gemini-cli"]
+    sample_memory.content_fingerprint = "sha256:abc"
+    sample_memory.history_complete = False
+    sample_memory.updated_count = 1
+    sample_memory.operations = [
+        MemoryOperation(
+            operation_id="op-1",
+            source="cursor",
+            action="created",
+            request_fingerprint="req-1",
+            timestamp="2026-07-14T10:00:00+00:00",
+            branch="main",
+            commit_sha="abc123",
+        )
+    ]
+
+    path = Path(
+        write_session_memory(str(tmp_path), sample_memory, "2026-07-14", details=details)
+    )
+    parsed = parse_session_file(path)
+
+    assert parsed.schema_version == 2
+    entry = parsed.entries[0]
+    assert entry.metadata_complete is True
+    assert set(entry.metadata) == {
+        "project",
+        "tags",
+        "category",
+        "related_files",
+        "section_anchor",
+        "created_at",
+        "updated_at",
+        "status",
+        "archived_at",
+        "archive_reason",
+        "superseded_by",
+        "structured_data",
+        "confidence",
+        "valid_from",
+        "valid_until",
+        "commit_sha",
+        "branch",
+        "links",
+        "last_verified",
+        "creator_source",
+        "last_updated_by",
+        "contributors",
+        "operations",
+        "content_fingerprint",
+        "history_complete",
+        "updated_count",
+    }
+    expected = replace(
+        sample_memory,
+        file_path=str(path),
+        section_anchor=entry.metadata["section_anchor"],
+    )
+    assert asdict(entry.to_memory(file_path=str(path))) == asdict(expected)
+    assert entry.details == details
+
+
+def test_schema_v2_metadata_comment_escapes_comment_terminators(
+    sample_memory: Memory,
+) -> None:
+    sample_memory.structured_data = {"constraint": "never emit -- inside comments"}
+
+    rendered = render_session_document(document_with(sample_memory))
+    metadata_line = next(
+        line
+        for line in rendered.splitlines()
+        if line.startswith("<!-- echovault-metadata-v2:")
+    )
+
+    assert "-- inside" not in metadata_line
+    assert "\\u002d\\u002d inside" in metadata_line
+
+
+def test_schema_v1_remains_readable_but_incomplete(tmp_path: Path) -> None:
+    path = tmp_path / "2026-07-14-session.md"
+    path.write_text(
+        "---\nproject: legacy\ntags: [one]\n---\n\n"
+        "# Session\n\n### Old\n**What:** readable\n",
+        encoding="utf-8",
+    )
+
+    parsed = parse_session_file(path)
+
+    assert parsed.schema_version == 1
+    assert parsed.entries[0].what == "readable"
+    assert parsed.entries[0].metadata_complete is False
