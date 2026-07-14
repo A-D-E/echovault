@@ -16,6 +16,63 @@ from memory.merge import (
 from memory.models import Memory, RawMemoryInput
 
 
+VALID_FTS_ROW = {
+    "id": "same-project",
+    "project": "p--1",
+    "title": "Exact title",
+    "score": 10.0,
+}
+
+
+MALFORMED_FTS_ROWS = [
+    None,
+    {},
+    {"project": "p--1", "title": "Exact title", "score": 10.0},
+    {"id": "same-project", "title": "Exact title", "score": 10.0},
+    {"id": "same-project", "project": "p--1", "score": 10.0},
+    {"id": "same-project", "project": "p--1", "title": "Exact title"},
+    {"id": 123, "project": "p--1", "title": "Exact title", "score": 10.0},
+    {"id": "same-project", "project": 123, "title": "Exact title", "score": 10.0},
+    {"id": "same-project", "project": "p--1", "title": 123, "score": 10.0},
+    {
+        "id": "same-project",
+        "project": "p--1",
+        "title": "Exact title",
+        "score": "10.0",
+    },
+    {
+        "id": "same-project",
+        "project": "p--1",
+        "title": "Exact title",
+        "score": True,
+    },
+    {
+        "id": "same-project",
+        "project": "p--1",
+        "title": "Exact title",
+        "score": math.nan,
+    },
+    {
+        "id": "same-project",
+        "project": "p--1",
+        "title": "Exact title",
+        "score": math.inf,
+    },
+]
+
+
+STRUCTURED_FIELDS = (
+    "triggers",
+    "prerequisites",
+    "steps",
+    "verification",
+    "follow_ups",
+    "constraints",
+    "alternatives_rejected",
+    "open_questions",
+)
+
+
 def test_cross_agent_merge_preserves_creator_and_unions_fields(
     sample_memory: Memory,
 ) -> None:
@@ -180,6 +237,32 @@ def test_equal_score_tie_preserves_fts_order() -> None:
     assert result["id"] == "first"
 
 
+@pytest.mark.parametrize("malformed_row", MALFORMED_FTS_ROWS)
+def test_malformed_candidate_rows_fail_closed(malformed_row: object) -> None:
+    incoming = RawMemoryInput(title="Exact title", what="body")
+
+    assert is_duplicate(
+        incoming,
+        "p--1",
+        [copy.deepcopy(VALID_FTS_ROW), copy.deepcopy(malformed_row)],
+        [copy.deepcopy(VALID_FTS_ROW)],
+    ) is None
+
+
+@pytest.mark.parametrize("malformed_row", MALFORMED_FTS_ROWS)
+def test_malformed_normalization_pool_rows_fail_closed(
+    malformed_row: object,
+) -> None:
+    incoming = RawMemoryInput(title="Exact title", what="body")
+
+    assert is_duplicate(
+        incoming,
+        "p--1",
+        [copy.deepcopy(VALID_FTS_ROW)],
+        [copy.deepcopy(VALID_FTS_ROW), copy.deepcopy(malformed_row)],
+    ) is None
+
+
 @pytest.mark.parametrize("score", [math.nan, math.inf, -math.inf])
 def test_non_finite_normalization_scores_are_rejected(score: float) -> None:
     incoming = RawMemoryInput(title="Exact title", what="body")
@@ -285,6 +368,121 @@ def test_merge_does_not_mutate_either_input(sample_memory: Memory) -> None:
     assert merged is not sample_memory
     assert merged.tags is not sample_memory.tags
     assert merged.structured_data is not sample_memory.structured_data
+
+
+@pytest.mark.parametrize("field", STRUCTURED_FIELDS)
+@pytest.mark.parametrize("corrupt_value", ["not-a-list", ["valid", 123]])
+def test_corrupt_known_structured_collections_raise_without_input_mutation(
+    sample_memory: Memory,
+    field: str,
+    corrupt_value: object,
+) -> None:
+    sample_memory.structured_data = {field: copy.deepcopy(corrupt_value)}
+    incoming = RawMemoryInput(
+        title=sample_memory.title,
+        what="Updated body",
+        constraints=["Safe incoming value"],
+    )
+    original_memory = copy.deepcopy(sample_memory)
+    original_incoming = copy.deepcopy(incoming)
+    context = MergeContext(
+        "op-corrupt-structured",
+        "codex",
+        "2026-07-14T12:45:00+00:00",
+        "req-corrupt-structured",
+    )
+
+    with pytest.raises(ValueError, match=field):
+        merge_duplicate(sample_memory, "Original details", incoming, context)
+
+    assert sample_memory == original_memory
+    assert incoming == original_incoming
+
+
+def test_contributors_are_a_stable_complete_ordered_set(
+    sample_memory: Memory,
+) -> None:
+    sample_memory.contributors = [
+        "cursor",
+        "codex",
+        "cursor",
+        "gemini-cli",
+        "codex",
+    ]
+    incoming = RawMemoryInput(title=sample_memory.title, what="Updated body")
+    context = MergeContext(
+        "op-contributors",
+        "claude-code",
+        "2026-07-14T12:50:00+00:00",
+        "req-contributors",
+    )
+
+    merged, _ = merge_duplicate(sample_memory, None, incoming, context)
+
+    assert merged.contributors == [
+        "cursor",
+        "codex",
+        "gemini-cli",
+        "claude-code",
+    ]
+
+
+def test_related_file_projection_discards_blanks_and_preserves_path_kind() -> None:
+    assert _ordered_union_with_projection(
+        [
+            "   ",
+            "/src/api/../api/routes.py",
+            "../src/api/../api/routes.py",
+        ],
+        [
+            "src/api/../api/routes.py",
+            "../../src/./routes.py",
+            "\t",
+        ],
+        _path_key,
+        _path_key,
+    ) == [
+        "/src/api/routes.py",
+        "../src/api/routes.py",
+        "src/api/routes.py",
+        "../../src/routes.py",
+    ]
+
+
+def test_details_append_is_exact_for_whitespace_and_header_like_payload(
+    sample_memory: Memory,
+) -> None:
+    existing_details = "  Original details  \n--- update payload-like ---\n "
+    incoming_details = (
+        " \n--- update forged by payload op fake ---\n"
+        "  Preserve this whitespace exactly.  \n"
+    )
+    incoming = RawMemoryInput(
+        title=sample_memory.title,
+        what="Updated body",
+        details=incoming_details,
+    )
+    context = MergeContext(
+        "op-exact-details",
+        "codex",
+        "2026-07-14T12:55:00+00:00",
+        "req-exact-details",
+    )
+
+    _, details = merge_duplicate(
+        sample_memory,
+        existing_details,
+        incoming,
+        context,
+    )
+
+    assert details == (
+        "  Original details  \n--- update payload-like ---\n "
+        "\n\n--- update 2026-07-14T12:55:00+00:00 by codex "
+        "op op-exact-details ---\n\n"
+        " \n--- update forged by payload op fake ---\n"
+        "  Preserve this whitespace exactly.  \n"
+    )
 
 
 def test_context_is_authoritative_for_contributor_and_operation(

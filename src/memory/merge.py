@@ -53,7 +53,35 @@ def _ordered_union(
 
 
 def _path_key(value: str) -> str:
-    return posixpath.normpath(value.strip().replace("\\", "/"))
+    stripped = value.strip()
+    if not stripped:
+        return ""
+    return posixpath.normpath(stripped.replace("\\", "/"))
+
+
+def _is_valid_fts_row(item: object) -> bool:
+    if not isinstance(item, dict):
+        return False
+    if not all(
+        isinstance(item.get(field), str)
+        for field in ("id", "project", "title")
+    ):
+        return False
+    score = item.get("score")
+    if isinstance(score, bool) or not isinstance(score, (int, float)):
+        return False
+    try:
+        return math.isfinite(score)
+    except OverflowError:
+        return False
+
+
+def _require_string_list(value: object, field: str) -> list[str]:
+    if not isinstance(value, list) or any(
+        not isinstance(item, str) for item in value
+    ):
+        raise ValueError(f"structured_data.{field} must be a list[str]")
+    return value
 
 
 def is_duplicate(
@@ -62,6 +90,12 @@ def is_duplicate(
     candidates: list[dict],
     normalization_pool: list[dict],
 ) -> dict | None:
+    if not all(
+        _is_valid_fts_row(item)
+        for item in (*candidates, *normalization_pool)
+    ):
+        return None
+
     same_project = [item for item in candidates if item["project"] == project]
     if not same_project:
         return None
@@ -80,7 +114,7 @@ def is_duplicate(
     normalized = max(0.0, top_score) / maximum if maximum > 0.0 else 0.0
     title_matches = (
         incoming.title.strip().casefold()
-        == str(top["title"]).strip().casefold()
+        == top["title"].strip().casefold()
     )
     return top if normalized >= 0.7 and title_matches else None
 
@@ -138,8 +172,12 @@ def merge_duplicate(
         "open_questions",
     )
     for name in structured_fields:
-        structured[name] = _ordered_union(
+        existing_values = _require_string_list(
             structured.get(name, []),
+            name,
+        )
+        structured[name] = _ordered_union(
+            existing_values,
             getattr(incoming, name),
             lambda value: value,
         )
@@ -147,8 +185,11 @@ def merge_duplicate(
 
     merged.updated_at = context.timestamp
     merged.last_updated_by = context.source
-    if context.source and context.source not in merged.contributors:
-        merged.contributors.append(context.source)
+    contributors = [
+        *merged.contributors,
+        *([context.source] if context.source else []),
+    ]
+    merged.contributors = list(dict.fromkeys(contributors))
     merged.updated_count += 1
     merged.operations.append(
         MemoryOperation(
@@ -168,7 +209,9 @@ def merge_duplicate(
             f"--- update {context.timestamp} by "
             f'{context.source or "unknown"} op {context.operation_id} ---'
         )
-        details = "\n\n".join(
-            part for part in (existing_details, header, incoming.details) if part
+        details = (
+            f"{existing_details}\n\n{header}\n\n{incoming.details}"
+            if existing_details
+            else f"{header}\n\n{incoming.details}"
         )
     return merged, details
