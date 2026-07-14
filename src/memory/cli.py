@@ -4,9 +4,11 @@ This module provides the command-line interface for managing memories.
 All commands use the MemoryService for business logic.
 """
 
+import json
 import os
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Literal, cast
 
 import yaml
 
@@ -22,6 +24,7 @@ from memory.config import (
 )
 from memory.core import MemoryService
 from memory.models import RawMemoryInput
+from memory.persistence import MemoryPatch
 from memory.projects import (
     ProjectRegistry,
     ProjectResolutionError,
@@ -45,6 +48,307 @@ Follow-up:
 """
 
 
+AdminAction = Literal["create", "update", "archive", "restore", "merge", "delete"]
+
+
+@dataclass(frozen=True)
+class AdminMutationRequest:
+    """Validated local mutation request for the hidden dashboard bridge."""
+
+    action: AdminAction
+    payload: dict[str, object]
+
+
+class AdminMutationValidationError(ValueError):
+    """Raised when a local admin mutation does not match the closed schema."""
+
+
+_ADMIN_ALLOWED_FIELDS: dict[AdminAction, frozenset[str]] = {
+    "create": frozenset(
+        {
+            "action",
+            "title",
+            "what",
+            "why",
+            "impact",
+            "category",
+            "tags",
+            "source",
+            "project",
+            "details",
+            "actor",
+        }
+    ),
+    "update": frozenset(
+        {
+            "action",
+            "memory_id",
+            "title",
+            "what",
+            "why",
+            "impact",
+            "category",
+            "tags",
+            "details",
+            "actor",
+        }
+    ),
+    "archive": frozenset({"action", "memory_id", "reason", "actor"}),
+    "restore": frozenset({"action", "memory_id", "actor"}),
+    "merge": frozenset({"action", "canonical_id", "source_ids", "actor"}),
+    "delete": frozenset({"action", "memory_id", "actor"}),
+}
+
+_ADMIN_REQUIRED_FIELDS: dict[AdminAction, frozenset[str]] = {
+    "create": frozenset({"action", "title", "what", "project", "actor"}),
+    "update": frozenset({"action", "memory_id", "actor"}),
+    "archive": frozenset({"action", "memory_id", "reason", "actor"}),
+    "restore": frozenset({"action", "memory_id", "actor"}),
+    "merge": frozenset({"action", "canonical_id", "source_ids", "actor"}),
+    "delete": frozenset({"action", "memory_id", "actor"}),
+}
+
+_ADMIN_REQUIRED_STRINGS: dict[AdminAction, frozenset[str]] = {
+    "create": frozenset({"title", "what", "project"}),
+    "update": frozenset({"memory_id"}),
+    "archive": frozenset({"memory_id", "reason"}),
+    "restore": frozenset({"memory_id"}),
+    "merge": frozenset({"canonical_id"}),
+    "delete": frozenset({"memory_id"}),
+}
+
+_ADMIN_NULLABLE_STRINGS: dict[AdminAction, frozenset[str]] = {
+    "create": frozenset({"why", "impact", "category", "source", "details"}),
+    "update": frozenset({"why", "impact", "category", "details"}),
+    "archive": frozenset(),
+    "restore": frozenset(),
+    "merge": frozenset(),
+    "delete": frozenset(),
+}
+
+
+def parse_admin_request(payload: object) -> AdminMutationRequest:
+    """Validate one admin request without opening storage or running commands."""
+    if not isinstance(payload, dict) or not all(
+        isinstance(key, str) for key in payload
+    ):
+        raise AdminMutationValidationError("request must be one JSON object")
+    request_payload = cast(dict[str, object], payload)
+    raw_action = request_payload.get("action")
+    if not isinstance(raw_action, str) or raw_action not in _ADMIN_ALLOWED_FIELDS:
+        raise AdminMutationValidationError(
+            "action must be create, update, archive, restore, merge, or delete"
+        )
+    action = cast(AdminAction, raw_action)
+
+    unknown = sorted(set(request_payload) - _ADMIN_ALLOWED_FIELDS[action])
+    if unknown:
+        raise AdminMutationValidationError(f"unknown field: {unknown[0]}")
+    missing = sorted(_ADMIN_REQUIRED_FIELDS[action] - set(request_payload))
+    if missing:
+        raise AdminMutationValidationError(f"missing required field: {missing[0]}")
+
+    actor = request_payload["actor"]
+    if not isinstance(actor, str) or not actor.strip():
+        raise AdminMutationValidationError("actor must be a non-empty string")
+
+    for field in _ADMIN_REQUIRED_STRINGS[action]:
+        value = request_payload[field]
+        if not isinstance(value, str) or not value.strip():
+            raise AdminMutationValidationError(
+                f"{field} must be a non-empty string"
+            )
+
+    if action == "update":
+        for field in ("title", "what"):
+            if field in request_payload:
+                value = request_payload[field]
+                if not isinstance(value, str) or not value.strip():
+                    raise AdminMutationValidationError(
+                        f"{field} must be a non-empty string"
+                    )
+
+    for field in _ADMIN_NULLABLE_STRINGS[action]:
+        if field not in request_payload:
+            continue
+        value = request_payload[field]
+        if value is not None and not isinstance(value, str):
+            raise AdminMutationValidationError(f"{field} must be a string or null")
+
+    if "tags" in request_payload:
+        tags = request_payload["tags"]
+        if not isinstance(tags, list) or not all(
+            isinstance(tag, str) for tag in tags
+        ):
+            raise AdminMutationValidationError("tags must be a list of strings")
+
+    if action == "merge":
+        source_ids = request_payload["source_ids"]
+        if (
+            not isinstance(source_ids, list)
+            or not source_ids
+            or not all(
+                isinstance(source_id, str) and source_id.strip()
+                for source_id in source_ids
+            )
+        ):
+            raise AdminMutationValidationError(
+                "source_ids must be a non-empty list of strings"
+            )
+        if len(set(source_ids)) != len(source_ids):
+            raise AdminMutationValidationError("source_ids must be unique")
+        if request_payload["canonical_id"] in source_ids:
+            raise AdminMutationValidationError(
+                "canonical_id cannot also be a source_id"
+            )
+
+    return AdminMutationRequest(action=action, payload=dict(request_payload))
+
+
+def _parse_admin_json(payload: str) -> AdminMutationRequest:
+    def reject_constant(value: str) -> object:
+        raise AdminMutationValidationError(f"invalid JSON constant: {value}")
+
+    def reject_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise AdminMutationValidationError(f"duplicate field: {key}")
+            result[key] = value
+        return result
+
+    try:
+        decoded = json.loads(
+            payload,
+            parse_constant=reject_constant,
+            object_pairs_hook=reject_duplicates,
+        )
+    except (json.JSONDecodeError, AdminMutationValidationError) as error:
+        raise AdminMutationValidationError("request must be valid JSON") from error
+    return parse_admin_request(decoded)
+
+
+def _admin_result(
+    result: object,
+    *,
+    fallback_id: str | None,
+    default_status: str,
+) -> tuple[str, str]:
+    if result is False or result is None:
+        raise RuntimeError("Mutation did not report success")
+    status = default_status
+    memory_id = fallback_id
+    if isinstance(result, dict):
+        raw_status = result.get("action")
+        raw_memory_id = result.get("id")
+        if isinstance(raw_status, str) and raw_status:
+            status = raw_status
+        if isinstance(raw_memory_id, str) and raw_memory_id:
+            memory_id = raw_memory_id
+    if not isinstance(memory_id, str) or not memory_id:
+        raise RuntimeError("Mutation did not return a memory ID")
+    return status, memory_id
+
+
+def _apply_admin_request(
+    service: MemoryService,
+    request: AdminMutationRequest,
+) -> tuple[str, str]:
+    payload = request.payload
+    actor = cast(str, payload["actor"])
+
+    if request.action == "create":
+        raw = RawMemoryInput(
+            title=cast(str, payload["title"]),
+            what=cast(str, payload["what"]),
+            why=cast(str | None, payload.get("why")),
+            impact=cast(str | None, payload.get("impact")),
+            category=cast(str | None, payload.get("category")),
+            tags=list(cast(list[str], payload.get("tags", []))),
+            source=cast(str | None, payload.get("source")),
+            details=cast(str | None, payload.get("details")),
+        )
+        result = service.save(
+            raw,
+            cast(str, payload["project"]),
+            authoritative_source=actor,
+        )
+        return _admin_result(
+            result,
+            fallback_id=None,
+            default_status="created",
+        )
+
+    if request.action == "update":
+        patch_fields = {
+            field: payload[field]
+            for field in (
+                "title",
+                "what",
+                "why",
+                "impact",
+                "category",
+                "tags",
+                "details",
+            )
+            if field in payload
+        }
+        memory_id = cast(str, payload["memory_id"])
+        result = service.update_memory_record(
+            memory_id,
+            patch=MemoryPatch(**patch_fields),
+            actor=actor,
+        )
+        return _admin_result(
+            result,
+            fallback_id=memory_id,
+            default_status="updated",
+        )
+
+    if request.action == "archive":
+        memory_id = cast(str, payload["memory_id"])
+        result = service.archive_memory(
+            memory_id,
+            reason=cast(str, payload["reason"]),
+            actor=actor,
+        )
+        return _admin_result(
+            result,
+            fallback_id=memory_id,
+            default_status="archived",
+        )
+
+    if request.action == "restore":
+        memory_id = cast(str, payload["memory_id"])
+        result = service.restore_memory(memory_id, actor=actor)
+        return _admin_result(
+            result,
+            fallback_id=memory_id,
+            default_status="restored",
+        )
+
+    if request.action == "merge":
+        canonical_id = cast(str, payload["canonical_id"])
+        result = service.merge_memories(
+            canonical_id,
+            list(cast(list[str], payload["source_ids"])),
+            actor=actor,
+        )
+        return _admin_result(
+            result,
+            fallback_id=canonical_id,
+            default_status="merged",
+        )
+
+    memory_id = cast(str, payload["memory_id"])
+    result = service.delete(memory_id, actor=actor)
+    return _admin_result(
+        result,
+        fallback_id=memory_id,
+        default_status="deleted",
+    )
+
+
 def _redact_api_keys(data: dict) -> dict:
     for section in ("embedding",):
         config = data.get(section)
@@ -58,6 +362,42 @@ def _redact_api_keys(data: dict) -> dict:
 def main():
     """Memory — local memory for coding agents."""
     pass
+
+
+@main.group(hidden=True)
+def admin():
+    """Trusted local mutation bridge."""
+    pass
+
+
+@admin.command("apply", hidden=True)
+@click.option("--json-stdin", is_flag=True, required=True, hidden=True)
+def admin_apply(json_stdin):
+    """Apply one strictly validated JSON mutation from stdin."""
+    if not json_stdin:  # pragma: no cover - enforced by Click
+        raise click.ClickException("Invalid admin mutation request.")
+    try:
+        request = _parse_admin_json(click.get_text_stream("stdin").read())
+    except AdminMutationValidationError:
+        raise click.ClickException("Invalid admin mutation request.") from None
+
+    try:
+        service = MemoryService()
+        try:
+            status, memory_id = _apply_admin_request(service, request)
+        finally:
+            service.close()
+    except Exception:
+        raise click.ClickException("Admin mutation failed.") from None
+
+    click.echo(
+        json.dumps(
+            {"status": status, "memory_id": memory_id},
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    )
 
 
 @main.command()
@@ -568,7 +908,7 @@ def review_cmd(project):
 def doctor_cmd(project):
     """Check vault, index, vectors, references, and lifecycle health."""
     from memory.health import doctor
-    svc = MemoryService()
+    svc = MemoryService(recover_pending=False)
     report = doctor(svc, project)
     svc.close()
     click.echo(yaml.safe_dump(report, sort_keys=False))

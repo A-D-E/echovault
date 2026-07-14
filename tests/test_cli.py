@@ -6,9 +6,11 @@ import os
 import pytest
 from click.testing import CliRunner
 
+import memory.cli as cli_module
 from memory.cli import main
 from memory.core import MemoryService
 from memory.models import RawMemoryInput
+from memory.persistence import MemoryPatch
 from memory.projects import ProjectRegistry, build_project_identity, discover_project_root
 from memory.safe_io import LockTimeoutError
 
@@ -221,6 +223,271 @@ def test_dashboard_help():
     assert "Launch the EchoVault terminal dashboard." in result.output
     assert "--project" in result.output
     assert "--include-archived" in result.output
+
+
+def test_admin_bridge_is_hidden_from_top_level_help():
+    result = CliRunner().invoke(main, ["--help"])
+
+    assert result.exit_code == 0
+    assert "admin" not in result.stdout
+
+
+def test_admin_create_emits_exact_compact_json_and_closes_service(monkeypatch):
+    instances = []
+
+    class RecordingService:
+        def __init__(self):
+            self.closed = False
+            self.calls = []
+            instances.append(self)
+
+        def save(self, raw, project, *, authoritative_source):
+            self.calls.append((raw, project, authoritative_source))
+            return {"id": "canonical-memory-id", "action": "created"}
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(cli_module, "MemoryService", RecordingService)
+    result = CliRunner().invoke(
+        main,
+        ["admin", "apply", "--json-stdin"],
+        input=json.dumps(
+            {
+                "action": "create",
+                "title": "Bridge create",
+                "what": "Use the canonical writer",
+                "why": None,
+                "impact": None,
+                "category": "decision",
+                "tags": ["bridge"],
+                "source": "caller-supplied",
+                "project": "bridge--111111111111",
+                "details": "Created through the bridge",
+                "actor": "dashboard",
+            }
+        ),
+    )
+
+    assert result.exit_code == 0
+    assert result.stdout == (
+        '{"status":"created","memory_id":"canonical-memory-id"}\n'
+    )
+    assert result.stderr == ""
+    assert len(instances) == 1
+    assert instances[0].closed is True
+    raw, project, actor = instances[0].calls[0]
+    assert raw == RawMemoryInput(
+        title="Bridge create",
+        what="Use the canonical writer",
+        why=None,
+        impact=None,
+        category="decision",
+        tags=["bridge"],
+        source="caller-supplied",
+        details="Created through the bridge",
+    )
+    assert project == "bridge--111111111111"
+    assert actor == "dashboard"
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_call", "expected_stdout"),
+    [
+        (
+            {
+                "action": "update",
+                "memory_id": "memory-1",
+                "title": "Renamed",
+                "impact": None,
+                "tags": [],
+                "actor": "dashboard",
+            },
+            (
+                "update",
+                "memory-1",
+                MemoryPatch(title="Renamed", impact=None, tags=[]),
+                "dashboard",
+            ),
+            '{"status":"updated","memory_id":"memory-1"}\n',
+        ),
+        (
+            {
+                "action": "archive",
+                "memory_id": "memory-2",
+                "reason": "reviewed",
+                "actor": "dashboard",
+            },
+            ("archive", "memory-2", "reviewed", "dashboard"),
+            '{"status":"archived","memory_id":"memory-2"}\n',
+        ),
+        (
+            {
+                "action": "restore",
+                "memory_id": "memory-3",
+                "actor": "dashboard",
+            },
+            ("restore", "memory-3", "dashboard"),
+            '{"status":"restored","memory_id":"memory-3"}\n',
+        ),
+        (
+            {
+                "action": "merge",
+                "canonical_id": "memory-4",
+                "source_ids": ["memory-5"],
+                "actor": "dashboard",
+            },
+            ("merge", "memory-4", ["memory-5"], "dashboard"),
+            '{"status":"merged","memory_id":"memory-4"}\n',
+        ),
+        (
+            {
+                "action": "delete",
+                "memory_id": "memory-6",
+                "actor": "dashboard",
+            },
+            ("delete", "memory-6", "dashboard"),
+            '{"status":"deleted","memory_id":"memory-6"}\n',
+        ),
+    ],
+)
+def test_admin_bridge_routes_canonical_mutations(
+    monkeypatch,
+    payload,
+    expected_call,
+    expected_stdout,
+):
+    instances = []
+
+    class RecordingService:
+        def __init__(self):
+            self.closed = False
+            self.calls = []
+            instances.append(self)
+
+        def update_memory_record(self, memory_id, *, patch, actor):
+            self.calls.append(("update", memory_id, patch, actor))
+            return {"id": memory_id, "action": "updated"}
+
+        def archive_memory(self, memory_id, *, reason, actor):
+            self.calls.append(("archive", memory_id, reason, actor))
+            return {"id": memory_id, "action": "archived"}
+
+        def restore_memory(self, memory_id, *, actor):
+            self.calls.append(("restore", memory_id, actor))
+            return {"id": memory_id, "action": "restored"}
+
+        def merge_memories(self, canonical_id, source_ids, *, actor):
+            self.calls.append(("merge", canonical_id, source_ids, actor))
+            return {"id": canonical_id, "action": "merged"}
+
+        def delete(self, memory_id, *, actor):
+            self.calls.append(("delete", memory_id, actor))
+            return True
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(cli_module, "MemoryService", RecordingService)
+    result = CliRunner().invoke(
+        main,
+        ["admin", "apply", "--json-stdin"],
+        input=json.dumps(payload),
+    )
+
+    assert result.exit_code == 0
+    assert result.stdout == expected_stdout
+    assert result.stderr == ""
+    assert len(instances) == 1
+    assert instances[0].calls == [expected_call]
+    assert instances[0].closed is True
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "not-json",
+        "[]",
+        '{"action":"unknown","actor":"dashboard"}',
+        (
+            '{"action":"create","title":"secret title","what":"body",'
+            '"project":"bridge--111111111111","actor":"dashboard",'
+            '"memory_id":"caller-id"}'
+        ),
+        (
+            '{"action":"create","title":"secret title","what":"body",'
+            '"project":"bridge--111111111111","actor":"dashboard",'
+            '"command":"sh -c secret"}'
+        ),
+        (
+            '{"action":"delete","action":"restore",'
+            '"memory_id":"memory-1","actor":"dashboard"}'
+        ),
+        (
+            '{"action":"create","title":"secret title","what":"body",'
+            '"project":"bridge--111111111111","actor":"dashboard",'
+            '"tags":[NaN]}'
+        ),
+    ],
+)
+def test_admin_bridge_rejects_invalid_input_without_stdout(
+    monkeypatch,
+    payload,
+):
+    constructed = []
+
+    class UnexpectedService:
+        def __init__(self):
+            constructed.append(self)
+
+    monkeypatch.setattr(cli_module, "MemoryService", UnexpectedService)
+    result = CliRunner().invoke(
+        main,
+        ["admin", "apply", "--json-stdin"],
+        input=payload,
+    )
+
+    assert result.exit_code != 0
+    assert result.stdout == ""
+    assert result.stderr == "Error: Invalid admin mutation request.\n"
+    assert "secret" not in result.stderr
+    assert constructed == []
+
+
+def test_admin_bridge_closes_service_and_sanitizes_mutation_errors(monkeypatch):
+    instances = []
+
+    class FailingService:
+        def __init__(self):
+            self.closed = False
+            instances.append(self)
+
+        def archive_memory(self, memory_id, *, reason, actor):
+            raise RuntimeError("sensitive mutation payload")
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(cli_module, "MemoryService", FailingService)
+    result = CliRunner().invoke(
+        main,
+        ["admin", "apply", "--json-stdin"],
+        input=json.dumps(
+            {
+                "action": "archive",
+                "memory_id": "memory-1",
+                "reason": "reviewed",
+                "actor": "dashboard",
+            }
+        ),
+    )
+
+    assert result.exit_code != 0
+    assert result.stdout == ""
+    assert result.stderr == "Error: Admin mutation failed.\n"
+    assert "sensitive" not in result.stderr
+    assert len(instances) == 1
+    assert instances[0].closed is True
 
 
 def test_config_set_home_persists_path(tmp_path, monkeypatch):

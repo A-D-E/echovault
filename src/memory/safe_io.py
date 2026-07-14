@@ -110,7 +110,14 @@ def _replace_and_sync(source: Path, target: Path) -> None:
             raise ctypes.WinError(ctypes.get_last_error())
         return
     os.replace(source, target)
-    descriptor = os.open(target.parent, os.O_RDONLY)
+    fsync_directory(target.parent)
+
+
+def fsync_directory(path: Path) -> None:
+    """Durably persist directory-entry changes where the platform permits it."""
+    if os.name == 'nt':
+        return
+    descriptor = os.open(path, os.O_RDONLY)
     try:
         os.fsync(descriptor)
     finally:

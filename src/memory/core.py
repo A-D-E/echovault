@@ -34,7 +34,13 @@ from memory.markdown import (
     write_session_memory,
 )
 from memory.models import Memory, MemoryDetail, RawMemoryInput
-from memory.persistence import CanonicalPersistence, SaveRequest
+from memory.persistence import (
+    UNSET,
+    CanonicalPersistence,
+    MemoryPatch,
+    SaveRequest,
+    _Unset,
+)
 from memory.redaction import load_memoryignore, redact
 from memory.search import hybrid_search, tiered_search
 
@@ -46,7 +52,12 @@ class MemoryService:
     All operations are coordinated through this service.
     """
 
-    def __init__(self, memory_home: Optional[str] = None):
+    def __init__(
+        self,
+        memory_home: Optional[str] = None,
+        *,
+        recover_pending: bool = True,
+    ):
         """Initialize the memory service.
 
         Args:
@@ -76,6 +87,10 @@ class MemoryService:
             self.ignore_patterns,
         )
         self.persistence.embed = lambda text: self.embedding_provider.embed(text)
+        if recover_pending:
+            self.persistence.startup_recoveries = tuple(
+                self.persistence.recover_pending_operations(())
+            )
 
     @property
     def embedding_provider(self) -> EmbeddingProvider:
@@ -546,65 +561,33 @@ class MemoryService:
         self,
         memory_id: str,
         *,
-        title: str,
-        what: str,
-        why: Optional[str],
-        impact: Optional[str],
-        category: Optional[str],
-        tags: list[str],
-        source: Optional[str],
-        details: Optional[str],
+        patch: Optional[MemoryPatch] = None,
+        actor: Optional[str] = None,
+        title: str | _Unset = UNSET,
+        what: str | _Unset = UNSET,
+        why: Optional[str] | _Unset = UNSET,
+        impact: Optional[str] | _Unset = UNSET,
+        category: Optional[str] | _Unset = UNSET,
+        tags: list[str] | _Unset = UNSET,
+        source: Optional[str] = None,
+        details: Optional[str] | _Unset = UNSET,
     ) -> dict[str, object]:
-        """Update a memory in markdown and SQLite."""
-        record = self._get_full_memory(memory_id)
-        if not record:
-            raise ValueError(f"Unknown memory: {memory_id}")
-
-        document, entry = self._load_document_entry(record)
-        entry.title = redact(title, self.ignore_patterns)
-        entry.what = redact(what, self.ignore_patterns)
-        entry.why = redact(why, self.ignore_patterns) if why else None
-        entry.impact = redact(impact, self.ignore_patterns) if impact else None
-        entry.category = category
-        entry.source = source
-        entry.details = redact(details, self.ignore_patterns) if details else None
-        entry.status = "active"
-        entry.archived_at = None
-        entry.archive_reason = None
-        entry.superseded_by = None
-
-        self._persist_document(
-            record["file_path"],
-            document,
-            tag_overrides={record["id"]: tags},
-            source_overrides={record["id"]: entry.source},
+        """Update a memory through the canonical mutation coordinator."""
+        if patch is None:
+            patch = MemoryPatch(
+                title=title,
+                what=what,
+                why=why,
+                impact=impact,
+                category=category,
+                tags=tags,
+                details=details,
+            )
+        return self.persistence.update(
+            memory_id,
+            patch,
+            actor=actor or source or "dashboard",
         )
-        updated_at = datetime.now(timezone.utc).isoformat()
-        cursor = self.db.conn.cursor()
-        cursor.execute(
-            """
-            UPDATE memories
-            SET title = ?, what = ?, why = ?, impact = ?, category = ?, tags = ?, source = ?,
-                section_anchor = ?, updated_at = ?, status = 'active',
-                archived_at = NULL, archive_reason = NULL, superseded_by = NULL
-            WHERE id = ?
-            """,
-            (
-                entry.title,
-                entry.what,
-                entry.why,
-                entry.impact,
-                entry.category,
-                json.dumps(tags),
-                entry.source,
-                entry.section_anchor,
-                updated_at,
-                record["id"],
-            ),
-        )
-        self._replace_details(record["id"], entry.details)
-        self.db.conn.commit()
-        return {"id": record["id"], "file_path": record["file_path"], "action": "updated"}
 
     def archive_memory(
         self,
@@ -612,111 +595,33 @@ class MemoryService:
         *,
         reason: str = "archived",
         superseded_by: Optional[str] = None,
+        actor: str = "dashboard",
     ) -> dict[str, object]:
-        """Archive a memory in markdown and SQLite."""
-        record = self._get_full_memory(memory_id)
-        if not record:
-            raise ValueError(f"Unknown memory: {memory_id}")
-
-        document, entry = self._load_document_entry(record)
-        entry.status = "archived"
-        entry.archived_at = datetime.now(timezone.utc).isoformat()
-        entry.archive_reason = reason
-        entry.superseded_by = superseded_by
-        self._persist_document(record["file_path"], document)
-
-        cursor = self.db.conn.cursor()
-        cursor.execute(
-            """
-            UPDATE memories
-            SET status = 'archived', archived_at = ?, archive_reason = ?, superseded_by = ?, section_anchor = ?, updated_at = ?
-            WHERE id = ?
-            """,
-            (entry.archived_at, reason, superseded_by, entry.section_anchor, entry.archived_at, record["id"]),
+        return self.persistence.archive(
+            memory_id,
+            reason=reason,
+            superseded_by=superseded_by,
+            actor=actor,
         )
-        self.db.conn.commit()
-        return {"id": record["id"], "file_path": record["file_path"], "action": "archived"}
 
-    def restore_memory(self, memory_id: str) -> dict[str, object]:
+    def restore_memory(
+        self,
+        memory_id: str,
+        *,
+        actor: str = "dashboard",
+    ) -> dict[str, object]:
         """Restore an archived memory."""
-        record = self._get_full_memory(memory_id)
-        if not record:
-            raise ValueError(f"Unknown memory: {memory_id}")
+        return self.persistence.restore(memory_id, actor=actor)
 
-        document, entry = self._load_document_entry(record)
-        entry.status = "active"
-        entry.archived_at = None
-        entry.archive_reason = None
-        entry.superseded_by = None
-        if not entry.category:
-            entry.category = record.get("category")
-        self._persist_document(record["file_path"], document)
-
-        updated_at = datetime.now(timezone.utc).isoformat()
-        cursor = self.db.conn.cursor()
-        cursor.execute(
-            """
-            UPDATE memories
-            SET status = 'active', archived_at = NULL, archive_reason = NULL, superseded_by = NULL,
-                section_anchor = ?, updated_at = ?
-            WHERE id = ?
-            """,
-            (entry.section_anchor, updated_at, record["id"]),
-        )
-        self.db.conn.commit()
-        return {"id": record["id"], "file_path": record["file_path"], "action": "restored"}
-
-    def merge_memories(self, canonical_id: str, source_ids: list[str]) -> dict[str, object]:
+    def merge_memories(
+        self,
+        canonical_id: str,
+        source_ids: list[str],
+        *,
+        actor: str = "dashboard",
+    ) -> dict[str, object]:
         """Merge source memories into a canonical memory and archive the sources."""
-        if canonical_id in source_ids:
-            raise ValueError("Canonical memory cannot also be a source memory")
-
-        canonical = self.get_memory_record(canonical_id)
-        if not canonical:
-            raise ValueError(f"Unknown memory: {canonical_id}")
-
-        merged_tags = set(json.loads(canonical["tags"]) if isinstance(canonical["tags"], str) else (canonical["tags"] or []))
-        merged_details_parts = [canonical.get("details", "").strip()]
-
-        for source_id in source_ids:
-            source = self.get_memory_record(source_id)
-            if not source:
-                continue
-            source_tags = json.loads(source["tags"]) if isinstance(source["tags"], str) else (source["tags"] or [])
-            merged_tags.update(source_tags)
-            if not canonical.get("why") and source.get("why"):
-                canonical["why"] = source["why"]
-            if not canonical.get("impact") and source.get("impact"):
-                canonical["impact"] = source["impact"]
-            merged_details_parts.append(
-                "\n".join(
-                    line
-                    for line in [
-                        f"Merged from: {source['title']} ({source['id'][:12]})",
-                        source.get("what", ""),
-                        source.get("details", "").strip(),
-                    ]
-                    if line
-                ).strip()
-            )
-
-        details = "\n\n".join(part for part in merged_details_parts if part)
-        self.update_memory_record(
-            canonical_id,
-            title=canonical["title"],
-            what=canonical["what"],
-            why=canonical.get("why"),
-            impact=canonical.get("impact"),
-            category=canonical.get("category"),
-            tags=sorted(merged_tags),
-            source=canonical.get("source"),
-            details=details,
-        )
-
-        for source_id in source_ids:
-            self.archive_memory(source_id, reason="merged", superseded_by=canonical_id)
-
-        return {"id": canonical_id, "merged": len(source_ids), "action": "merged"}
+        return self.persistence.merge(canonical_id, source_ids, actor=actor)
 
     def find_duplicate_candidates(
         self,
@@ -773,7 +678,7 @@ class MemoryService:
         """
         return self.db.get_details(memory_id)
 
-    def delete(self, memory_id: str) -> bool:
+    def delete(self, memory_id: str, *, actor: str = "cli") -> bool:
         """Delete a memory by ID or prefix.
 
         Args:
@@ -782,7 +687,7 @@ class MemoryService:
         Returns:
             True if deleted, False if not found
         """
-        return self.db.delete_memory(memory_id)
+        return self.persistence.delete(memory_id, actor=actor)
 
     def _normalize_duplicate_text(self, value: str) -> str:
         return re.sub(r"\W+", " ", (value or "").lower()).strip()

@@ -6,6 +6,7 @@ import json
 import os
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
+from pathlib import Path
 
 
 def lifecycle_review(db, project: str | None = None) -> dict[str, list]:
@@ -42,6 +43,8 @@ def lifecycle_review(db, project: str | None = None) -> dict[str, list]:
 
 
 def doctor(service, project: str | None = None) -> dict:
+    from memory.persistence import JournalRecoveryConflict, load_operation_journal
+
     db = service.db
     memories = db.list_memories(limit=100000, project=project, include_archived=True)
     cursor = db.conn.cursor()
@@ -61,12 +64,37 @@ def doctor(service, project: str | None = None) -> dict:
         vector_rows = cursor.fetchone()[0]
     active_count = sum(1 for m in memories if (m.get("status") or "active") == "active")
     lifecycle = lifecycle_review(db, project)
+    operation_journals: list[dict[str, str]] = []
+    transactions = Path(service.memory_home).resolve() / "transactions"
+    if transactions.is_dir() and not transactions.is_symlink():
+        for journal_path in sorted(transactions.glob("*.json")):
+            try:
+                operation = load_operation_journal(
+                    Path(service.memory_home),
+                    journal_path,
+                )
+            except JournalRecoveryConflict:
+                operation_journals.append(
+                    {
+                        "type": "journal_recovery_conflict",
+                        "operation_id": journal_path.stem,
+                    }
+                )
+                continue
+            if project is None or project in operation.project_keys:
+                operation_journals.append(
+                    {
+                        "type": "pending_operation_journal",
+                        "operation_id": operation.operation_id,
+                    }
+                )
     return {
-        "status": "ok" if not (orphaned_details or missing_files) else "warning",
+        "status": "ok" if not (orphaned_details or missing_files or operation_journals) else "warning",
         "memories": len(memories), "active": active_count,
         "missing_markdown_files": missing_files, "orphaned_details": orphaned_details,
         "broken_absolute_related_files": broken_related,
         "vectors": {"available": db.has_vec_table(), "rows": vector_rows, "missing": max(0, len(memories) - vector_rows)},
         "embedding_dimension": db.get_embedding_dim(),
         "lifecycle_counts": {key: len(value) for key, value in lifecycle.items()},
+        "operation_journals": operation_journals,
     }
