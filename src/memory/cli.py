@@ -6,6 +6,7 @@ All commands use the MemoryService for business logic.
 
 import os
 from dataclasses import asdict
+from pathlib import Path
 
 import yaml
 
@@ -21,6 +22,12 @@ from memory.config import (
 )
 from memory.core import MemoryService
 from memory.models import RawMemoryInput
+from memory.projects import (
+    ProjectRegistry,
+    ProjectResolutionError,
+    build_project_identity,
+    discover_project_root,
+)
 
 DETAILS_TEMPLATE = """\
 Context:
@@ -59,6 +66,42 @@ def init():
     vault_dir = os.path.join(home, "vault")
     os.makedirs(vault_dir, exist_ok=True)
     click.echo(f"Memory vault initialized at {home}")
+
+
+@main.group()
+def project():
+    """Manage collision-safe project identities."""
+    pass
+
+
+@project.command("adopt-legacy")
+@click.argument("legacy_key")
+@click.option(
+    "--project-root",
+    required=True,
+    type=click.Path(path_type=Path, file_okay=False),
+    help="Project directory that should own the legacy alias.",
+)
+@click.option(
+    "--force-reassign",
+    is_flag=True,
+    default=False,
+    help="Reassign an alias that belongs to another project.",
+)
+def project_adopt_legacy(legacy_key, project_root, force_reassign):
+    """Assign LEGACY_KEY to a collision-safe project identity."""
+    memory_home, _ = resolve_memory_home()
+    try:
+        discovered = discover_project_root(project_root)
+        identity = build_project_identity(*discovered)
+        scope = ProjectRegistry(Path(memory_home)).adopt_legacy(
+            legacy_key,
+            identity,
+            force_reassign=force_reassign,
+        )
+    except ProjectResolutionError as error:
+        raise click.ClickException(str(error)) from error
+    click.echo(f"Adopted legacy alias {legacy_key} for {scope.identity.key}")
 
 
 @main.group(invoke_without_command=True)

@@ -1,10 +1,15 @@
+import json
 from pathlib import Path
 
 import pytest
 
 from memory.projects import (
+    LegacyAliasConflict,
     MultiRootError,
     ProjectCandidates,
+    ProjectIdentity,
+    ProjectRegistry,
+    ProjectRegistryConflict,
     ProjectResolutionError,
     build_project_identity,
     discover_project_root,
@@ -269,3 +274,148 @@ def test_symlink_alias_builds_repeatable_identity(tmp_path: Path) -> None:
     through_alias = build_project_identity(*discover_project_root(alias))
 
     assert through_alias == direct
+
+
+def test_registry_adopts_sole_legacy_basename_once(tmp_path: Path) -> None:
+    memory_home = tmp_path / '.memory'
+    legacy = memory_home / 'vault' / 'api'
+    legacy.mkdir(parents=True)
+    first_root = tmp_path / 'one' / 'api'
+    second_root = tmp_path / 'two' / 'api'
+    first_root.mkdir(parents=True)
+    second_root.mkdir(parents=True)
+    (first_root / 'package.json').write_text('{}')
+    (second_root / 'package.json').write_text('{}')
+    registry = ProjectRegistry(memory_home)
+    first = registry.register(build_project_identity(*discover_project_root(first_root)))
+    second = registry.register(build_project_identity(*discover_project_root(second_root)))
+    assert first.aliases == ('api',)
+    assert second.aliases == ()
+
+
+def test_adopt_legacy_refuses_reassignment_without_force(tmp_path: Path) -> None:
+    registry = ProjectRegistry(tmp_path / '.memory')
+    left = ProjectIdentity(
+        tmp_path / 'left',
+        'left',
+        'left--111111111111',
+        None,
+        tmp_path / 'left',
+    )
+    right = ProjectIdentity(
+        tmp_path / 'right',
+        'right',
+        'right--222222222222',
+        None,
+        tmp_path / 'right',
+    )
+    registry.adopt_legacy('legacy', left)
+    with pytest.raises(LegacyAliasConflict):
+        registry.adopt_legacy('legacy', right)
+    scope = registry.adopt_legacy('legacy', right, force_reassign=True)
+    assert scope.aliases == ('legacy',)
+
+
+def test_registry_digest_cas_retries_once_from_fresh_external_state(
+    tmp_path: Path,
+) -> None:
+    registry = ProjectRegistry(tmp_path / '.memory')
+    identity = ProjectIdentity(
+        tmp_path / 'root',
+        'root',
+        'root--111111111111',
+        None,
+        tmp_path / 'root',
+    )
+    calls = 0
+
+    def change_once(path: Path) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            external = {
+                'schema_version': 1,
+                'projects': {},
+                'legacy_aliases': {},
+                'external_marker': 'preserve-me',
+            }
+            path.write_text(json.dumps(external, sort_keys=True) + '\n', encoding='utf-8')
+
+    registry._before_replace = change_once
+    registry.register(identity)
+    data = json.loads(registry.path.read_text(encoding='utf-8'))
+    assert calls == 2
+    assert data['external_marker'] == 'preserve-me'
+    assert identity.key in data['projects']
+
+
+def test_registry_digest_cas_stops_after_second_conflict(tmp_path: Path) -> None:
+    registry = ProjectRegistry(tmp_path / '.memory')
+    identity = ProjectIdentity(
+        tmp_path / 'root',
+        'root',
+        'root--111111111111',
+        None,
+        tmp_path / 'root',
+    )
+    revision = 0
+
+    def change_every_time(path: Path) -> None:
+        nonlocal revision
+        revision += 1
+        path.write_text(
+            json.dumps(
+                {
+                    'schema_version': 1,
+                    'projects': {},
+                    'legacy_aliases': {},
+                    'revision': revision,
+                }
+            )
+            + '\n',
+            encoding='utf-8',
+        )
+
+    registry._before_replace = change_every_time
+    with pytest.raises(ProjectRegistryConflict):
+        registry.register(identity)
+    assert json.loads(registry.path.read_text(encoding='utf-8'))['revision'] == 2
+
+
+@pytest.mark.parametrize('existing', ['', '{not valid json'])
+def test_registry_rejects_empty_or_malformed_existing_state(
+    tmp_path: Path,
+    existing: str,
+) -> None:
+    registry = ProjectRegistry(tmp_path / '.memory')
+    registry.path.parent.mkdir(parents=True)
+    registry.path.write_text(existing, encoding='utf-8')
+    identity = ProjectIdentity(
+        tmp_path / 'root',
+        'root',
+        'root--111111111111',
+        None,
+        tmp_path / 'root',
+    )
+
+    with pytest.raises(ProjectResolutionError):
+        registry.register(identity)
+
+    assert registry.path.read_text(encoding='utf-8') == existing
+
+
+def test_project_scope_orders_aliases_after_canonical_storage_key(tmp_path: Path) -> None:
+    registry = ProjectRegistry(tmp_path / '.memory')
+    identity = ProjectIdentity(
+        tmp_path / 'root',
+        'root',
+        'root--111111111111',
+        None,
+        tmp_path / 'root',
+    )
+
+    registry.adopt_legacy('zeta', identity)
+    scope = registry.adopt_legacy('alpha', identity)
+
+    assert scope.aliases == ('alpha', 'zeta')
+    assert scope.storage_keys == (identity.key, 'alpha', 'zeta')

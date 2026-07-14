@@ -1,5 +1,6 @@
 """Tests for CLI commands."""
 
+import json
 import os
 
 from click.testing import CliRunner
@@ -22,6 +23,52 @@ def test_cli_help():
     assert "details" in result.output
     assert "sessions" in result.output
     assert "dashboard" in result.output
+
+
+def test_project_adopt_legacy_assigns_alias_and_refuses_reassignment(
+    env_home,
+    tmp_path,
+):
+    left = tmp_path / "left"
+    right = tmp_path / "right"
+    left.mkdir()
+    right.mkdir()
+    (left / "package.json").write_text("{}")
+    (right / "package.json").write_text("{}")
+    runner = CliRunner()
+
+    first = runner.invoke(
+        main,
+        [
+            "project",
+            "adopt-legacy",
+            "legacy",
+            "--project-root",
+            str(left),
+        ],
+    )
+
+    assert first.exit_code == 0
+    registry_path = env_home / "projects.json"
+    data = json.loads(registry_path.read_text(encoding="utf-8"))
+    assigned_key = data["legacy_aliases"]["legacy"]
+    assert assigned_key.startswith("left--")
+    assert assigned_key in data["projects"]
+
+    second = runner.invoke(
+        main,
+        [
+            "project",
+            "adopt-legacy",
+            "legacy",
+            "--project-root",
+            str(right),
+        ],
+    )
+
+    assert second.exit_code != 0
+    unchanged = json.loads(registry_path.read_text(encoding="utf-8"))
+    assert unchanged["legacy_aliases"]["legacy"] == assigned_key
 
 
 def test_init_creates_vault_dir(env_home):
