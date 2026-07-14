@@ -1,6 +1,6 @@
 # Cross-Agent Native Integrations for EchoVault
 
-**Status:** Design approved in conversation; written specification awaiting review
+**Status:** Approved in conversation, including the canonical Rust dashboard write-path addendum
 
 **Date:** 2026-07-14
 
@@ -86,7 +86,9 @@ The audit also found adjacent issues that materially affect cross-agent use:
 - Replacing Cursor Memories, Gemini memory files, Claude auto-memory, or Codex
   native memories.
 - A web service, daemon, or always-on background process.
-- Changes to the Rust dashboard.
+- New Rust dashboard features or a dashboard UI redesign. Its existing mutation
+  actions must delegate to the canonical persistence coordinator so they cannot
+  bypass schema-v2 Markdown.
 - A new embedding provider or embedding-model calibration.
 - Publishing a release, tag, marketplace listing, or upstream pull request as
   part of implementation. Those are separate completion decisions.
@@ -129,6 +131,8 @@ flowchart LR
 
 - `MemoryService` owns redaction, deduplication, canonical Markdown persistence,
   derived indexing, and retrieval.
+- Every existing mutation surface, including the Rust dashboard, delegates to
+  `MemoryService`; the dashboard keeps its current UI and SQLite read model.
 - The MCP server owns agent-neutral tool contracts plus configured agent and
   project authority.
 - Agent adapters own native paths, manifests, instructions, hooks, setup,
@@ -248,14 +252,22 @@ conflicting caller-supplied project or path. A project-unbound global adapter
 server prefers the single client root, then resolves `cwd`, then falls back to
 its startup directory. Existing explicit `project` string input remains
 available only on a backward-compatible legacy server started without agent or
-project binding. Phase one supports one workspace root per agent process; zero
-roots at a generic home directory or more than one root is degraded and
-requires an explicit cwd or project adapter. Multi-root automatic routing is
-out of scope.
+project binding. Phase one has no implicit multi-root routing. A project-bound
+server treats its configured root as authoritative; advertised roots and caller
+cwd may only confirm that boundary. A global agent-bound server may use exactly
+one advertised root directly. When more than one root is advertised, the call
+must provide cwd and that cwd must be contained by exactly one advertised root;
+otherwise the call is rejected as ambiguous. With zero roots, cwd may select a
+project only when it is outside a generic home/startup directory; otherwise the
+adapter must supply an explicit project root. No basename or first-root
+fallback is allowed.
 
-For an agent-bound MCP server, caller-supplied cwd must be inside the sole
-advertised MCP root, or inside the startup-resolved root when the client exposes
-no Roots capability. Paths outside that boundary are rejected. Gemini's hook
+For an agent-bound MCP server, caller-supplied cwd must be inside its configured
+project root, the single advertised root, or the exactly one advertised root
+that contains it. When the client exposes no Roots capability, cwd must remain
+inside the startup-resolved project unless the startup directory is a generic
+home and cwd provides the only project boundary. Paths outside that boundary
+are rejected. Gemini's hook
 cwd is trusted as client protocol input, not copied from model-generated tool
 arguments.
 
@@ -454,6 +466,7 @@ The handler:
 6. claims the hook event atomically and, only for the winning invocation,
    records retrieval feedback;
 7. writes one valid JSON response containing
+   `hookSpecificOutput.hookEventName: "BeforeAgent"` and
    `hookSpecificOutput.additionalContext`;
 8. writes diagnostics only to stderr;
 9. returns a harmless empty JSON response on recoverable failure or when
@@ -490,7 +503,9 @@ The extension does not use `AfterAgent` or `SessionEnd` to create memories.
 Gemini's shutdown hook is best effort and cannot be a persistence boundary.
 Its static context and skill use the same curated-save policy as Cursor,
 including one operation UUID per conceptual save and reuse of that UUID for the
-single allowed retry.
+single allowed retry. The shared skill is agent-neutral: bound tool calls omit
+caller-selected `agent`, `source`, and `project`, and the configured MCP binding
+assigns those authority fields for Cursor or Gemini.
 
 ### Direct-settings fallback
 
@@ -728,6 +743,14 @@ migration. Multi-project operations acquire project locks in sorted key order.
 Feedback counters are DB-only operational data. Reindex does not mutate
 Markdown and uses the content-fingerprint check described below.
 
+An administrative merge that changes more than one Markdown file uses a
+durable operation journal. The journal records only operation ID, target/temp
+basenames, before/after digests, and phases; it contains no memory text. Each
+file replacement remains individually atomic and parent-fsynced. Before the
+next mutator, recovery compares recorded digests, resumes every known phase,
+then rebuilds derived rows; an unrecognized external edit stops recovery as a
+conflict. The implementation must not claim impossible all-files atomicity.
+
 ### Save state machine
 
 For an agent-bound save, `idempotency_key` is required and unique within the
@@ -806,8 +829,11 @@ with the integration ID, schema and asset versions, relative managed paths,
 marked-block identifiers, and SHA-256 hashes of the last installed contents.
 Shared JSON/TOML/Markdown files remain user-owned; the sidecar claims only the
 EchoVault entry or marker block. Native plugin and extension directories are
-staged under the same parent and atomically renamed only after their manifests
-and hashes validate.
+staged under the same parent only after their manifests and hashes validate.
+Because replacing a non-empty directory is not one portable atomic operation,
+updates use a fsynced operation journal plus target-to-backup and staging-to-
+target renames. Each rename is atomic; recovery resumes or preserves the last
+digest-verified owned tree and never deletes an unknown user-modified tree.
 
 Setup and uninstall take a per-target configuration lock, re-read the file
 under that lock, and compare its digest again immediately before replacement.
@@ -829,7 +855,7 @@ configuration.
 | No EchoVault artifacts | Install and write ownership manifest | No-op |
 | Exact recognized pre-manifest legacy entry | Migrate in place, then write ownership manifest | Remove only exact legacy shape |
 | Current owned, hashes match | Byte-stable no-op | Remove claimed artifacts and marker blocks |
-| Older known owned version, hashes match | Upgrade atomically | Remove claimed artifacts |
+| Older known owned version, hashes match | Upgrade through the locked journaled swap | Remove claimed artifacts |
 | Owned but a managed hash differs | Conflict; require `--force-managed` | Conflict; require `--force-managed` |
 | Same name with custom command, args, content, or unmarked directory | Conflict; no mutation | Preserve; report not owned |
 | Malformed shared configuration | Parse error; no mutation | Parse error; no mutation |
@@ -1052,12 +1078,20 @@ uv build
 ~~~
 
 The baseline Claude Code, Codex, OpenCode, CLI, MCP, and storage tests remain in
-the same blocking suite. Rust dashboard verification remains separate because
-this design does not change dashboard behavior.
+the same blocking suite. Rust dashboard verification remains a separate job
+because the compatibility bridge changes its write path but not its UI.
 
 ### Authenticated client smoke gates
 
-Pin Cursor 3.11.19 and Gemini CLI 0.50.0 for the phase-one dogfood report:
+Pin three independent client observations for the phase-one dogfood report:
+
+- Cursor IDE 3.11.19 for manual IDE evidence;
+- Cursor Agent CLI build 2026.07.09-a3815c0 for `agent --version`, interactive,
+  and headless CLI evidence;
+- Gemini CLI 0.50.0 for extension, hook, and headless evidence.
+
+Never compare the Agent CLI build with the Cursor IDE semantic version. The
+report covers:
 
 - Cursor IDE new task and known marker retrieval;
 - Cursor CLI interactive and headless task;
@@ -1068,12 +1102,15 @@ Pin Cursor 3.11.19 and Gemini CLI 0.50.0 for the phase-one dogfood report:
 
 Each retrieval smoke seeds a unique marker, starts a fresh supported client in a
 single-root workspace, submits a matching task, and records whether the marker
-was injected or the expected MCP call occurred. Cross-agent smoke saves one
-curated marker with a fixed operation ID and retrieves the same memory ID from
-each other client. Cursor model compliance results are reported separately from
-deterministic installation/tool availability; they cannot be promoted to an
-exactly-once guarantee. If a binary or authenticated account is unavailable,
-the report says `not verified` and the phase is not described as client-verified.
+was injected or the expected MCP call occurred. Cursor model compliance results
+are reported separately from deterministic installation/tool availability; they
+cannot be promoted to an exactly-once guarantee. The cross-agent gate saves one
+marker through the Cursor-bound server and a second marker through the
+Gemini-bound server, with a distinct fixed operation ID for each, then retrieves
+both memory IDs from every available bound client. A single generic or unbound
+marker is insufficient. If a binary or authenticated account is unavailable,
+the report says `not verified` and the phase is not described as
+client-verified.
 
 The pre-change baseline is 272 passing Python tests.
 
@@ -1129,7 +1166,8 @@ The pre-change baseline is 272 passing Python tests.
 2. Make schema-v2 Markdown lossless and add explicit legacy enrichment and
    reconciliation tests.
 3. Add project process locking, atomic/fsynced Markdown writes, derived-index
-   transactions, crash recovery, and concurrency tests.
+   transactions, crash recovery, concurrency tests, and the minimal Rust
+   dashboard-to-canonical-persistence bridge.
 4. Add safe configuration lock/CAS primitives, ownership manifests, and the
    adapter registry.
 5. Implement Cursor plugin assets, project fallback, migration, diagnostics,
@@ -1167,6 +1205,8 @@ The pre-change baseline is 272 passing Python tests.
 - Gemini `BeforeAgent` performs task-time injection.
 - Explicit MCP save is the authoritative persistence trigger; schema-v2
   Markdown is the authoritative stored record and SQLite is derived.
+- Existing dashboard mutations cross the same canonical persistence boundary;
+  no dashboard feature or UI redesign is included.
 - Project keys separate display names from collision-resistant local identity;
   automatic multi-root routing is excluded.
 - Bound MCP identities and project roots cannot be spoofed by tool arguments.
