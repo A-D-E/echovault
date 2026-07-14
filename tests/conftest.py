@@ -1,9 +1,11 @@
 import random
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
 from memory.embeddings.base import EmbeddingProvider
+from memory.core import MemoryService
 from memory.models import Memory
 
 
@@ -69,3 +71,12 @@ def env_home(tmp_vault, monkeypatch):
         return_value=fake,
     ):
         yield tmp_vault
+
+
+@pytest.fixture
+def service(env_home: Path):
+    instance = MemoryService(str(env_home))
+    try:
+        yield instance
+    finally:
+        instance.db.close()

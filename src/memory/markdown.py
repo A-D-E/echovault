@@ -543,6 +543,30 @@ def assign_entry_anchors(entries: list[SessionEntry]) -> None:
         entry.section_anchor = make_section_anchor(entry.title, occurrence)
 
 
+def upsert_session_memory_entry(
+    document: SessionDocument,
+    mem: Memory,
+    details: Optional[str] = None,
+) -> None:
+    """Replace or append one canonical memory entry and refresh its anchor."""
+    if document.schema_version == 1:
+        raise LegacySchemaWriteError()
+
+    replacement = _entry_from_memory(mem, details)
+    for index, entry in enumerate(document.entries):
+        if entry.id == mem.id:
+            document.entries[index] = replacement
+            break
+    else:
+        document.entries.append(replacement)
+
+    assign_entry_anchors(document.entries)
+    if replacement.section_anchor is None:
+        raise ValueError(f"Unable to assign section anchor for memory {mem.id}")
+    mem.section_anchor = replacement.section_anchor
+    replacement.metadata["section_anchor"] = replacement.section_anchor
+
+
 def write_session_memory(
     vault_project_dir: str,
     mem: Memory,
