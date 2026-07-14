@@ -4,6 +4,7 @@ from unittest.mock import patch
 import pytest
 
 from memory.embeddings.base import EmbeddingProvider
+from memory.models import Memory
 
 
 class FakeEmbeddingProvider(EmbeddingProvider):
@@ -22,6 +23,29 @@ class FakeEmbeddingProvider(EmbeddingProvider):
         # L2 normalize
         norm = sum(x * x for x in vec) ** 0.5
         return [x / norm for x in vec]
+
+
+@pytest.fixture
+def sample_memory() -> Memory:
+    return Memory(
+        id="11111111-1111-4111-8111-111111111111",
+        title="Use FastAPI for API endpoints",
+        what="Implemented REST API using FastAPI framework",
+        why="FastAPI provides automatic validation and documentation",
+        impact="Reduces boilerplate code",
+        tags=["api", "fastapi"],
+        category="decision",
+        project="p--1",
+        source="cursor",
+        related_files=["/src/api/main.py"],
+        file_path="2026-07-14-session.md",
+        section_anchor="use-fastapi-for-api-endpoints",
+        created_at="2026-07-14T10:00:00+00:00",
+        updated_at="2026-07-14T10:00:00+00:00",
+        creator_source="cursor",
+        last_updated_by="cursor",
+        contributors=["cursor"],
+    )
 
 
 @pytest.fixture
