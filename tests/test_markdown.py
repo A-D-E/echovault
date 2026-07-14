@@ -19,7 +19,7 @@ from memory.markdown import (
     write_session_document,
     write_session_memory,
 )
-from memory.models import Memory, MemoryOperation
+from memory.models import CATEGORY_HEADINGS, Memory, MemoryOperation
 
 
 def document_with(memory: Memory) -> SessionDocument:
@@ -1068,3 +1068,83 @@ def test_schema_v2_rejects_duplicate_schema_version_frontmatter(
 
     with pytest.raises(ValueError):
         parse_session_file(path)
+
+
+@pytest.mark.parametrize(
+    "unexpected_prefix_line",
+    [
+        "arbitrary prelude text",
+        "<!-- echovault-null-v2: Why -->",
+        '  **Title:** "indented lookalike"',
+        "<details>",
+        "</details>",
+        '**What:** "readable record before entry"',
+        "<!-- memory-id: prefix-id -->",
+        "<!-- echovault-metadata-v2: {} -->",
+        " ",
+    ],
+)
+def test_schema_v2_rejects_noncanonical_lines_before_first_entry(
+    tmp_path: Path, sample_memory: Memory, unexpected_prefix_line: str
+) -> None:
+    lines = render_session_document(document_with(sample_memory)).splitlines()
+    first_entry_index = next(i for i, line in enumerate(lines) if line.startswith("### "))
+    lines.insert(first_entry_index, unexpected_prefix_line)
+    path = tmp_path / "invalid-prefix.md"
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        parse_session_file(path)
+
+
+@pytest.mark.parametrize(
+    "boundary_heading",
+    [*(f"## {heading}" for heading in CATEGORY_HEADINGS.values()), "## Archived"],
+)
+def test_schema_v2_rejects_boundary_heading_before_records_are_complete(
+    tmp_path: Path, sample_memory: Memory, boundary_heading: str
+) -> None:
+    lines = render_session_document(document_with(sample_memory)).splitlines()
+    what_index = next(i for i, line in enumerate(lines) if line.startswith("**What:**"))
+    lines.insert(what_index + 1, boundary_heading)
+    path = tmp_path / "premature-boundary.md"
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        parse_session_file(path)
+
+
+def test_schema_v2_accepts_rendered_category_and_archive_transitions(
+    tmp_path: Path, sample_memory: Memory
+) -> None:
+    context_memory = replace(
+        sample_memory,
+        id="test-context",
+        title="Context entry",
+        category="context",
+        section_anchor="context-entry",
+    )
+    archived_memory = replace(
+        sample_memory,
+        id="test-archived",
+        title="Archived entry",
+        status="archived",
+        section_anchor="archived-entry",
+    )
+    document = document_with(sample_memory)
+    document.entries.extend(
+        [
+            document_with(context_memory).entries[0],
+            document_with(archived_memory).entries[0],
+        ]
+    )
+    path = tmp_path / "valid-transitions.md"
+    path.write_text(render_session_document(document), encoding="utf-8")
+
+    parsed = parse_session_file(path)
+
+    assert [entry.id for entry in parsed.entries] == [
+        sample_memory.id,
+        context_memory.id,
+        archived_memory.id,
+    ]

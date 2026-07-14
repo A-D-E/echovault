@@ -776,6 +776,32 @@ def _parse_v2_json_record(line: str, label: str, memory_id: str) -> object:
     return _load_schema_v2_json(payload[1:], f"{label} for memory {memory_id}")
 
 
+def _validate_v2_prelude(
+    lines: list[str], first_entry_start: int, section_headings: set[str]
+) -> None:
+    """Require the exact renderer-owned body prefix before the first v2 entry."""
+    prelude = lines[:first_entry_start]
+    canonical_base = (
+        len(prelude) >= 3
+        and prelude[0] == ""
+        and prelude[1].startswith("# ")
+        and len(prelude[1]) > 2
+        and prelude[2] == ""
+    )
+    if not canonical_base:
+        raise ValueError("Invalid schema-v2 session body prelude")
+    if len(prelude) == 3:
+        return
+    if (
+        first_entry_start < len(lines)
+        and len(prelude) == 5
+        and prelude[3] in section_headings
+        and prelude[4] == ""
+    ):
+        return
+    raise ValueError("Unexpected schema-v2 content before first entry")
+
+
 def _parse_entries_v2(body: str) -> list[SessionEntry]:
     """Parse canonical v2 entries with adjacent structural comments and JSON records."""
     lines = body.split("\n")
@@ -809,6 +835,12 @@ def _parse_entries_v2(body: str) -> list[SessionEntry]:
     entries: list[SessionEntry] = []
     seen_ids: set[str] = set()
     readable_labels = ("Title", "What", "Why", "Impact", "Source", "Details")
+    section_headings = {
+        *(f"## {heading}" for heading in CATEGORY_HEADINGS.values()),
+        "## Archived",
+    }
+    first_entry_start = entry_starts[0] if entry_starts else len(lines)
+    _validate_v2_prelude(lines, first_entry_start, section_headings)
 
     for position, start in enumerate(entry_starts):
         end = entry_starts[position + 1] if position + 1 < len(entry_starts) else len(lines)
@@ -819,63 +851,44 @@ def _parse_entries_v2(body: str) -> list[SessionEntry]:
         metadata = _parse_metadata_v2_line(lines[start + 2], memory_id)
         fields: dict[str, object] = {}
         living_data: dict = {}
-        living_data_seen = False
-
-        for line in lines[start + 3:end]:
-            matched_label = next(
-                (label for label in readable_labels if line.startswith(f"**{label}:**")),
-                None,
-            )
-            if matched_label is not None:
-                if matched_label in fields:
-                    raise ValueError(
-                        f"Duplicate schema-v2 readable field {matched_label} "
-                        f"for memory {memory_id}"
-                    )
-                fields[matched_label] = _parse_v2_json_record(
-                    line, matched_label, memory_id
+        cursor = start + 3
+        for label in readable_labels:
+            if cursor >= end:
+                raise ValueError(
+                    f"Missing schema-v2 readable field {label} for memory {memory_id}"
                 )
-                continue
+            fields[label] = _parse_v2_json_record(lines[cursor], label, memory_id)
+            cursor += 1
 
-            living_prefix = "**Living Memory:**"
-            if line.startswith(living_prefix):
-                if living_data_seen:
-                    raise ValueError(
-                        f"Duplicate Living Memory record for memory {memory_id}"
-                    )
-                living_data_seen = True
-                payload = line[len(living_prefix):]
-                if payload.startswith(" "):
-                    payload = payload[1:]
-                loaded_living_data = _load_schema_v2_json(
-                    payload, f"living data for memory {memory_id}"
+        living_prefix = "**Living Memory:**"
+        if cursor < end and lines[cursor].startswith(living_prefix):
+            payload = lines[cursor][len(living_prefix):]
+            if not payload.startswith(" "):
+                raise ValueError(
+                    f"Living data record requires one delimiter space for memory {memory_id}"
                 )
-                if not isinstance(loaded_living_data, dict):
-                    raise ValueError(f"Living data for memory {memory_id} must be an object")
-                living_data = loaded_living_data
-                continue
+            loaded_living_data = _load_schema_v2_json(
+                payload[1:], f"living data for memory {memory_id}"
+            )
+            if not isinstance(loaded_living_data, dict):
+                raise ValueError(f"Living data for memory {memory_id} must be an object")
+            living_data = loaded_living_data
+            cursor += 1
 
-            if line == "":
-                continue
-
-            category_headings = {
-                *(f"## {heading}" for heading in CATEGORY_HEADINGS.values()),
-                "## Archived",
-            }
-            if line in category_headings:
-                continue
-
+        suffix = lines[cursor:end]
+        valid_suffix = suffix == [""]
+        if position + 1 < len(entry_starts):
+            valid_suffix = valid_suffix or (
+                len(suffix) == 3
+                and suffix[0] == ""
+                and suffix[1] in section_headings
+                and suffix[2] == ""
+            )
+        if not valid_suffix:
             raise ValueError(
-                f"Unexpected noncanonical schema-v2 body line for memory {memory_id}: "
-                f"{line}"
+                f"Invalid schema-v2 entry-boundary suffix for memory {memory_id}"
             )
 
-        missing_fields = sorted(set(readable_labels) - set(fields))
-        if missing_fields:
-            raise ValueError(
-                f"Missing schema-v2 readable fields for memory {memory_id}: "
-                + ", ".join(missing_fields)
-            )
         if not isinstance(fields["Title"], str) or not isinstance(fields["What"], str):
             raise ValueError(f"Schema-v2 Title and What must be strings for memory {memory_id}")
         for label in ("Why", "Impact", "Source", "Details"):
