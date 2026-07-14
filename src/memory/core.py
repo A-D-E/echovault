@@ -222,7 +222,7 @@ class MemoryService:
         Returns:
             Dictionary with 'id' (memory UUID) and 'file_path' (markdown file path)
         """
-        project = project or os.path.basename(os.getcwd())
+        project = os.path.basename(os.getcwd()) if project is None else project
         warnings = self._details_warnings(raw)
         request = SaveRequest(
             raw=raw,
@@ -232,6 +232,9 @@ class MemoryService:
             timestamp=datetime.now(timezone.utc).isoformat(),
         )
         result = self.persistence.save(request)
+        vector_warning = result.get("warning")
+        if isinstance(vector_warning, str) and vector_warning not in warnings:
+            warnings.append(vector_warning)
         return {**result, "warnings": warnings}
 
     def search(

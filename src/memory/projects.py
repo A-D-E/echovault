@@ -7,7 +7,7 @@ import re
 import unicodedata
 from collections.abc import Callable
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 from memory.safe_io import (
     ConcurrentModificationError,
@@ -59,17 +59,32 @@ class ProjectRegistryConflict(ProjectResolutionError):
     pass
 
 
-def _validate_legacy_key(value: object) -> str:
+def validate_storage_key(value: object) -> str:
+    """Validate one local vault/lock basename without normalizing it."""
     if not isinstance(value, str):
-        raise ProjectResolutionError('Invalid legacy alias: expected a string basename')
+        raise ProjectResolutionError(
+            'Invalid storage key or legacy alias: expected a string basename'
+        )
     if not value.strip() or value in {'.', '..'}:
-        raise ProjectResolutionError('Invalid legacy alias: expected a non-empty basename')
+        raise ProjectResolutionError(
+            'Invalid storage key or legacy alias: expected a non-empty basename'
+        )
     if '/' in value or '\\' in value:
-        raise ProjectResolutionError('Invalid legacy alias: expected a single local basename')
+        raise ProjectResolutionError(
+            'Invalid storage key or legacy alias: expected a single local basename'
+        )
+    if Path(value).is_absolute() or PureWindowsPath(value).drive:
+        raise ProjectResolutionError(
+            'Invalid storage key or legacy alias: absolute paths are not allowed'
+        )
     if any(unicodedata.category(character) == 'Cc' for character in value):
-        raise ProjectResolutionError('Invalid legacy alias: control characters are not allowed')
+        raise ProjectResolutionError(
+            'Invalid storage key or legacy alias: control characters are not allowed'
+        )
     if Path(value).name != value or Path(value).parts != (value,):
-        raise ProjectResolutionError('Invalid legacy alias: expected a single local basename')
+        raise ProjectResolutionError(
+            'Invalid storage key or legacy alias: expected a single local basename'
+        )
     return value
 
 
@@ -119,6 +134,7 @@ class ProjectRegistry:
         for key, record in projects.items():
             if not isinstance(key, str) or not isinstance(record, dict):
                 raise ProjectResolutionError('Existing projects.json has invalid projects')
+            validate_storage_key(key)
             display_name = record.get('display_name')
             roots = record.get('roots')
             if not isinstance(display_name, str) or not isinstance(roots, list):
@@ -126,7 +142,7 @@ class ProjectRegistry:
             if not all(isinstance(root, str) for root in roots):
                 raise ProjectResolutionError('Existing projects.json has invalid project roots')
         for alias, project_key in aliases.items():
-            _validate_legacy_key(alias)
+            validate_storage_key(alias)
             if not isinstance(project_key, str):
                 raise ProjectResolutionError(
                     'Existing projects.json has invalid legacy aliases'
@@ -138,6 +154,7 @@ class ProjectRegistry:
 
     @staticmethod
     def _register_identity(data: dict[str, object], identity: ProjectIdentity) -> None:
+        validate_storage_key(identity.key)
         projects = data['projects']
         assert isinstance(projects, dict)
         if identity.key in projects:
@@ -201,7 +218,7 @@ class ProjectRegistry:
             assert isinstance(aliases, dict)
             legacy_dir = self.memory_home / 'vault' / identity.display_name
             if legacy_dir.is_dir():
-                legacy_key = _validate_legacy_key(identity.display_name)
+                legacy_key = validate_storage_key(identity.display_name)
             else:
                 legacy_key = None
             if legacy_key is not None and legacy_key not in aliases:
@@ -223,7 +240,7 @@ class ProjectRegistry:
         identity: ProjectIdentity,
         force_reassign: bool = False,
     ) -> ProjectScope:
-        legacy_key = _validate_legacy_key(legacy_key)
+        legacy_key = validate_storage_key(legacy_key)
 
         def transform(data: dict[str, object]) -> ProjectScope:
             self._register_identity(data, identity)
@@ -238,6 +255,37 @@ class ProjectRegistry:
             return self._scope(identity, data)
 
         return self._mutate(transform)
+
+    def resolve(self, storage_key: str) -> ProjectScope | None:
+        """Resolve a canonical key or adopted alias without mutating the registry."""
+        storage_key = validate_storage_key(storage_key)
+        data, _ = self._read_with_digest()
+        projects = data['projects']
+        aliases = data['legacy_aliases']
+        assert isinstance(projects, dict)
+        assert isinstance(aliases, dict)
+        canonical_key = aliases.get(storage_key, storage_key)
+        if not isinstance(canonical_key, str):
+            raise ProjectResolutionError(
+                'Existing projects.json has invalid legacy aliases'
+            )
+        record = projects.get(canonical_key)
+        if record is None:
+            return None
+        assert isinstance(record, dict)
+        display_name = record['display_name']
+        roots = record['roots']
+        assert isinstance(display_name, str)
+        assert isinstance(roots, list)
+        root = _canonical(Path(roots[0])) if roots else _canonical(self.memory_home)
+        identity = ProjectIdentity(
+            root=root,
+            display_name=display_name,
+            key=canonical_key,
+            marker=None,
+            canonical_owner=root,
+        )
+        return self._scope(identity, data)
 
 
 def _canonical(path: Path) -> Path:

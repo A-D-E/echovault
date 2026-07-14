@@ -14,6 +14,7 @@ from memory.projects import (
     build_project_identity,
     discover_project_root,
     select_project_candidate,
+    validate_storage_key,
 )
 
 
@@ -611,3 +612,46 @@ def test_project_scope_orders_aliases_after_canonical_storage_key(tmp_path: Path
 
     assert scope.aliases == ('alpha', 'zeta')
     assert scope.storage_keys == (identity.key, 'alpha', 'zeta')
+
+
+@pytest.mark.parametrize(
+    'storage_key',
+    ['', '   ', '.', '..', '../outside', 'nested/name', 'nested\\name', '/absolute'],
+)
+def test_storage_key_validator_rejects_non_local_paths(storage_key: str) -> None:
+    with pytest.raises(ProjectResolutionError, match='storage key'):
+        validate_storage_key(storage_key)
+
+
+def test_registry_resolves_alias_and_canonical_key_without_writing(tmp_path: Path) -> None:
+    registry = ProjectRegistry(tmp_path / '.memory')
+    identity = ProjectIdentity(
+        tmp_path / 'root',
+        'root',
+        'root--111111111111',
+        None,
+        tmp_path / 'root',
+    )
+    registry.adopt_legacy('zeta', identity)
+    registry.adopt_legacy('alpha', identity)
+    before = registry.path.read_bytes()
+
+    from_alias = registry.resolve('alpha')
+    from_canonical = registry.resolve(identity.key)
+
+    assert from_alias == from_canonical
+    assert from_alias is not None
+    assert from_alias.identity.key == identity.key
+    assert from_alias.storage_keys == (identity.key, 'alpha', 'zeta')
+    assert registry.path.read_bytes() == before
+
+
+def test_registry_resolution_rejects_unsafe_key_without_creating_state(
+    tmp_path: Path,
+) -> None:
+    registry = ProjectRegistry(tmp_path / '.memory')
+
+    with pytest.raises(ProjectResolutionError, match='storage key'):
+        registry.resolve('../outside')
+
+    assert not registry.path.exists()

@@ -1,8 +1,9 @@
 import copy
-from datetime import date
+from datetime import datetime, timezone
 import hashlib
 import json
 from pathlib import Path
+import uuid
 
 import pytest
 
@@ -12,11 +13,13 @@ from memory.models import RawMemoryInput
 from memory.persistence import (
     CanonicalDriftError,
     LegacyMetadataRequiredError,
+    SaveRequest,
     SaveConflict,
     content_fingerprint,
     embedding_text,
     request_fingerprint,
 )
+from memory.projects import ProjectIdentity, ProjectRegistry, ProjectResolutionError
 
 
 def _operation(service: MemoryService, memory_id: str) -> dict[str, object]:
@@ -34,6 +37,19 @@ def _canonical_memory(saved: dict[str, object]):
         for entry in document.entries
         if entry.id == saved["id"]
     )
+
+
+def _adopt_alias(
+    service: MemoryService,
+    tmp_path: Path,
+    *,
+    canonical: str = "project--111111111111",
+    alias: str = "legacy",
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir(exist_ok=True)
+    identity = ProjectIdentity(root, "workspace", canonical, None, root)
+    ProjectRegistry(Path(service.memory_home)).adopt_legacy(alias, identity)
 
 
 def test_same_operation_and_payload_replays_without_second_update(
@@ -221,7 +237,7 @@ def test_write_targeting_v1_file_requires_explicit_migration(
     legacy_file = (
         Path(service.vault_dir)
         / "legacy"
-        / f"{date.today().isoformat()}-session.md"
+        / f"{datetime.now(timezone.utc).date().isoformat()}-session.md"
     )
     legacy_file.parent.mkdir(parents=True)
     legacy_file.write_text(
@@ -316,7 +332,7 @@ def test_fault_boundaries_leave_recoverable_state(
     markdown_expected: bool,
     db_expected: bool,
 ) -> None:
-    operation_id = f"fault-{phase}"
+    operation_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"fault:{phase}"))
 
     def inject(current: str) -> None:
         if current == phase:
@@ -447,3 +463,315 @@ def test_stale_embedding_cannot_overwrite_newer_vector(
     assert service.db.upsert_vector_if_current(
         str(saved["id"]), str(old_fingerprint), [0.1, 0.2]
     ) is False
+
+
+@pytest.mark.parametrize(
+    "project",
+    ["", "   ", ".", "..", "../outside", "nested/name", "nested\\name", "/absolute"],
+)
+def test_unsafe_project_key_is_rejected_before_any_write(
+    service: MemoryService,
+    project: str,
+) -> None:
+    with pytest.raises(ProjectResolutionError, match="storage key"):
+        service.save(
+            RawMemoryInput(title="Unsafe", what="must not persist"),
+            project=project,
+            idempotency_key="70000000-0000-4000-8000-000000000001",
+        )
+
+    assert service.db.conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0] == 0
+    assert list(Path(service.vault_dir).rglob("*-session.md")) == []
+    locks = Path(service.memory_home) / "locks"
+    assert not locks.exists() or list(locks.iterdir()) == []
+
+
+@pytest.mark.parametrize("escape_kind", ["locks", "project", "session"])
+def test_symlink_cannot_redirect_persistence_outside_memory_home(
+    service: MemoryService,
+    tmp_path: Path,
+    escape_kind: str,
+) -> None:
+    memory_home = Path(service.memory_home)
+    outside = tmp_path.parent / f"{tmp_path.name}-outside-{escape_kind}"
+    outside.mkdir()
+    request = SaveRequest(
+        raw=RawMemoryInput(title="Contained", what="stay inside"),
+        project="safe-project",
+        source="codex",
+        operation_id="70000000-0000-4000-8000-000000000002",
+        timestamp="2026-01-23T00:30:00+00:00",
+    )
+
+    try:
+        if escape_kind == "locks":
+            (memory_home / "locks").symlink_to(outside, target_is_directory=True)
+        elif escape_kind == "project":
+            (memory_home / "vault" / "safe-project").symlink_to(
+                outside,
+                target_is_directory=True,
+            )
+        else:
+            project_dir = memory_home / "vault" / "safe-project"
+            project_dir.mkdir()
+            (project_dir / "2026-01-23-session.md").symlink_to(
+                outside / "escaped.md"
+            )
+    except (NotImplementedError, OSError):
+        pytest.skip("symlinks are not supported on this platform")
+
+    with pytest.raises(ProjectResolutionError, match="outside|contain"):
+        service.persistence.save(request)
+
+    assert list(outside.iterdir()) == []
+    assert service.db.conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0] == 0
+
+
+def test_invalid_operation_uuid_is_rejected_before_any_write(
+    service: MemoryService,
+) -> None:
+    with pytest.raises(ValueError, match="UUID"):
+        service.save(
+            RawMemoryInput(title="Invalid operation", what="no write"),
+            project="safe-project",
+            idempotency_key="not-a-uuid",
+        )
+
+    assert service.db.conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0] == 0
+    assert list(Path(service.vault_dir).rglob("*-session.md")) == []
+    assert not (Path(service.memory_home) / "locks").exists()
+
+
+def test_operation_uuid_is_canonicalized_before_fingerprinting_and_storage(
+    service: MemoryService,
+) -> None:
+    uppercase = "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA"
+    raw = RawMemoryInput(title="Canonical UUID", what="one operation")
+
+    created = service.save(raw, project="safe-project", idempotency_key=uppercase)
+    replayed = service.save(
+        raw,
+        project="safe-project",
+        idempotency_key=uppercase.lower(),
+    )
+
+    assert replayed["id"] == created["id"]
+    assert replayed["action"] == "replayed"
+    operation = service.db.get_operation("safe-project", uppercase.lower())
+    assert operation is not None
+    assert operation["operation_id"] == uppercase.lower()
+    assert _operation(service, str(created["id"]))["operation_id"] == uppercase.lower()
+
+
+def test_alias_save_uses_canonical_project_for_all_new_state(
+    service: MemoryService,
+    tmp_path: Path,
+) -> None:
+    canonical = "project--111111111111"
+    _adopt_alias(service, tmp_path, canonical=canonical, alias="legacy")
+
+    saved = service.save(
+        RawMemoryInput(title="Canonical scope", what="alias input"),
+        project="legacy",
+        idempotency_key="70000000-0000-4000-8000-000000000003",
+    )
+    record = service.get_memory_record(str(saved["id"]))
+
+    assert record is not None
+    assert record["project"] == canonical
+    assert Path(str(saved["file_path"])).parent.name == canonical
+    assert service.db.get_operation(
+        canonical,
+        "70000000-0000-4000-8000-000000000003",
+    ) is not None
+    assert service.db.get_operation(
+        "legacy",
+        "70000000-0000-4000-8000-000000000003",
+    ) is None
+
+
+def test_replay_scans_every_alias_directory_under_one_canonical_scope(
+    service: MemoryService,
+    tmp_path: Path,
+) -> None:
+    canonical = "project--111111111111"
+    operation_id = "70000000-0000-4000-8000-000000000004"
+    raw = RawMemoryInput(title="Alias replay", what="canonical request")
+    created = service.save(raw, project=canonical, idempotency_key=operation_id)
+    canonical_path = Path(str(created["file_path"]))
+    alias_path = canonical_path.parent.parent / "legacy" / canonical_path.name
+    alias_path.parent.mkdir()
+    canonical_path.replace(alias_path)
+    _adopt_alias(service, tmp_path, canonical=canonical, alias="legacy")
+
+    replayed = service.save(raw, project="legacy", idempotency_key=operation_id)
+
+    assert replayed["id"] == created["id"]
+    assert replayed["action"] == "replayed"
+    assert replayed["file_path"] == str(alias_path)
+    record = service.get_memory_record(str(created["id"]))
+    assert record is not None
+    assert record["project"] == canonical
+    assert record["file_path"] == str(alias_path)
+
+
+def test_duplicate_operation_across_scope_files_is_rejected_as_ambiguous(
+    service: MemoryService,
+    tmp_path: Path,
+) -> None:
+    canonical = "project--111111111111"
+    operation_id = "70000000-0000-4000-8000-000000000005"
+    raw = RawMemoryInput(title="Ambiguous operation", what="same operation twice")
+    saved = service.save(raw, project=canonical, idempotency_key=operation_id)
+    canonical_path = Path(str(saved["file_path"]))
+    alias_path = canonical_path.parent.parent / "legacy" / canonical_path.name
+    alias_path.parent.mkdir()
+    alias_path.write_bytes(canonical_path.read_bytes())
+    _adopt_alias(service, tmp_path, canonical=canonical, alias="legacy")
+    before = canonical_path.read_bytes(), alias_path.read_bytes()
+
+    with pytest.raises(CanonicalDriftError, match="ambiguous|multiple"):
+        service.save(raw, project=canonical, idempotency_key=operation_id)
+
+    assert (canonical_path.read_bytes(), alias_path.read_bytes()) == before
+
+
+def test_duplicate_memory_id_across_scope_files_is_rejected_as_ambiguous(
+    service: MemoryService,
+    tmp_path: Path,
+) -> None:
+    canonical = "project--111111111111"
+    saved = service.save(
+        RawMemoryInput(title="Ambiguous memory", what="old"),
+        project=canonical,
+        idempotency_key="70000000-0000-4000-8000-000000000006",
+    )
+    canonical_path = Path(str(saved["file_path"]))
+    alias_path = canonical_path.parent.parent / "legacy" / canonical_path.name
+    alias_path.parent.mkdir()
+    alias_path.write_bytes(canonical_path.read_bytes())
+    _adopt_alias(service, tmp_path, canonical=canonical, alias="legacy")
+    before = canonical_path.read_bytes(), alias_path.read_bytes()
+
+    with pytest.raises(CanonicalDriftError, match="ambiguous|multiple"):
+        service.save(
+            RawMemoryInput(title="Ambiguous memory", what="new"),
+            project=canonical,
+            idempotency_key="70000000-0000-4000-8000-000000000007",
+        )
+
+    assert (canonical_path.read_bytes(), alias_path.read_bytes()) == before
+
+
+@pytest.mark.parametrize("indexed_path", ["", "outside"])
+def test_duplicate_rewrite_uses_canonical_scan_not_indexed_file_path(
+    service: MemoryService,
+    tmp_path: Path,
+    indexed_path: str,
+) -> None:
+    saved = service.save(
+        RawMemoryInput(title="Indexed path", what="old"),
+        project="safe-project",
+        idempotency_key="70000000-0000-4000-8000-000000000008",
+    )
+    canonical_path = Path(str(saved["file_path"]))
+    outside = tmp_path / "outside.md"
+    outside.write_text("do not rewrite\n", encoding="utf-8")
+    untrusted = "" if indexed_path == "" else str(outside)
+    with service.db.transaction():
+        service.db.conn.execute(
+            "UPDATE memories SET file_path = ? WHERE id = ?",
+            (untrusted, saved["id"]),
+        )
+    before_outside = outside.read_bytes()
+
+    updated = service.save(
+        RawMemoryInput(title="Indexed path", what="new"),
+        project="safe-project",
+        idempotency_key="70000000-0000-4000-8000-000000000009",
+    )
+
+    assert updated["id"] == saved["id"]
+    assert updated["file_path"] == str(canonical_path)
+    assert _canonical_memory(updated).what == "new"
+    assert outside.read_bytes() == before_outside
+
+
+def test_embedding_failure_returns_redacted_degraded_status(
+    service: MemoryService,
+) -> None:
+    secret = "provider-secret-token"
+
+    def fail(_text: str) -> list[float]:
+        raise RuntimeError(secret)
+
+    service.persistence.embed = fail
+    saved = service.save(
+        RawMemoryInput(title="Degraded vector", what="canonical save succeeds"),
+        project="safe-project",
+        idempotency_key="70000000-0000-4000-8000-000000000010",
+    )
+
+    assert saved["vector_status"] == "degraded"
+    assert saved["warning"] == "Memory saved, but semantic indexing is temporarily unavailable."
+    assert saved["warning"] in saved["warnings"]
+    assert secret not in json.dumps(saved, sort_keys=True)
+    assert service.get_memory_record(str(saved["id"])) is not None
+    assert service.db.has_vector(str(saved["id"])) is False
+
+
+def test_failed_replay_embedding_preserves_existing_current_vector(
+    service: MemoryService,
+) -> None:
+    operation_id = "70000000-0000-4000-8000-000000000011"
+    raw = RawMemoryInput(title="Preserve vector", what="unchanged replay")
+    created = service.save(raw, project="safe-project", idempotency_key=operation_id)
+    assert created["vector_status"] == "ready"
+    assert service.db.has_vector(str(created["id"])) is True
+
+    service.persistence.embed = lambda _text: (_ for _ in ()).throw(
+        RuntimeError("provider unavailable")
+    )
+    replayed = service.save(raw, project="safe-project", idempotency_key=operation_id)
+
+    assert replayed["action"] == "replayed"
+    assert replayed["vector_status"] == "degraded"
+    assert service.db.has_vector(str(created["id"])) is True
+
+
+def test_replay_repairs_vector_after_provider_recovers(
+    service: MemoryService,
+) -> None:
+    operation_id = "70000000-0000-4000-8000-000000000012"
+    raw = RawMemoryInput(title="Recover vector", what="retry same operation")
+    healthy_embed = service.persistence.embed
+    service.persistence.embed = lambda _text: (_ for _ in ()).throw(
+        RuntimeError("provider unavailable")
+    )
+    created = service.save(raw, project="safe-project", idempotency_key=operation_id)
+    assert created["vector_status"] == "degraded"
+    assert service.db.has_vector(str(created["id"])) is False
+
+    service.persistence.embed = healthy_embed
+    replayed = service.save(raw, project="safe-project", idempotency_key=operation_id)
+
+    assert replayed["action"] == "replayed"
+    assert replayed["vector_status"] == "ready"
+    assert service.db.has_vector(str(created["id"])) is True
+    assert len(json.loads(service.get_memory_record(str(created["id"]))["operation_history"])) == 1
+
+
+def test_session_filename_uses_captured_request_timestamp(
+    service: MemoryService,
+) -> None:
+    saved = service.persistence.save(
+        SaveRequest(
+            raw=RawMemoryInput(title="Captured date", what="stable across midnight"),
+            project="safe-project",
+            source="codex",
+            operation_id="70000000-0000-4000-8000-000000000013",
+            timestamp="2025-12-31T23:59:59.999999+00:00",
+        )
+    )
+
+    assert Path(str(saved["file_path"])).name == "2025-12-31-session.md"

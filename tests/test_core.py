@@ -1,7 +1,7 @@
 """Tests for core MemoryService."""
 
 import os
-from datetime import date
+from datetime import datetime, timezone
 from unittest.mock import patch
 
 import pytest
@@ -28,7 +28,7 @@ def test_save_creates_markdown_file(env_home):
     assert os.path.exists(result["file_path"])
 
     # Verify file is in correct location
-    today = date.today().isoformat()
+    today = datetime.now(timezone.utc).date().isoformat()
     expected_path = os.path.join(
         str(env_home), "vault", "test-project", f"{today}-session.md"
     )
