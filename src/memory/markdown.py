@@ -55,7 +55,6 @@ MEMORY_OPERATION_KEYS = frozenset({
     "commit_sha",
 })
 SCHEMA_V1_MIGRATION_COMMAND = "memory migrate vault-metadata"
-NULL_READABLE_V2_PREFIX = "<!-- echovault-null-v2:"
 
 
 class LegacySchemaWriteError(ValueError):
@@ -164,15 +163,26 @@ def _is_string_list(value: object) -> bool:
     return isinstance(value, list) and all(isinstance(item, str) for item in value)
 
 
-def _validate_finite_json(value: object, path: str = "metadata") -> None:
-    if isinstance(value, float) and not math.isfinite(value):
-        raise ValueError(f"Schema-v2 {path} contains a non-finite number")
+def _validate_json_native(value: object, path: str = "metadata") -> None:
+    if value is None or isinstance(value, (bool, int, str)):
+        return
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError(f"Schema-v2 {path} contains a non-finite number")
+        return
+    if isinstance(value, list):
+        for index, nested in enumerate(value):
+            _validate_json_native(nested, f"{path}[{index}]")
+        return
     if isinstance(value, dict):
         for key, nested in value.items():
-            _validate_finite_json(nested, f"{path}.{key}")
-    elif isinstance(value, (list, tuple)):
-        for index, nested in enumerate(value):
-            _validate_finite_json(nested, f"{path}[{index}]")
+            if not isinstance(key, str):
+                raise ValueError(f"Schema-v2 {path} contains a non-string object key")
+            _validate_json_native(nested, f"{path}.{key}")
+        return
+    raise ValueError(
+        f"Schema-v2 {path} contains non-JSON-native type {type(value).__name__}"
+    )
 
 
 def _validate_memory_operation(operation: object, index: int) -> dict:
@@ -195,7 +205,7 @@ def _validate_v2_metadata(metadata: object) -> dict:
     """Validate the complete, typed schema-v2 per-entry metadata object."""
     if not isinstance(metadata, dict):
         raise ValueError("Schema-v2 metadata must be an object")
-    _validate_finite_json(metadata)
+    _validate_json_native(metadata)
 
     keys = set(metadata)
     missing = sorted(SCHEMA_V2_METADATA_KEYS - keys)
@@ -304,7 +314,7 @@ def _entry_from_memory(mem: Memory, details: Optional[str] = None) -> SessionEnt
             "valid_until": mem.valid_until,
             "commit_sha": mem.commit_sha,
             "branch": mem.branch,
-            "links": mem.links,
+            "links": list(mem.links),
             "last_verified": mem.last_verified,
         },
         metadata=_metadata_from_memory(mem),
@@ -362,23 +372,21 @@ def _metadata_for_render(entry: SessionEntry) -> dict:
     return _validate_v2_metadata(metadata)
 
 
-def _render_v2_field(label: str, value: str) -> list[str]:
-    parts = value.split("\n")
-    lines = [f"**{label}:** {parts[0]}"]
-    lines.extend(f"**{label}+:** {part}" for part in parts[1:])
-    return lines
+def _render_v2_json_record(label: str, value: Optional[str]) -> str:
+    return (
+        f"**{label}:** "
+        + json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+    )
 
 
-def _render_v2_nullable_field(label: str, value: Optional[str]) -> list[str]:
-    if value is None:
-        return [f"**{label}:** ", f"{NULL_READABLE_V2_PREFIX} {label} -->"]
-    return _render_v2_field(label, value)
+def _title_preview(title: str) -> str:
+    return re.split(r"\r\n|\r|\n", title, maxsplit=1)[0]
 
 
 def render_entry(entry: SessionEntry, *, schema_version: int = 1) -> str:
     """Render a single parsed session entry."""
-    title_parts = entry.title.split("\n") if schema_version == 2 else [entry.title]
-    lines = [f"### {title_parts[0]}"]
+    rendered_title = _title_preview(entry.title) if schema_version == 2 else entry.title
+    lines = [f"### {rendered_title}"]
     if entry.id:
         lines.append(f"<!-- memory-id: {entry.id} -->")
     elif schema_version == 2:
@@ -391,16 +399,14 @@ def render_entry(entry: SessionEntry, *, schema_version: int = 1) -> str:
             allow_nan=False,
         ).replace("--", "\\u002d\\u002d")
         lines.append(f"{METADATA_V2_PREFIX} {metadata_json} -->")
-        lines.extend(f"**Title+:** {part}" for part in title_parts[1:])
-        lines.extend(_render_v2_field("What", entry.what))
+        lines.append(_render_v2_json_record("Title", entry.title))
+        lines.append(_render_v2_json_record("What", entry.what))
+        lines.append(_render_v2_json_record("Why", entry.why))
+        lines.append(_render_v2_json_record("Impact", entry.impact))
+        lines.append(_render_v2_json_record("Source", entry.source))
+        lines.append(_render_v2_json_record("Details", entry.details))
     else:
         lines.append(f"**What:** {entry.what}")
-
-    if schema_version == 2:
-        lines.extend(_render_v2_nullable_field("Why", entry.why))
-        lines.extend(_render_v2_nullable_field("Impact", entry.impact))
-        lines.extend(_render_v2_nullable_field("Source", entry.source))
-    else:
         if entry.why is not None:
             lines.append(f"**Why:** {entry.why}")
         if entry.impact is not None:
@@ -424,7 +430,7 @@ def render_entry(entry: SessionEntry, *, schema_version: int = 1) -> str:
         if entry.superseded_by is not None:
             lines.append(f"**Superseded By:** {entry.superseded_by}")
 
-    if entry.details is not None:
+    if schema_version == 1 and entry.details is not None:
         lines.append("")
         lines.append("<details>")
         lines.append(entry.details)
@@ -669,30 +675,19 @@ def _parse_entries_v1(body: str) -> list[SessionEntry]:
             )
             details_lines: list[str] = []
             in_details = False
-            metadata_seen = False
 
             i += 1
             while i < len(lines) and not lines[i].startswith("### ") and not lines[i].startswith("## "):
                 stripped = lines[i].strip()
-                if stripped.startswith(MEMORY_ID_PREFIX):
-                    entry.id = stripped.removeprefix(MEMORY_ID_PREFIX).removesuffix("-->").strip()
-                elif stripped.startswith(METADATA_V2_PREFIX):
-                    if not stripped.endswith("-->"):
-                        raise ValueError(f"Unterminated schema-v2 metadata for memory {entry.id}")
-                    payload = stripped.removeprefix(METADATA_V2_PREFIX).removesuffix("-->").strip()
-                    try:
-                        entry.metadata = json.loads(payload)
-                    except json.JSONDecodeError as exc:
-                        raise ValueError(
-                            f"Invalid schema-v2 metadata JSON for memory {entry.id}"
-                        ) from exc
-                    metadata_seen = True
+                if in_details:
+                    if stripped == "</details>":
+                        in_details = False
+                    else:
+                        details_lines.append(lines[i])
                 elif stripped == "<details>":
                     in_details = True
-                elif stripped == "</details>":
-                    in_details = False
-                elif in_details:
-                    details_lines.append(lines[i])
+                elif stripped.startswith(MEMORY_ID_PREFIX):
+                    entry.id = stripped.removeprefix(MEMORY_ID_PREFIX).removesuffix("-->").strip()
                 elif stripped.startswith("**What:**"):
                     entry.what = stripped[len("**What:**"):].strip()
                 elif stripped.startswith("**Why:**"):
@@ -729,11 +724,23 @@ def _load_schema_v2_json(payload: str, context: str) -> object:
     def reject_constant(value: str) -> None:
         raise ValueError(f"Non-finite JSON constant {value}")
 
+    def reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"Duplicate JSON object key {key}")
+            result[key] = value
+        return result
+
     try:
-        value = json.loads(payload, parse_constant=reject_constant)
+        value = json.loads(
+            payload,
+            parse_constant=reject_constant,
+            object_pairs_hook=reject_duplicate_keys,
+        )
     except (json.JSONDecodeError, ValueError) as exc:
         raise ValueError(f"Invalid schema-v2 JSON in {context}") from exc
-    _validate_finite_json(value, context)
+    _validate_json_native(value, context)
     return value
 
 
@@ -754,15 +761,18 @@ def _parse_metadata_v2_line(line: str, memory_id: str) -> dict:
     return _validate_v2_metadata(metadata)
 
 
-def _parse_v2_field_value(line: str, prefix: str) -> str:
-    remainder = line[len(prefix):]
-    if not remainder.startswith(" "):
-        raise ValueError(f"Schema-v2 readable field {prefix} requires one delimiter space")
-    return remainder[1:]
+def _parse_v2_json_record(line: str, label: str, memory_id: str) -> object:
+    prefix = f"**{label}:**"
+    if not line.startswith(prefix):
+        raise ValueError(f"Missing schema-v2 {label} record for memory {memory_id}")
+    payload = line[len(prefix):]
+    if not payload.startswith(" "):
+        raise ValueError(f"Schema-v2 {label} record requires one delimiter space")
+    return _load_schema_v2_json(payload[1:], f"{label} for memory {memory_id}")
 
 
 def _parse_entries_v2(body: str) -> list[SessionEntry]:
-    """Parse canonical v2 entries using structural comment placement and field states."""
+    """Parse canonical v2 entries with adjacent structural comments and JSON records."""
     lines = body.split("\n")
     entry_starts: list[int] = []
     consumed_comments: set[int] = set()
@@ -770,13 +780,10 @@ def _parse_entries_v2(body: str) -> list[SessionEntry]:
     for index, line in enumerate(lines):
         if not line.startswith("### "):
             continue
-        next_line = lines[index + 1] if index + 1 < len(lines) else ""
-        metadata_next = next_line.startswith(METADATA_V2_PREFIX)
-        if metadata_next:
-            raise ValueError("Schema-v2 metadata must follow a stable memory ID")
-        if not next_line.startswith(MEMORY_ID_PREFIX):
-            continue
+        id_index = index + 1
         metadata_index = index + 2
+        if id_index >= len(lines) or not lines[id_index].startswith(MEMORY_ID_PREFIX):
+            raise ValueError("Every schema-v2 entry heading must be followed by a stable ID")
         if metadata_index >= len(lines) or not lines[metadata_index].startswith(
             METADATA_V2_PREFIX
         ):
@@ -784,7 +791,7 @@ def _parse_entries_v2(body: str) -> list[SessionEntry]:
                 "Schema-v2 memory ID must be immediately followed by metadata"
             )
         entry_starts.append(index)
-        consumed_comments.update({index + 1, metadata_index})
+        consumed_comments.update({id_index, metadata_index})
 
     for index, line in enumerate(lines):
         stripped = line.strip()
@@ -796,7 +803,7 @@ def _parse_entries_v2(body: str) -> list[SessionEntry]:
 
     entries: list[SessionEntry] = []
     seen_ids: set[str] = set()
-    readable_labels = ("What", "Why", "Impact", "Source")
+    readable_labels = ("Title", "What", "Why", "Impact", "Source", "Details")
 
     for position, start in enumerate(entry_starts):
         end = entry_starts[position + 1] if position + 1 < len(entry_starts) else len(lines)
@@ -805,99 +812,23 @@ def _parse_entries_v2(body: str) -> list[SessionEntry]:
             raise ValueError(f"Duplicate schema-v2 memory ID: {memory_id}")
         seen_ids.add(memory_id)
         metadata = _parse_metadata_v2_line(lines[start + 2], memory_id)
-
-        title_parts = [lines[start][4:]]
-        field_parts: dict[str, list[str]] = {}
-        seen_fields: set[str] = set()
-        null_fields: set[str] = set()
-        current_field = "Title"
-        details: Optional[str] = None
-        details_lines: list[str] = []
-        in_details = False
-        details_seen = False
+        fields: dict[str, object] = {}
         living_data: dict = {}
 
-        index = start + 3
-        while index < end:
-            line = lines[index]
-            if in_details:
-                if line == "</details>":
-                    details = "\n".join(details_lines)
-                    in_details = False
-                    current_field = ""
-                else:
-                    details_lines.append(line)
-                index += 1
-                continue
-
-            if line == "<details>":
-                if details_seen:
-                    raise ValueError(f"Duplicate details block for memory {memory_id}")
-                details_seen = True
-                in_details = True
-                details_lines = []
-                current_field = ""
-                index += 1
-                continue
-            if line == "</details>":
-                raise ValueError(f"Unexpected details terminator for memory {memory_id}")
-
-            title_prefix = "**Title+:**"
-            if line.startswith(title_prefix):
-                if seen_fields or current_field != "Title":
-                    raise ValueError(f"Misplaced title continuation for memory {memory_id}")
-                title_parts.append(_parse_v2_field_value(line, title_prefix))
-                index += 1
-                continue
-
-            matched_field = False
-            for label in readable_labels:
-                prefix = f"**{label}:**"
-                continuation_prefix = f"**{label}+:**"
-                if line.startswith(prefix):
-                    if label in seen_fields:
-                        raise ValueError(
-                            f"Duplicate schema-v2 readable field {label} for memory {memory_id}"
-                        )
-                    seen_fields.add(label)
-                    field_parts[label] = [_parse_v2_field_value(line, prefix)]
-                    current_field = label
-                    matched_field = True
-                    break
-                if line.startswith(continuation_prefix):
-                    if label not in seen_fields or current_field != label:
-                        raise ValueError(
-                            f"Misplaced schema-v2 {label} continuation for memory {memory_id}"
-                        )
-                    field_parts[label].append(
-                        _parse_v2_field_value(line, continuation_prefix)
+        for line in lines[start + 3:end]:
+            matched_label = next(
+                (label for label in readable_labels if line.startswith(f"**{label}:**")),
+                None,
+            )
+            if matched_label is not None:
+                if matched_label in fields:
+                    raise ValueError(
+                        f"Duplicate schema-v2 readable field {matched_label} "
+                        f"for memory {memory_id}"
                     )
-                    matched_field = True
-                    break
-            if matched_field:
-                index += 1
-                continue
-
-            if line.startswith(NULL_READABLE_V2_PREFIX):
-                null_label = next(
-                    (
-                        label
-                        for label in ("Why", "Impact", "Source")
-                        if line == f"{NULL_READABLE_V2_PREFIX} {label} -->"
-                    ),
-                    None,
+                fields[matched_label] = _parse_v2_json_record(
+                    line, matched_label, memory_id
                 )
-                if (
-                    null_label is None
-                    or null_label not in seen_fields
-                    or current_field != null_label
-                    or field_parts[null_label] != [""]
-                    or null_label in null_fields
-                ):
-                    raise ValueError(f"Misplaced schema-v2 null field for memory {memory_id}")
-                null_fields.add(null_label)
-                current_field = ""
-                index += 1
                 continue
 
             living_prefix = "**Living Memory:**"
@@ -911,46 +842,55 @@ def _parse_entries_v2(body: str) -> list[SessionEntry]:
                 if not isinstance(loaded_living_data, dict):
                     raise ValueError(f"Living data for memory {memory_id} must be an object")
                 living_data = loaded_living_data
-                current_field = ""
-                index += 1
                 continue
 
-            if line.startswith(("**Category:**", "**Archived:**", "**Archive Reason:**", "**Superseded By:**")):
-                current_field = ""
-                index += 1
+            if line.startswith(
+                (
+                    "**Category:**",
+                    "**Archived:**",
+                    "**Archive Reason:**",
+                    "**Superseded By:**",
+                )
+            ):
                 continue
             if line.startswith("**") and ":**" in line:
                 raise ValueError(f"Unknown schema-v2 readable field for memory {memory_id}")
-            current_field = ""
-            index += 1
 
-        if in_details:
-            raise ValueError(f"Unterminated details block for memory {memory_id}")
-        missing_fields = sorted(set(readable_labels) - seen_fields)
+        missing_fields = sorted(set(readable_labels) - set(fields))
         if missing_fields:
             raise ValueError(
                 f"Missing schema-v2 readable fields for memory {memory_id}: "
                 + ", ".join(missing_fields)
             )
+        if not isinstance(fields["Title"], str) or not isinstance(fields["What"], str):
+            raise ValueError(f"Schema-v2 Title and What must be strings for memory {memory_id}")
+        for label in ("Why", "Impact", "Source", "Details"):
+            if fields[label] is not None and not isinstance(fields[label], str):
+                raise ValueError(
+                    f"Schema-v2 {label} must be a string or null for memory {memory_id}"
+                )
+        if lines[start][4:] != _title_preview(fields["Title"]):
+            raise ValueError(f"Schema-v2 title preview does not match memory {memory_id}")
 
-        entry = SessionEntry(
-            id=memory_id,
-            title="\n".join(title_parts),
-            what="\n".join(field_parts["What"]),
-            why=None if "Why" in null_fields else "\n".join(field_parts["Why"]),
-            impact=None if "Impact" in null_fields else "\n".join(field_parts["Impact"]),
-            source=None if "Source" in null_fields else "\n".join(field_parts["Source"]),
-            details=details,
-            category=metadata["category"],
-            status=metadata["status"],
-            archived_at=metadata["archived_at"],
-            archive_reason=metadata["archive_reason"],
-            superseded_by=metadata["superseded_by"],
-            section_anchor=metadata["section_anchor"],
-            living_data=living_data,
-            metadata=metadata,
-            metadata_complete=True,
+        entries.append(
+            SessionEntry(
+                id=memory_id,
+                title=fields["Title"],
+                what=fields["What"],
+                why=fields["Why"],
+                impact=fields["Impact"],
+                source=fields["Source"],
+                details=fields["Details"],
+                category=metadata["category"],
+                status=metadata["status"],
+                archived_at=metadata["archived_at"],
+                archive_reason=metadata["archive_reason"],
+                superseded_by=metadata["superseded_by"],
+                section_anchor=metadata["section_anchor"],
+                living_data=living_data,
+                metadata=metadata,
+                metadata_complete=True,
+            )
         )
-        entries.append(entry)
 
     return entries

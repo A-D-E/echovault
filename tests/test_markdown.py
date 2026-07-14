@@ -130,31 +130,35 @@ class TestRenderSection:
         result = render_section(sample_memory)
 
         assert "### Use FastAPI for API endpoints" in result
-        assert "**What:** Implemented REST API using FastAPI framework" in result
-        assert "**Why:** FastAPI provides automatic validation and documentation" in result
-        assert "**Impact:** Reduces boilerplate code by 40%" in result
-        assert "**Source:** claude-code" in result
+        assert '**What:** "Implemented REST API using FastAPI framework"' in result
+        assert '**Why:** "FastAPI provides automatic validation and documentation"' in result
+        assert '**Impact:** "Reduces boilerplate code by 40%"' in result
+        assert '**Source:** "claude-code"' in result
+        assert "**Details:** null" in result
         assert "<details>" not in result
 
     def test_render_section_with_details(self, sample_memory: Memory) -> None:
-        """Test rendering section with details tag."""
+        """Test rendering details as a JSON-encoded readable record."""
         details = "Here is the full implementation:\n\n```python\nfrom fastapi import FastAPI\n```"
         result = render_section(sample_memory, details=details)
 
         assert "### Use FastAPI for API endpoints" in result
-        assert "<details>" in result
-        assert details in result
-        assert "</details>" in result
+        assert (
+            '**Details:** "Here is the full implementation:\\n\\n```python\\n'
+            'from fastapi import FastAPI\\n```"'
+        ) in result
+        assert "<details>" not in result
 
     def test_render_section_without_optional_fields(self, minimal_memory: Memory) -> None:
-        """Test rendering explicit null markers for optional v2 fields."""
+        """Test rendering explicit JSON nulls for optional v2 fields."""
         result = render_section(minimal_memory)
 
         assert "### Basic memory" in result
-        assert "**What:** Simple memory entry" in result
-        assert "**Why:** \n<!-- echovault-null-v2: Why -->" in result
-        assert "**Impact:** \n<!-- echovault-null-v2: Impact -->" in result
-        assert "**Source:** \n<!-- echovault-null-v2: Source -->" in result
+        assert '**What:** "Simple memory entry"' in result
+        assert "**Why:** null" in result
+        assert "**Impact:** null" in result
+        assert "**Source:** null" in result
+        assert "**Details:** null" in result
         assert "<details>" not in result
 
 
@@ -193,7 +197,7 @@ class TestWriteSessionMemory:
 
         # Check memory section
         assert "### Use FastAPI for API endpoints" in content
-        assert "**What:** Implemented REST API using FastAPI framework" in content
+        assert '**What:** "Implemented REST API using FastAPI framework"' in content
 
     def test_write_appends_to_existing_same_category(self, temp_vault: str, sample_memory: Memory) -> None:
         """Test appending to existing session under same category."""
@@ -327,15 +331,14 @@ class TestWriteSessionMemory:
         assert "sources: [claude-code, user]" in content
 
     def test_write_with_details(self, temp_vault: str, sample_memory: Memory) -> None:
-        """Test writing memory with details section."""
+        """Test writing memory with an encoded details record."""
         details = "Full implementation details here"
         file_path = write_session_memory(temp_vault, sample_memory, "2026-01-22", details=details)
 
         content = Path(file_path).read_text()
 
-        assert "<details>" in content
-        assert details in content
-        assert "</details>" in content
+        assert '**Details:** "Full implementation details here"' in content
+        assert "<details>" not in content
 
     def test_write_maintains_category_order(self, temp_vault: str) -> None:
         """Test that categories are inserted in correct order."""
@@ -787,3 +790,188 @@ def test_legacy_render_entry_behavior_remains_available() -> None:
     assert rendered.startswith("### Legacy entry\n<!-- memory-id: legacy-1 -->")
     assert "**What:** Readable legacy value" in rendered
     assert "echovault-metadata-v2" not in rendered
+
+
+def test_schema_v2_rejects_entry_heading_without_id_and_metadata(
+    tmp_path: Path, sample_memory: Memory
+) -> None:
+    lines = render_session_document(document_with(sample_memory)).splitlines()
+    id_index = next(i for i, line in enumerate(lines) if line.startswith("<!-- memory-id:"))
+    lines.pop(id_index)
+    lines.pop(id_index)
+    path = tmp_path / "missing-entry-comments.md"
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        parse_session_file(path)
+
+
+@pytest.mark.parametrize("details", ["", "\r", "\r\n", "\n\n", "  leading\ntrailing  "])
+def test_schema_v2_details_json_record_round_trips_exact_values(
+    tmp_path: Path, sample_memory: Memory, details: str
+) -> None:
+    document = document_with(sample_memory)
+    document.entries[0].details = details
+    path = tmp_path / "details-values.md"
+    path.write_text(render_session_document(document), encoding="utf-8")
+
+    assert parse_session_file(path).entries[0].details == details
+
+
+def test_schema_v2_details_json_record_round_trips_arbitrary_reserved_text(
+    tmp_path: Path, sample_memory: Memory
+) -> None:
+    canonical = render_session_document(document_with(sample_memory))
+    metadata_line = next(
+        line
+        for line in canonical.splitlines()
+        if line.startswith("<!-- echovault-metadata-v2:")
+    )
+    details = (
+        "\r\n  leading whitespace\r"
+        "<!-- memory-id: literal-detail-id -->\n"
+        "<!-- echovault-metadata-v2: {malformed detail json} -->\r\n"
+        "### Full canonical-looking entry\n"
+        "<!-- memory-id: fake-entry -->\n"
+        f"{metadata_line}\n"
+        "<details>\n</details>\n"
+        "\ntrailing whitespace  \r\n"
+    )
+    document = document_with(sample_memory)
+    document.entries[0].details = details
+    path = tmp_path / "arbitrary-details.md"
+    path.write_text(render_session_document(document), encoding="utf-8")
+
+    parsed = parse_session_file(path)
+
+    assert len(parsed.entries) == 1
+    assert parsed.entries[0].details == details
+
+
+@pytest.mark.parametrize("corruption", ["duplicate", "malformed"])
+def test_schema_v2_rejects_duplicate_or_malformed_details_records(
+    tmp_path: Path, sample_memory: Memory, corruption: str
+) -> None:
+    lines = render_session_document(document_with(sample_memory)).splitlines()
+    details_index = next(
+        i for i, line in enumerate(lines) if line.startswith("**Details:**")
+    )
+    if corruption == "duplicate":
+        lines.insert(details_index + 1, lines[details_index])
+    else:
+        lines[details_index] = "**Details:** {not valid json}"
+    path = tmp_path / f"details-{corruption}.md"
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        parse_session_file(path)
+
+
+def test_schema_v2_readable_json_records_preserve_control_characters(
+    tmp_path: Path, sample_memory: Memory
+) -> None:
+    sample_memory.title = "title\rwith\r\nlines\\and trailing spaces  "
+    sample_memory.what = "what\r\n\rblank\\literal\\n  "
+    sample_memory.why = "why\rending"
+    sample_memory.impact = "impact\\\r\nnext  "
+    sample_memory.source = "cursor\r\nwindows\\path\\"
+    document = document_with(sample_memory)
+    path = tmp_path / "control-characters.md"
+    path.write_text(render_session_document(document), encoding="utf-8")
+
+    entry = parse_session_file(path).entries[0]
+
+    assert entry.title == sample_memory.title
+    assert entry.what == sample_memory.what
+    assert entry.why == sample_memory.why
+    assert entry.impact == sample_memory.impact
+    assert entry.source == sample_memory.source
+
+
+@pytest.mark.parametrize(
+    "structured_data",
+    [
+        {"tuple": (1, 2)},
+        {"set": {1, 2}},
+        {1: "non-string key"},
+        {"nested": [None, True, {"value": float("inf")}]},
+    ],
+)
+def test_schema_v2_rejects_non_json_native_structured_data_before_render(
+    sample_memory: Memory, structured_data: dict
+) -> None:
+    sample_memory.structured_data = structured_data
+
+    with pytest.raises(ValueError):
+        render_session_document(document_with(sample_memory))
+
+
+def test_schema_v2_to_memory_rejects_non_json_native_structured_data(
+    sample_memory: Memory,
+) -> None:
+    entry = _entry_from_memory(sample_memory)
+    entry.metadata["structured_data"] = {"tuple": (1, 2)}
+
+    with pytest.raises(ValueError):
+        entry.to_memory(file_path="session.md")
+
+
+@pytest.mark.parametrize("duplicate", ["top_level", "nested"])
+def test_schema_v2_rejects_duplicate_json_object_keys(
+    tmp_path: Path, sample_memory: Memory, duplicate: str
+) -> None:
+    sample_memory.structured_data = {"nested": {"value": 1}}
+    rendered = render_session_document(document_with(sample_memory))
+    if duplicate == "top_level":
+        corrupted = rendered.replace(
+            '"project":"my-project"',
+            '"project":"my-project","project":"other-project"',
+            1,
+        )
+    else:
+        corrupted = rendered.replace(
+            '"nested":{"value":1}',
+            '"nested":{"value":1,"value":2}',
+            1,
+        )
+    assert corrupted != rendered
+    path = tmp_path / f"duplicate-{duplicate}.md"
+    path.write_text(corrupted, encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        parse_session_file(path)
+
+
+def test_schema_v2_entry_deep_copies_mutable_living_data_links(
+    sample_memory: Memory,
+) -> None:
+    sample_memory.links = ["https://example.test/original"]
+    entry = _entry_from_memory(sample_memory)
+
+    sample_memory.links.append("https://example.test/source-mutation")
+
+    assert entry.metadata["links"] == ["https://example.test/original"]
+    assert entry.living_data["links"] == ["https://example.test/original"]
+
+
+def test_schema_v1_details_keep_reserved_v2_comments_literal(tmp_path: Path) -> None:
+    path = tmp_path / "legacy-details.md"
+    details = (
+        "before\n"
+        "<!-- memory-id: literal-id -->\n"
+        "<!-- echovault-metadata-v2: {not valid json} -->\n"
+        '<!-- echovault-metadata-v2: {"valid":"but literal"} -->\n'
+        "after"
+    )
+    path.write_text(
+        "---\nproject: legacy\n---\n\n# Legacy\n\n"
+        "### Entry\n**What:** readable\n\n<details>\n"
+        f"{details}\n"
+        "</details>\n",
+        encoding="utf-8",
+    )
+
+    entry = parse_session_file(path).entries[0]
+
+    assert entry.id is None
+    assert entry.details == details
