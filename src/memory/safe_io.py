@@ -36,25 +36,28 @@ class ProcessFileLock:
     def __enter__(self) -> 'ProcessFileLock':
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._handle = self.path.open('a+b')
-        self._handle.seek(0)
-        if self._handle.read(1) == b'':
-            self._handle.write(b'0')
-            self._handle.flush()
-        deadline = time.monotonic() + self.timeout
-        while True:
+        try:
+            self._handle.seek(0)
+            if self._handle.read(1) == b'':
+                self._handle.write(b'0')
+                self._handle.flush()
+            deadline = time.monotonic() + self.timeout
+            while True:
+                try:
+                    self._acquire_once()
+                    return self
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise LockTimeoutError(f'Timed out acquiring lock: {self.path}')
+                    time.sleep(self.poll_interval)
+        except BaseException:
+            handle = self._handle
+            self._handle = None
             try:
-                self._acquire_once()
-                return self
-            except BlockingIOError:
-                if time.monotonic() >= deadline:
-                    self._handle.close()
-                    self._handle = None
-                    raise LockTimeoutError(f'Timed out acquiring lock: {self.path}')
-                time.sleep(self.poll_interval)
+                handle.close()
             except BaseException:
-                self._handle.close()
-                self._handle = None
-                raise
+                pass
+            raise
 
     def _acquire_once(self) -> None:
         assert self._handle is not None
@@ -123,6 +126,11 @@ class PreparedAtomicWrite:
     def replace(self) -> None:
         if self.original_mode is not None:
             self.temporary.chmod(self.original_mode)
+            descriptor = os.open(self.temporary, os.O_RDWR)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
         _replace_and_sync(self.temporary, self.target)
 
     def replace_if_digest(self, expected_digest: str | None) -> None:
