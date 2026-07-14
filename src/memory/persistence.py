@@ -146,22 +146,26 @@ class CanonicalPersistence:
         )
         redacted.source = source
         canonical_request = replace(validated_request, raw=redacted, source=source)
-        fingerprint = request_fingerprint(redacted, scope.canonical_key, source)
+        fingerprints = {
+            storage_key: request_fingerprint(redacted, storage_key, source)
+            for storage_key in scope.storage_keys
+        }
+        fingerprint = fingerprints[scope.canonical_key]
 
-        lock_path = self._contained_path(
-            self.memory_home,
-            self.memory_home / "locks" / f"{scope.canonical_key}.lock",
-            "project lock",
+        project_dirs = tuple(
+            (storage_key, self._project_dir(storage_key))
+            for storage_key in scope.storage_keys
         )
+        lock_path = self._lock_path(scope.canonical_key)
         with ProcessFileLock(lock_path):
-            documents = self._read_project_documents(scope.storage_keys)
+            documents = self._read_project_documents(project_dirs)
             canonical_operation = self._find_canonical_operation(
                 documents,
                 operation_id,
             )
             if canonical_operation is not None:
                 canonical, operation = canonical_operation
-                if operation.request_fingerprint != fingerprint:
+                if operation.request_fingerprint not in fingerprints.values():
                     raise SaveConflict(
                         f"Operation {operation_id!r} was already used with "
                         "a different request"
@@ -172,6 +176,10 @@ class CanonicalPersistence:
                     "Canonical memory ID",
                     CanonicalDriftError,
                 )
+                if memory.project not in scope.storage_keys:
+                    raise CanonicalDriftError(
+                        f"Canonical memory {memory.id} is outside the resolved project scope"
+                    )
                 details = canonical.entry.details
                 embedding_bytes = self._embedding_bytes(memory)
                 self._validate_content_fingerprint(memory, embedding_bytes)
@@ -182,11 +190,48 @@ class CanonicalPersistence:
                     and projection.get("content_fingerprint")
                     == memory.content_fingerprint
                 )
-                with self.db.transaction():
-                    self.db.upsert_memory(memory, details)
-                    self.db.upsert_operation(scope.canonical_key, memory.id, operation)
-                    if not vector_is_current:
-                        self.db.invalidate_vector(memory.id)
+                requires_rewrite = (
+                    memory.project != scope.canonical_key
+                    or canonical.document.project != scope.canonical_key
+                )
+                memory.project = scope.canonical_key
+                prepared = None
+                if requires_rewrite:
+                    canonical.document.project = scope.canonical_key
+                    upsert_session_memory_entry(canonical.document, memory, details)
+                    rendered = self._render_document(canonical.document)
+                    prepared = prepare_atomic_text(canonical.path, rendered)
+                try:
+                    if prepared is not None:
+                        self.fault("after_temp_fsync")
+                    with self.db.transaction():
+                        self.db.upsert_memory(memory, details)
+                        self.db.upsert_operation(
+                            scope.canonical_key,
+                            memory.id,
+                            operation,
+                        )
+                        alias_keys = tuple(
+                            key for key in scope.storage_keys if key != scope.canonical_key
+                        )
+                        if alias_keys:
+                            placeholders = ", ".join("?" for _ in alias_keys)
+                            self.db.conn.execute(
+                                f"DELETE FROM save_operations WHERE operation_id = ? "
+                                f"AND project IN ({placeholders})",
+                                (operation_id, *alias_keys),
+                            )
+                        if not vector_is_current:
+                            self.db.invalidate_vector(memory.id)
+                        if prepared is not None:
+                            self.fault("after_db_write")
+                            prepared.replace()
+                            self.fault("after_markdown_replace")
+                    if prepared is not None:
+                        self.fault("after_db_commit")
+                finally:
+                    if prepared is not None:
+                        prepared.discard()
                 result = {
                     "id": memory.id,
                     "file_path": str(canonical.path),
@@ -280,21 +325,53 @@ class CanonicalPersistence:
             ) from error
         return resolved_candidate
 
+    def _exact_child_path(
+        self,
+        root: Path,
+        candidate: Path,
+        child_name: str,
+        label: str,
+    ) -> Path:
+        resolved_root = self._contained_path(
+            self.memory_home,
+            root,
+            f"{label} root",
+        )
+        expected = resolved_root / child_name
+        resolved_candidate = candidate.resolve(strict=False)
+        if resolved_candidate != expected:
+            raise ProjectResolutionError(
+                f"Resolved {label} does not preserve its exact storage identity "
+                "containment"
+            )
+        return resolved_candidate
+
+    def _lock_path(self, canonical_key: str) -> Path:
+        canonical_key = validate_storage_key(canonical_key)
+        filename = f"{canonical_key}.lock"
+        locks_root = self.memory_home / "locks"
+        return self._exact_child_path(
+            locks_root,
+            locks_root / filename,
+            filename,
+            "project lock",
+        )
+
     def _project_dir(self, storage_key: str) -> Path:
         storage_key = validate_storage_key(storage_key)
-        return self._contained_path(
-            self.memory_home,
+        return self._exact_child_path(
+            self.vault_dir,
             self.vault_dir / storage_key,
+            storage_key,
             "vault project directory",
         )
 
     def _read_project_documents(
         self,
-        storage_keys: Sequence[str],
+        project_dirs: Sequence[tuple[str, Path]],
     ) -> dict[Path, SessionDocument]:
         documents: dict[Path, SessionDocument] = {}
-        for storage_key in storage_keys:
-            project_dir = self._project_dir(storage_key)
+        for _storage_key, project_dir in project_dirs:
             if not project_dir.exists():
                 continue
             if not project_dir.is_dir():
@@ -371,6 +448,36 @@ class CanonicalPersistence:
             )
         return matches[0]
 
+    @staticmethod
+    def _find_legacy_duplicate(
+        documents: dict[Path, SessionDocument],
+        duplicate: dict,
+    ) -> _CanonicalEntry | None:
+        indexed_path = duplicate.get("file_path")
+        indexed_title = duplicate.get("title")
+        indexed_anchor = duplicate.get("section_anchor")
+        if (
+            not isinstance(indexed_path, str)
+            or not indexed_path
+            or not isinstance(indexed_title, str)
+            or not isinstance(indexed_anchor, str)
+            or not indexed_anchor
+        ):
+            return None
+        resolved_path = Path(indexed_path).resolve(strict=False)
+        document = documents.get(resolved_path)
+        if document is None or document.schema_version != 1:
+            return None
+        matches = [
+            entry
+            for entry in document.entries
+            if entry.section_anchor == indexed_anchor
+            and entry.title.strip().casefold() == indexed_title.strip().casefold()
+        ]
+        if len(matches) != 1:
+            return None
+        return _CanonicalEntry(resolved_path, document, matches[0])
+
     def _prepare_change(
         self,
         request: SaveRequest,
@@ -423,6 +530,9 @@ class CanonicalPersistence:
             commit_sha=request.raw.commit_sha,
         )
         if duplicate is not None:
+            legacy = self._find_legacy_duplicate(documents, duplicate)
+            if legacy is not None:
+                self._require_v2(legacy.document)
             canonical = self._find_canonical_memory(documents, duplicate.get("id"))
             target = canonical.path
             document = canonical.document

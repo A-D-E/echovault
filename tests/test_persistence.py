@@ -9,7 +9,7 @@ import pytest
 
 from memory.core import MemoryService
 from memory.markdown import parse_session_file
-from memory.models import RawMemoryInput
+from memory.models import Memory, RawMemoryInput
 from memory.persistence import (
     CanonicalDriftError,
     LegacyMetadataRequiredError,
@@ -775,3 +775,176 @@ def test_session_filename_uses_captured_request_timestamp(
     )
 
     assert Path(str(saved["file_path"])).name == "2025-12-31-session.md"
+
+
+def test_same_home_project_symlink_cannot_alias_another_storage_key(
+    service: MemoryService,
+) -> None:
+    memory_home = Path(service.memory_home)
+    target = memory_home / "vault" / "other-project"
+    target.mkdir()
+    sentinel = target / "sentinel.txt"
+    sentinel.write_text("unchanged\n", encoding="utf-8")
+    try:
+        (memory_home / "vault" / "safe-project").symlink_to(
+            target,
+            target_is_directory=True,
+        )
+    except (NotImplementedError, OSError):
+        pytest.skip("symlinks are not supported on this platform")
+
+    with pytest.raises(ProjectResolutionError, match="identity|exact"):
+        service.save(
+            RawMemoryInput(title="Cross project", what="must not write"),
+            project="safe-project",
+            idempotency_key="71000000-0000-4000-8000-000000000001",
+        )
+
+    assert sentinel.read_text(encoding="utf-8") == "unchanged\n"
+    assert list(target.glob("*-session.md")) == []
+    assert not (memory_home / "locks").exists()
+
+
+def test_alias_directory_symlink_to_canonical_directory_is_rejected_before_lock(
+    service: MemoryService,
+    tmp_path: Path,
+) -> None:
+    memory_home = Path(service.memory_home)
+    canonical = "project--111111111111"
+    canonical_dir = memory_home / "vault" / canonical
+    canonical_dir.mkdir()
+    sentinel = canonical_dir / "sentinel.txt"
+    sentinel.write_text("unchanged\n", encoding="utf-8")
+    _adopt_alias(service, tmp_path, canonical=canonical, alias="legacy")
+    try:
+        (memory_home / "vault" / "legacy").symlink_to(
+            canonical_dir,
+            target_is_directory=True,
+        )
+    except (NotImplementedError, OSError):
+        pytest.skip("symlinks are not supported on this platform")
+
+    with pytest.raises(ProjectResolutionError, match="identity|exact"):
+        service.save(
+            RawMemoryInput(title="Alias path", what="must not write"),
+            project=canonical,
+            idempotency_key="71000000-0000-4000-8000-000000000002",
+        )
+
+    assert sentinel.read_text(encoding="utf-8") == "unchanged\n"
+    assert list(canonical_dir.glob("*-session.md")) == []
+    assert not (memory_home / "locks").exists()
+
+
+def test_lock_file_symlink_cannot_alias_another_same_home_file(
+    service: MemoryService,
+) -> None:
+    memory_home = Path(service.memory_home)
+    locks = memory_home / "locks"
+    locks.mkdir()
+    target = memory_home / "other-project.lock"
+    target.write_bytes(b"do-not-open")
+    try:
+        (locks / "safe-project.lock").symlink_to(target)
+    except (NotImplementedError, OSError):
+        pytest.skip("symlinks are not supported on this platform")
+
+    with pytest.raises(ProjectResolutionError, match="identity|exact"):
+        service.save(
+            RawMemoryInput(title="Lock alias", what="must not open target"),
+            project="safe-project",
+            idempotency_key="71000000-0000-4000-8000-000000000003",
+        )
+
+    assert target.read_bytes() == b"do-not-open"
+    assert list(Path(service.vault_dir).rglob("*-session.md")) == []
+    assert service.db.conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0] == 0
+
+
+def test_alias_authored_v2_replay_canonicalizes_project_once(
+    service: MemoryService,
+    tmp_path: Path,
+) -> None:
+    alias = "legacy"
+    canonical = "project--111111111111"
+    operation_id = "71000000-0000-4000-8000-000000000004"
+    raw = RawMemoryInput(title="Alias authored", what="before adoption")
+    created = service.save(raw, project=alias, idempotency_key=operation_id)
+    path = Path(str(created["file_path"]))
+    before_memory = _canonical_memory(created)
+    before_operations = list(before_memory.operations)
+    before_fingerprint = before_operations[0].request_fingerprint
+    assert before_memory.project == alias
+    assert service.db.has_vector(str(created["id"])) is True
+    _adopt_alias(service, tmp_path, canonical=canonical, alias=alias)
+
+    replayed_alias = service.save(raw, project=alias, idempotency_key=operation_id)
+    after_alias = _canonical_memory(replayed_alias)
+    canonical_ledger = service.db.get_operation(canonical, operation_id)
+    record = service.get_memory_record(str(created["id"]))
+
+    assert replayed_alias["action"] == "replayed"
+    assert after_alias.project == canonical
+    assert after_alias.operations == before_operations
+    assert after_alias.operations[0].request_fingerprint == before_fingerprint
+    assert record is not None
+    assert record["project"] == canonical
+    assert canonical_ledger is not None
+    assert canonical_ledger["request_fingerprint"] == before_fingerprint
+    assert service.db.get_operation(alias, operation_id) is None
+    assert service.db.has_vector(str(created["id"])) is True
+    canonicalized_bytes = path.read_bytes()
+
+    replayed_canonical = service.save(
+        raw,
+        project=canonical,
+        idempotency_key=operation_id,
+    )
+    assert replayed_canonical["action"] == "replayed"
+    assert replayed_canonical["id"] == created["id"]
+    assert path.read_bytes() == canonicalized_bytes
+    assert len(_canonical_memory(replayed_canonical).operations) == 1
+
+    with pytest.raises(SaveConflict):
+        service.save(
+            RawMemoryInput(title="Alias authored", what="different payload"),
+            project=alias,
+            idempotency_key=operation_id,
+        )
+
+
+def test_indexed_historical_v1_duplicate_requires_metadata_migration(
+    service: MemoryService,
+) -> None:
+    project = "safe-project"
+    legacy_path = Path(service.vault_dir) / project / "2020-01-02-session.md"
+    legacy_path.parent.mkdir()
+    legacy_path.write_text(
+        "---\nproject: safe-project\n---\n\n"
+        "# Historical Session\n\n"
+        "### Indexed legacy\n"
+        "**What:** old value\n",
+        encoding="utf-8",
+    )
+    parsed = parse_session_file(legacy_path)
+    entry = parsed.entries[0]
+    indexed = Memory.from_raw(
+        RawMemoryInput(title=entry.title, what=entry.what),
+        project=project,
+        file_path=str(legacy_path),
+    )
+    indexed.section_anchor = str(entry.section_anchor)
+    service.db.insert_memory(indexed)
+    before = legacy_path.read_bytes()
+
+    with pytest.raises(
+        LegacyMetadataRequiredError,
+        match="memory migrate vault-metadata",
+    ):
+        service.save(
+            RawMemoryInput(title="Indexed legacy", what="new value"),
+            project=project,
+            idempotency_key="71000000-0000-4000-8000-000000000005",
+        )
+
+    assert legacy_path.read_bytes() == before
