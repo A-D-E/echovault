@@ -975,3 +975,96 @@ def test_schema_v1_details_keep_reserved_v2_comments_literal(tmp_path: Path) -> 
 
     assert entry.id is None
     assert entry.details == details
+
+
+def test_schema_v2_archived_diagnostics_round_trip_only_through_metadata(
+    tmp_path: Path, sample_memory: Memory
+) -> None:
+    sample_memory.status = "archived"
+    sample_memory.category = "decision\r\n### category heading"
+    sample_memory.archived_at = (
+        "2026-07-14T11:30:00+00:00\r\n<!-- memory-id: archived-at -->"
+    )
+    sample_memory.archive_reason = (
+        "superseded  \\ path\n"
+        "<!-- echovault-metadata-v2: {not structure} -->"
+    )
+    sample_memory.superseded_by = "memory-2\r### superseded heading  "
+    document = document_with(sample_memory)
+    path = tmp_path / "archived-diagnostics.md"
+    rendered = render_session_document(document)
+    path.write_text(rendered, encoding="utf-8")
+
+    entry = parse_session_file(path).entries[0]
+    rebuilt = entry.to_memory(file_path=str(path))
+
+    assert rebuilt.category == sample_memory.category
+    assert rebuilt.archived_at == sample_memory.archived_at
+    assert rebuilt.archive_reason == sample_memory.archive_reason
+    assert rebuilt.superseded_by == sample_memory.superseded_by
+    assert "**Category:**" not in rendered
+    assert "**Archived:**" not in rendered
+    assert "**Archive Reason:**" not in rendered
+    assert "**Superseded By:**" not in rendered
+
+
+@pytest.mark.parametrize(
+    "noncanonical_line",
+    [
+        "unexpected body text",
+        "  **Details:** null",
+        " **Title:** \"indented lookalike\"",
+        "<!-- echovault-null-v2: Why -->",
+        "**What+:** \"obsolete continuation\"",
+        "<details>",
+        "</details>",
+        "**Category:** decision",
+    ],
+)
+def test_schema_v2_rejects_noncanonical_body_lines(
+    tmp_path: Path, sample_memory: Memory, noncanonical_line: str
+) -> None:
+    lines = render_session_document(document_with(sample_memory)).splitlines()
+    details_index = next(
+        i for i, line in enumerate(lines) if line.startswith("**Details:**")
+    )
+    lines.insert(details_index + 1, noncanonical_line)
+    path = tmp_path / "noncanonical.md"
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        parse_session_file(path)
+
+
+def test_schema_v2_rejects_duplicate_living_memory_records(
+    tmp_path: Path, sample_memory: Memory
+) -> None:
+    lines = render_session_document(document_with(sample_memory)).splitlines()
+    details_index = next(
+        i for i, line in enumerate(lines) if line.startswith("**Details:**")
+    )
+    lines[details_index + 1:details_index + 1] = [
+        "**Living Memory:** {}",
+        "**Living Memory:** {}",
+    ]
+    path = tmp_path / "duplicate-living.md"
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        parse_session_file(path)
+
+
+def test_schema_v2_rejects_duplicate_schema_version_frontmatter(
+    tmp_path: Path, sample_memory: Memory
+) -> None:
+    rendered = render_session_document(document_with(sample_memory))
+    corrupted = rendered.replace(
+        "schema_version: 2",
+        "schema_version: 2\nschema_version: 1",
+        1,
+    )
+    path = tmp_path / "duplicate-schema-version.md"
+    path.write_text(corrupted, encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        parse_session_file(path)

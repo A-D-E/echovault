@@ -420,7 +420,7 @@ def render_entry(entry: SessionEntry, *, schema_version: int = 1) -> str:
             + json.dumps(living_data, sort_keys=True, allow_nan=False)
         )
 
-    if entry.status == "archived":
+    if schema_version == 1 and entry.status == "archived":
         if entry.category is not None:
             lines.append(f"**Category:** {entry.category}")
         if entry.archived_at is not None:
@@ -593,6 +593,7 @@ def _split_frontmatter(content: str) -> tuple[str, str]:
 def _parse_frontmatter(frontmatter: str) -> dict:
     """Parse the small YAML-ish frontmatter used by session files."""
     data: dict[str, object] = {}
+    seen_schema_version = False
     if not frontmatter:
         return data
     for line in frontmatter.split("\n"):
@@ -601,6 +602,10 @@ def _parse_frontmatter(frontmatter: str) -> dict:
         key, value = line.split(":", 1)
         key = key.strip()
         value = value.strip()
+        if key == "schema_version":
+            if seen_schema_version:
+                raise ValueError("Duplicate schema_version in frontmatter")
+            seen_schema_version = True
         if value.startswith("[") and value.endswith("]"):
             items = [item.strip() for item in value[1:-1].split(",") if item.strip()]
             data[key] = items
@@ -814,6 +819,7 @@ def _parse_entries_v2(body: str) -> list[SessionEntry]:
         metadata = _parse_metadata_v2_line(lines[start + 2], memory_id)
         fields: dict[str, object] = {}
         living_data: dict = {}
+        living_data_seen = False
 
         for line in lines[start + 3:end]:
             matched_label = next(
@@ -833,6 +839,11 @@ def _parse_entries_v2(body: str) -> list[SessionEntry]:
 
             living_prefix = "**Living Memory:**"
             if line.startswith(living_prefix):
+                if living_data_seen:
+                    raise ValueError(
+                        f"Duplicate Living Memory record for memory {memory_id}"
+                    )
+                living_data_seen = True
                 payload = line[len(living_prefix):]
                 if payload.startswith(" "):
                     payload = payload[1:]
@@ -844,17 +855,20 @@ def _parse_entries_v2(body: str) -> list[SessionEntry]:
                 living_data = loaded_living_data
                 continue
 
-            if line.startswith(
-                (
-                    "**Category:**",
-                    "**Archived:**",
-                    "**Archive Reason:**",
-                    "**Superseded By:**",
-                )
-            ):
+            if line == "":
                 continue
-            if line.startswith("**") and ":**" in line:
-                raise ValueError(f"Unknown schema-v2 readable field for memory {memory_id}")
+
+            category_headings = {
+                *(f"## {heading}" for heading in CATEGORY_HEADINGS.values()),
+                "## Archived",
+            }
+            if line in category_headings:
+                continue
+
+            raise ValueError(
+                f"Unexpected noncanonical schema-v2 body line for memory {memory_id}: "
+                f"{line}"
+            )
 
         missing_fields = sorted(set(readable_labels) - set(fields))
         if missing_fields:
