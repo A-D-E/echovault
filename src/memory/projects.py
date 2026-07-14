@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import re
+import unicodedata
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -58,6 +59,20 @@ class ProjectRegistryConflict(ProjectResolutionError):
     pass
 
 
+def _validate_legacy_key(value: object) -> str:
+    if not isinstance(value, str):
+        raise ProjectResolutionError('Invalid legacy alias: expected a string basename')
+    if not value.strip() or value in {'.', '..'}:
+        raise ProjectResolutionError('Invalid legacy alias: expected a non-empty basename')
+    if '/' in value or '\\' in value:
+        raise ProjectResolutionError('Invalid legacy alias: expected a single local basename')
+    if any(unicodedata.category(character) == 'Cc' for character in value):
+        raise ProjectResolutionError('Invalid legacy alias: control characters are not allowed')
+    if Path(value).name != value or Path(value).parts != (value,):
+        raise ProjectResolutionError('Invalid legacy alias: expected a single local basename')
+    return value
+
+
 class ProjectRegistry:
     def __init__(self, memory_home: Path):
         self.memory_home = memory_home
@@ -94,7 +109,8 @@ class ProjectRegistry:
 
     @staticmethod
     def _validate_data(data: dict[str, object]) -> None:
-        if data.get('schema_version') != 1:
+        schema_version = data.get('schema_version')
+        if type(schema_version) is not int or schema_version != 1:
             raise ProjectResolutionError('Unsupported projects.json schema version')
         projects = data.get('projects')
         aliases = data.get('legacy_aliases')
@@ -109,20 +125,31 @@ class ProjectRegistry:
                 raise ProjectResolutionError('Existing projects.json has invalid project records')
             if not all(isinstance(root, str) for root in roots):
                 raise ProjectResolutionError('Existing projects.json has invalid project roots')
-        if not all(
-            isinstance(alias, str) and isinstance(project_key, str)
-            for alias, project_key in aliases.items()
-        ):
-            raise ProjectResolutionError('Existing projects.json has invalid legacy aliases')
+        for alias, project_key in aliases.items():
+            _validate_legacy_key(alias)
+            if not isinstance(project_key, str):
+                raise ProjectResolutionError(
+                    'Existing projects.json has invalid legacy aliases'
+                )
+            if project_key not in projects:
+                raise ProjectResolutionError(
+                    'Existing projects.json has a dangling legacy alias'
+                )
 
     @staticmethod
     def _register_identity(data: dict[str, object], identity: ProjectIdentity) -> None:
         projects = data['projects']
         assert isinstance(projects, dict)
-        record = projects.setdefault(
-            identity.key,
-            {'display_name': identity.display_name, 'roots': []},
-        )
+        if identity.key in projects:
+            record = projects[identity.key]
+            assert isinstance(record, dict)
+            if record['display_name'] != identity.display_name:
+                raise ProjectResolutionError(
+                    'Existing project display name conflicts with this identity'
+                )
+        else:
+            record = {'display_name': identity.display_name, 'roots': []}
+            projects[identity.key] = record
         assert isinstance(record, dict)
         roots = record['roots']
         assert isinstance(roots, list)
@@ -173,7 +200,11 @@ class ProjectRegistry:
             assert isinstance(projects, dict)
             assert isinstance(aliases, dict)
             legacy_dir = self.memory_home / 'vault' / identity.display_name
-            if legacy_dir.is_dir() and identity.display_name not in aliases:
+            if legacy_dir.is_dir():
+                legacy_key = _validate_legacy_key(identity.display_name)
+            else:
+                legacy_key = None
+            if legacy_key is not None and legacy_key not in aliases:
                 same_name = [
                     key
                     for key, record in projects.items()
@@ -181,7 +212,7 @@ class ProjectRegistry:
                     and record.get('display_name') == identity.display_name
                 ]
                 if same_name == [identity.key]:
-                    aliases[identity.display_name] = identity.key
+                    aliases[legacy_key] = identity.key
             return self._scope(identity, data)
 
         return self._mutate(transform)
@@ -192,6 +223,8 @@ class ProjectRegistry:
         identity: ProjectIdentity,
         force_reassign: bool = False,
     ) -> ProjectScope:
+        legacy_key = _validate_legacy_key(legacy_key)
+
         def transform(data: dict[str, object]) -> ProjectScope:
             self._register_identity(data, identity)
             aliases = data['legacy_aliases']

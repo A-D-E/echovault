@@ -312,6 +312,9 @@ def test_adopt_legacy_refuses_reassignment_without_force(tmp_path: Path) -> None
     registry.adopt_legacy('legacy', left)
     with pytest.raises(LegacyAliasConflict):
         registry.adopt_legacy('legacy', right)
+    conflicted = json.loads(registry.path.read_text(encoding='utf-8'))
+    assert right.key not in conflicted['projects']
+    assert list(registry.path.parent.glob('.projects.json.*.tmp')) == []
     scope = registry.adopt_legacy('legacy', right, force_reassign=True)
     assert scope.aliases == ('legacy',)
 
@@ -380,6 +383,28 @@ def test_registry_digest_cas_stops_after_second_conflict(tmp_path: Path) -> None
     with pytest.raises(ProjectRegistryConflict):
         registry.register(identity)
     assert json.loads(registry.path.read_text(encoding='utf-8'))['revision'] == 2
+    assert list(registry.path.parent.glob('.projects.json.*.tmp')) == []
+
+
+def test_registry_discards_prepared_temp_after_non_cas_error(tmp_path: Path) -> None:
+    registry = ProjectRegistry(tmp_path / '.memory')
+    identity = ProjectIdentity(
+        tmp_path / 'root',
+        'root',
+        'root--111111111111',
+        None,
+        tmp_path / 'root',
+    )
+
+    def fail_before_replace(path: Path) -> None:
+        raise OSError('simulated registry failure')
+
+    registry._before_replace = fail_before_replace
+    with pytest.raises(OSError, match='simulated registry failure'):
+        registry.register(identity)
+
+    assert not registry.path.exists()
+    assert list(registry.path.parent.glob('.projects.json.*.tmp')) == []
 
 
 @pytest.mark.parametrize('existing', ['', '{not valid json'])
@@ -402,6 +427,173 @@ def test_registry_rejects_empty_or_malformed_existing_state(
         registry.register(identity)
 
     assert registry.path.read_text(encoding='utf-8') == existing
+
+
+@pytest.mark.parametrize(
+    'raw',
+    [
+        pytest.param(b'\xff', id='invalid-utf8'),
+        pytest.param(b'[]', id='non-object'),
+        pytest.param(
+            json.dumps(
+                {
+                    'schema_version': 2,
+                    'projects': {},
+                    'legacy_aliases': {},
+                }
+            ).encode('utf-8'),
+            id='wrong-schema',
+        ),
+        pytest.param(
+            json.dumps(
+                {
+                    'schema_version': 1,
+                    'projects': {
+                        'root--111111111111': {
+                            'display_name': ['root'],
+                            'roots': 'not-a-list',
+                        }
+                    },
+                    'legacy_aliases': {},
+                }
+            ).encode('utf-8'),
+            id='invalid-project-record',
+        ),
+        pytest.param(
+            json.dumps(
+                {
+                    'schema_version': 1,
+                    'projects': {},
+                    'legacy_aliases': {'legacy': 'missing--111111111111'},
+                }
+            ).encode('utf-8'),
+            id='dangling-alias',
+        ),
+    ],
+)
+def test_registry_rejects_semantically_corrupt_existing_state(
+    tmp_path: Path,
+    raw: bytes,
+) -> None:
+    registry = ProjectRegistry(tmp_path / '.memory')
+    registry.path.parent.mkdir(parents=True)
+    registry.path.write_bytes(raw)
+    identity = ProjectIdentity(
+        tmp_path / 'root',
+        'root',
+        'root--111111111111',
+        None,
+        tmp_path / 'root',
+    )
+
+    with pytest.raises(ProjectResolutionError):
+        registry.register(identity)
+
+    assert registry.path.read_bytes() == raw
+    assert list(registry.path.parent.glob('.projects.json.*.tmp')) == []
+
+
+def test_registry_rejects_inconsistent_existing_identity(tmp_path: Path) -> None:
+    registry = ProjectRegistry(tmp_path / '.memory')
+    registry.path.parent.mkdir(parents=True)
+    existing = {
+        'schema_version': 1,
+        'projects': {
+            'root--111111111111': {
+                'display_name': 'different-name',
+                'roots': ['/existing/root'],
+            }
+        },
+        'legacy_aliases': {},
+    }
+    registry.path.write_text(json.dumps(existing) + '\n', encoding='utf-8')
+    before = registry.path.read_bytes()
+    identity = ProjectIdentity(
+        tmp_path / 'root',
+        'root',
+        'root--111111111111',
+        None,
+        tmp_path / 'root',
+    )
+
+    with pytest.raises(ProjectResolutionError, match='display name'):
+        registry.register(identity)
+
+    assert registry.path.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    'legacy_key',
+    ['', '   ', '.', '..', 'nested/name', 'nested\\name', 'nul\x00name', 'line\nbreak'],
+)
+def test_adopt_legacy_rejects_unsafe_local_basename(
+    tmp_path: Path,
+    legacy_key: str,
+) -> None:
+    registry = ProjectRegistry(tmp_path / '.memory')
+    identity = ProjectIdentity(
+        tmp_path / 'root',
+        'root',
+        'root--111111111111',
+        None,
+        tmp_path / 'root',
+    )
+
+    with pytest.raises(ProjectResolutionError, match='legacy alias'):
+        registry.adopt_legacy(legacy_key, identity)
+
+    assert not registry.path.exists()
+
+
+@pytest.mark.parametrize(
+    'legacy_key',
+    ['', '   ', '.', '..', 'nested/name', 'nested\\name', 'nul\x00name', 'line\nbreak'],
+)
+def test_registry_rejects_loaded_unsafe_legacy_alias(
+    tmp_path: Path,
+    legacy_key: str,
+) -> None:
+    registry = ProjectRegistry(tmp_path / '.memory')
+    registry.path.parent.mkdir(parents=True)
+    existing = {
+        'schema_version': 1,
+        'projects': {
+            'root--111111111111': {
+                'display_name': 'root',
+                'roots': ['/existing/root'],
+            }
+        },
+        'legacy_aliases': {legacy_key: 'root--111111111111'},
+    }
+    registry.path.write_text(json.dumps(existing) + '\n', encoding='utf-8')
+    before = registry.path.read_bytes()
+    identity = ProjectIdentity(
+        tmp_path / 'root',
+        'root',
+        'root--111111111111',
+        None,
+        tmp_path / 'root',
+    )
+
+    with pytest.raises(ProjectResolutionError, match='legacy alias'):
+        registry.register(identity)
+
+    assert registry.path.read_bytes() == before
+
+
+def test_adopt_legacy_accepts_safe_unicode_and_spaces(tmp_path: Path) -> None:
+    registry = ProjectRegistry(tmp_path / '.memory')
+    identity = ProjectIdentity(
+        tmp_path / 'root',
+        'root',
+        'root--111111111111',
+        None,
+        tmp_path / 'root',
+    )
+
+    scope = registry.adopt_legacy('Kunden Akte Ü', identity)
+
+    assert scope.aliases == ('Kunden Akte Ü',)
 
 
 def test_project_scope_orders_aliases_after_canonical_storage_key(tmp_path: Path) -> None:

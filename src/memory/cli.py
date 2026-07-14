@@ -28,6 +28,7 @@ from memory.projects import (
     build_project_identity,
     discover_project_root,
 )
+from memory.safe_io import LockTimeoutError
 
 DETAILS_TEMPLATE = """\
 Context:
@@ -79,7 +80,7 @@ def project():
 @click.option(
     "--project-root",
     required=True,
-    type=click.Path(path_type=Path, file_okay=False),
+    type=click.Path(path_type=Path, exists=True, file_okay=False),
     help="Project directory that should own the legacy alias.",
 )
 @click.option(
@@ -99,7 +100,7 @@ def project_adopt_legacy(legacy_key, project_root, force_reassign):
             identity,
             force_reassign=force_reassign,
         )
-    except ProjectResolutionError as error:
+    except (ProjectResolutionError, LockTimeoutError, OSError) as error:
         raise click.ClickException(str(error)) from error
     click.echo(f"Adopted legacy alias {legacy_key} for {scope.identity.key}")
 

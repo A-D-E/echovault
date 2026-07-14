@@ -3,11 +3,14 @@
 import json
 import os
 
+import pytest
 from click.testing import CliRunner
 
 from memory.cli import main
 from memory.core import MemoryService
 from memory.models import RawMemoryInput
+from memory.projects import ProjectRegistry, build_project_identity, discover_project_root
+from memory.safe_io import LockTimeoutError
 
 
 def test_cli_help():
@@ -52,7 +55,8 @@ def test_project_adopt_legacy_assigns_alias_and_refuses_reassignment(
     registry_path = env_home / "projects.json"
     data = json.loads(registry_path.read_text(encoding="utf-8"))
     assigned_key = data["legacy_aliases"]["legacy"]
-    assert assigned_key.startswith("left--")
+    left_identity = build_project_identity(*discover_project_root(left))
+    assert assigned_key == left_identity.key
     assert assigned_key in data["projects"]
 
     second = runner.invoke(
@@ -66,9 +70,131 @@ def test_project_adopt_legacy_assigns_alias_and_refuses_reassignment(
         ],
     )
 
-    assert second.exit_code != 0
+    assert second.exit_code == 1
+    assert second.output == (
+        "Error: Legacy alias 'legacy' is already assigned to another project\n"
+    )
+    assert isinstance(second.exception, SystemExit)
+    assert second.exception.code == 1
     unchanged = json.loads(registry_path.read_text(encoding="utf-8"))
     assert unchanged["legacy_aliases"]["legacy"] == assigned_key
+
+    forced = runner.invoke(
+        main,
+        [
+            "project",
+            "adopt-legacy",
+            "legacy",
+            "--project-root",
+            str(right),
+            "--force-reassign",
+        ],
+    )
+
+    right_identity = build_project_identity(*discover_project_root(right))
+    assert forced.exit_code == 0
+    assert forced.output == f"Adopted legacy alias legacy for {right_identity.key}\n"
+    reassigned = json.loads(registry_path.read_text(encoding="utf-8"))
+    assert reassigned["legacy_aliases"] == {"legacy": right_identity.key}
+    assert reassigned["legacy_aliases"]["legacy"] != left_identity.key
+
+
+def test_project_root_must_exist_without_creating_registry_state(env_home, tmp_path):
+    missing = tmp_path / "missing"
+    runner = CliRunner()
+
+    result = runner.invoke(
+        main,
+        [
+            "project",
+            "adopt-legacy",
+            "legacy",
+            "--project-root",
+            str(missing),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert result.output == (
+        "Usage: main project adopt-legacy [OPTIONS] LEGACY_KEY\n"
+        "Try 'main project adopt-legacy --help' for help.\n\n"
+        f"Error: Invalid value for '--project-root': Directory '{missing}' "
+        "does not exist.\n"
+    )
+    assert isinstance(result.exception, SystemExit)
+    assert result.exception.code == 2
+    assert not (env_home / "projects.json").exists()
+
+
+@pytest.mark.parametrize(
+    ('error_type', 'message'),
+    [
+        (LockTimeoutError, 'simulated registry lock timeout'),
+        (OSError, 'simulated registry file failure'),
+    ],
+)
+def test_project_adopt_legacy_formats_expected_operational_errors(
+    env_home,
+    tmp_path,
+    monkeypatch,
+    error_type,
+    message,
+):
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "package.json").write_text("{}")
+
+    def fail_adoption(self, legacy_key, identity, force_reassign=False):
+        raise error_type(message)
+
+    monkeypatch.setattr(ProjectRegistry, "adopt_legacy", fail_adoption)
+    result = CliRunner().invoke(
+        main,
+        [
+            "project",
+            "adopt-legacy",
+            "legacy",
+            "--project-root",
+            str(root),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert result.output == f"Error: {message}\n"
+    assert isinstance(result.exception, SystemExit)
+    assert result.exception.code == 1
+    assert not (env_home / "projects.json").exists()
+
+
+def test_project_adopt_legacy_does_not_mask_programming_errors(
+    env_home,
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "package.json").write_text("{}")
+
+    def fail_adoption(self, legacy_key, identity, force_reassign=False):
+        raise RuntimeError('simulated programming error')
+
+    monkeypatch.setattr(ProjectRegistry, "adopt_legacy", fail_adoption)
+    result = CliRunner().invoke(
+        main,
+        [
+            "project",
+            "adopt-legacy",
+            "legacy",
+            "--project-root",
+            str(root),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert result.output == ""
+    assert isinstance(result.exception, RuntimeError)
+    assert str(result.exception) == 'simulated programming error'
+    assert not (env_home / "projects.json").exists()
 
 
 def test_init_creates_vault_dir(env_home):
