@@ -654,6 +654,77 @@ def test_operation_ledger_returns_exact_fields(
     assert db.get_operation("another-project", operation.operation_id) is None
 
 
+def test_standalone_operation_write_rejects_memory_that_never_existed(
+    db: MemoryDB,
+) -> None:
+    operation = MemoryOperation(
+        "op-orphan-standalone",
+        "cursor",
+        "created",
+        "req-orphan-standalone",
+        "2026-07-14T10:00:00+00:00",
+    )
+
+    with pytest.raises(
+        ValueError, match="Cannot record operation for missing memory: never-existed"
+    ):
+        db.upsert_operation("project", "never-existed", operation)
+
+    assert db.conn.in_transaction is False
+    assert db.get_operation("project", operation.operation_id) is None
+
+
+def test_grouped_operation_write_rejects_orphan_and_rolls_back_group(
+    db: MemoryDB, sample_memory: Memory
+) -> None:
+    operation = MemoryOperation(
+        "op-orphan-grouped",
+        "cursor",
+        "created",
+        "req-orphan-grouped",
+        "2026-07-14T10:00:00+00:00",
+    )
+
+    with pytest.raises(
+        ValueError, match="Cannot record operation for missing memory: never-existed"
+    ):
+        with db.transaction():
+            db.upsert_memory(sample_memory, None)
+            db.upsert_operation("project", "never-existed", operation)
+
+    assert db.get_memory(sample_memory.id) is None
+    assert db.get_operation("project", operation.operation_id) is None
+
+
+def test_operation_history_survives_valid_memory_deletion(
+    db: MemoryDB, sample_memory: Memory
+) -> None:
+    operation = MemoryOperation(
+        "op-before-delete",
+        "cursor",
+        "created",
+        "req-before-delete",
+        "2026-07-14T10:00:00+00:00",
+    )
+    with db.transaction():
+        db.upsert_memory(sample_memory, None)
+        db.upsert_operation(sample_memory.project, sample_memory.id, operation)
+
+    assert db.delete_memory(sample_memory.id) is True
+    assert db.get_memory(sample_memory.id) is None
+    assert db.get_operation(sample_memory.project, operation.operation_id) == {
+        "project": sample_memory.project,
+        "operation_id": operation.operation_id,
+        "memory_id": sample_memory.id,
+        "request_fingerprint": operation.request_fingerprint,
+        "action": operation.action,
+        "source": operation.source,
+        "timestamp": operation.timestamp,
+        "branch": operation.branch,
+        "commit_sha": operation.commit_sha,
+    }
+
+
 def test_old_embedding_cannot_replace_new_fingerprint(
     db: MemoryDB, sample_memory: Memory
 ) -> None:
@@ -707,6 +778,9 @@ def test_vector_cas_check_delete_insert_is_one_write_transaction(
     bootstrap_db.close()
     fingerprint_read = threading.Event()
     allow_vector_write = threading.Event()
+    updater_ready = threading.Event()
+    start_update = threading.Event()
+    updater_begin_attempted = threading.Event()
     update_finished = threading.Event()
     cas_result: Queue[bool] = Queue()
 
@@ -722,33 +796,43 @@ def test_vector_cas_check_delete_insert_is_one_write_transaction(
         finally:
             embedding_db.close()
 
-    cas = threading.Thread(target=run_cas)
     def update_to_second() -> None:
         updater_db = MemoryDB(str(db_path))
         try:
+            def trace_sql(statement: str) -> None:
+                if statement.strip().upper() == "BEGIN IMMEDIATE":
+                    updater_begin_attempted.set()
+
+            updater_db.conn.set_trace_callback(trace_sql)
+            updater_ready.set()
+            if not start_update.wait(timeout=2.0):
+                return
             changed = replace(sample_memory, content_fingerprint="second")
             with updater_db.transaction():
                 updater_db.upsert_memory(changed, None)
                 updater_db.invalidate_vector(changed.id)
             update_finished.set()
         finally:
+            updater_db.conn.set_trace_callback(None)
             updater_db.close()
 
-    updater: threading.Thread | None = None
+    updater = threading.Thread(target=update_to_second)
+    cas = threading.Thread(target=run_cas)
+    updater.start()
     cas.start()
     try:
+        assert updater_ready.wait(timeout=2.0)
         assert fingerprint_read.wait(timeout=2.0)
-        updater = threading.Thread(target=update_to_second)
-        updater.start()
-        assert update_finished.wait(timeout=0.05) is False
+        start_update.set()
+        assert updater_begin_attempted.wait(timeout=2.0)
+        assert update_finished.is_set() is False
     finally:
+        start_update.set()
         allow_vector_write.set()
         cas.join(timeout=2.0)
-        if updater is not None:
-            updater.join(timeout=2.0)
+        updater.join(timeout=2.0)
 
     assert not cas.is_alive()
-    assert updater is not None
     assert not updater.is_alive()
     assert cas_result.get_nowait() is True
     verification_db = MemoryDB(str(db_path))

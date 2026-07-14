@@ -547,6 +547,12 @@ class MemoryDB:
     ) -> None:
         """Upsert an operation ledger record without committing."""
         cursor = self.conn.cursor()
+        cursor.execute("SELECT 1 FROM memories WHERE id = ?", (memory_id,))
+        if cursor.fetchone() is None:
+            raise ValueError(
+                f"Cannot record operation for missing memory: {memory_id}"
+            )
+
         cursor.execute("""
             INSERT INTO save_operations (
                 project, operation_id, memory_id, request_fingerprint, action,
