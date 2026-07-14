@@ -11,9 +11,12 @@ import pytest
 from memory.markdown import (
     SessionDocument,
     SessionEntry,
+    _entry_from_memory,
     parse_session_file,
+    render_entry,
     render_section,
     render_session_document,
+    write_session_document,
     write_session_memory,
 )
 from memory.models import Memory, MemoryOperation
@@ -144,14 +147,14 @@ class TestRenderSection:
         assert "</details>" in result
 
     def test_render_section_without_optional_fields(self, minimal_memory: Memory) -> None:
-        """Test rendering section without Why, Impact, and Source."""
+        """Test rendering explicit null markers for optional v2 fields."""
         result = render_section(minimal_memory)
 
         assert "### Basic memory" in result
         assert "**What:** Simple memory entry" in result
-        assert "**Why:**" not in result
-        assert "**Impact:**" not in result
-        assert "**Source:**" not in result
+        assert "**Why:** \n<!-- echovault-null-v2: Why -->" in result
+        assert "**Impact:** \n<!-- echovault-null-v2: Impact -->" in result
+        assert "**Source:** \n<!-- echovault-null-v2: Source -->" in result
         assert "<details>" not in result
 
 
@@ -383,8 +386,8 @@ class TestWriteSessionMemory:
         content = Path(file_path).read_text(encoding="utf-8")
         assert "unicode — кириллица ✓" in content
 
-    def test_write_reads_legacy_cp1251_and_rewrites_utf8(self, temp_vault: str) -> None:
-        """Test appending to a legacy cp1251 file rewrites it as UTF-8."""
+    def test_schema_v1_append_fails_without_changing_bytes(self, temp_vault: str) -> None:
+        """A legacy file must be explicitly migrated before appending."""
         file_path = Path(temp_vault) / "2026-01-22-session.md"
         legacy_content = """---
 project: my-project
@@ -402,6 +405,7 @@ tags: [legacy]
 **Source:** claude-code
 """
         file_path.write_text(legacy_content, encoding="cp1251")
+        original_bytes = file_path.read_bytes()
 
         memory = Memory(
             id="test-unicode",
@@ -420,11 +424,10 @@ tags: [legacy]
             updated_at="2026-01-22T18:00:00Z",
         )
 
-        write_session_memory(temp_vault, memory, "2026-01-22")
+        with pytest.raises(ValueError, match=r"memory migrate vault-metadata"):
+            write_session_memory(temp_vault, memory, "2026-01-22")
 
-        content = file_path.read_text(encoding="utf-8")
-        assert "старый текст" in content
-        assert "новый текст — ✓" in content
+        assert file_path.read_bytes() == original_bytes
 
 
 def test_schema_v2_round_trip_preserves_every_memory_field(
@@ -545,3 +548,242 @@ def test_schema_v1_remains_readable_but_incomplete(tmp_path: Path) -> None:
     assert parsed.schema_version == 1
     assert parsed.entries[0].what == "readable"
     assert parsed.entries[0].metadata_complete is False
+
+
+def test_write_session_document_rejects_schema_v1_without_touching_file(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "legacy.md"
+    original_bytes = b"legacy bytes\n"
+    path.write_bytes(original_bytes)
+    document = SessionDocument(
+        project="legacy",
+        created=None,
+        tags=[],
+        sources=[],
+        title="Legacy",
+        entries=[],
+        schema_version=1,
+    )
+
+    with pytest.raises(ValueError, match=r"memory migrate vault-metadata"):
+        write_session_document(path, document)
+
+    assert path.read_bytes() == original_bytes
+
+
+def test_schema_v2_multiline_readable_fields_round_trip_exactly(
+    tmp_path: Path, sample_memory: Memory
+) -> None:
+    sample_memory.title = "Title first line\n\n### title-looking heading"
+    sample_memory.what = (
+        "What first line\n\n## what heading\n### what subheading\n**Why:** still what"
+    )
+    sample_memory.why = "Why first line\n\n### why heading"
+    sample_memory.impact = "Impact first line\n  indented impact\n## impact heading"
+    sample_memory.source = "cursor\n\n### source heading with trailing spaces  "
+    document = document_with(sample_memory)
+    path = tmp_path / "multiline.md"
+    path.write_text(render_session_document(document), encoding="utf-8")
+
+    entry = parse_session_file(path).entries[0]
+
+    assert entry.title == sample_memory.title
+    assert entry.what == sample_memory.what
+    assert entry.why == sample_memory.why
+    assert entry.impact == sample_memory.impact
+    assert entry.source == sample_memory.source
+
+
+def test_schema_v2_details_round_trip_headings_and_whitespace_exactly(
+    tmp_path: Path, sample_memory: Memory
+) -> None:
+    details = (
+        "\n  meaningful leading whitespace\n\n"
+        "## Details heading\n"
+        "### Looks like a memory but has no stable ID\n"
+        "**What:** remains detail content\n\n"
+        "meaningful trailing whitespace  \n"
+    )
+    document = document_with(sample_memory)
+    document.entries[0].details = details
+    second_memory = replace(
+        sample_memory,
+        id="test-456",
+        title="Actual second entry",
+        section_anchor="actual-second-entry",
+    )
+    document.entries.append(document_with(second_memory).entries[0])
+    path = tmp_path / "details.md"
+    path.write_text(render_session_document(document), encoding="utf-8")
+
+    parsed = parse_session_file(path)
+
+    assert [entry.id for entry in parsed.entries] == ["test-123", "test-456"]
+    assert parsed.entries[0].details == details
+    assert parsed.entries[1].title == "Actual second entry"
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "duplicate_id",
+        "duplicate_metadata",
+        "metadata_before_id",
+        "metadata_nonadjacent",
+        "stray_id",
+        "stray_metadata",
+    ],
+)
+def test_schema_v2_rejects_malformed_placement(
+    tmp_path: Path, sample_memory: Memory, corruption: str
+) -> None:
+    lines = render_session_document(document_with(sample_memory)).splitlines()
+    id_index = next(i for i, line in enumerate(lines) if line.startswith("<!-- memory-id:"))
+    metadata_index = next(
+        i for i, line in enumerate(lines) if line.startswith("<!-- echovault-metadata-v2:")
+    )
+    id_line = lines[id_index]
+    metadata_line = lines[metadata_index]
+
+    if corruption == "duplicate_id":
+        lines.insert(id_index + 1, id_line)
+    elif corruption == "duplicate_metadata":
+        lines.insert(metadata_index + 1, metadata_line)
+    elif corruption == "metadata_before_id":
+        lines[id_index], lines[metadata_index] = metadata_line, id_line
+    elif corruption == "metadata_nonadjacent":
+        lines.insert(metadata_index, "")
+    elif corruption == "stray_id":
+        lines.append("<!-- memory-id: stray -->")
+    elif corruption == "stray_metadata":
+        lines.append(metadata_line)
+
+    path = tmp_path / f"{corruption}.md"
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        parse_session_file(path)
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "missing_what",
+        "missing_why",
+        "missing_impact",
+        "missing_source",
+        "duplicate_what",
+        "duplicate_source",
+    ],
+)
+def test_schema_v2_rejects_missing_or_duplicate_readable_fields(
+    tmp_path: Path, sample_memory: Memory, corruption: str
+) -> None:
+    lines = render_session_document(document_with(sample_memory)).splitlines()
+    what_index = next(i for i, line in enumerate(lines) if line.startswith("**What:**"))
+    why_index = next(i for i, line in enumerate(lines) if line.startswith("**Why:**"))
+    impact_index = next(i for i, line in enumerate(lines) if line.startswith("**Impact:**"))
+    source_index = next(i for i, line in enumerate(lines) if line.startswith("**Source:**"))
+
+    if corruption == "missing_what":
+        lines.pop(what_index)
+    elif corruption == "missing_why":
+        lines.pop(why_index)
+    elif corruption == "missing_impact":
+        lines.pop(impact_index)
+    elif corruption == "missing_source":
+        lines.pop(source_index)
+    elif corruption == "duplicate_what":
+        lines.insert(what_index + 1, lines[what_index])
+    elif corruption == "duplicate_source":
+        lines.insert(source_index + 1, lines[source_index])
+
+    path = tmp_path / f"{corruption}.md"
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        parse_session_file(path)
+
+
+def test_schema_v2_distinguishes_optional_null_from_empty_string(
+    tmp_path: Path, minimal_memory: Memory
+) -> None:
+    minimal_memory.why = None
+    minimal_memory.impact = ""
+    minimal_memory.source = None
+    path = tmp_path / "optional-fields.md"
+    path.write_text(
+        render_session_document(document_with(minimal_memory)),
+        encoding="utf-8",
+    )
+
+    entry = parse_session_file(path).entries[0]
+
+    assert entry.why is None
+    assert entry.impact == ""
+    assert entry.source is None
+
+
+@pytest.mark.parametrize(
+    "structured_data_json",
+    [
+        '{"nested":{"value":NaN}}',
+        '{"nested":[Infinity]}',
+        '{"nested":{"values":[0,-Infinity]}}',
+    ],
+)
+def test_schema_v2_rejects_non_finite_json_at_any_depth(
+    tmp_path: Path, sample_memory: Memory, structured_data_json: str
+) -> None:
+    rendered = render_session_document(document_with(sample_memory))
+    corrupted = rendered.replace(
+        '"structured_data":{}',
+        f'"structured_data":{structured_data_json}',
+        1,
+    )
+    assert corrupted != rendered
+    path = tmp_path / "non-finite.md"
+    path.write_text(corrupted, encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        parse_session_file(path)
+
+
+def test_schema_v2_deep_copies_nested_structured_data(sample_memory: Memory) -> None:
+    sample_memory.structured_data = {
+        "nested": {"items": [{"value": "original"}]},
+    }
+
+    entry = _entry_from_memory(sample_memory)
+    entry.metadata["structured_data"]["nested"]["items"][0]["value"] = "entry"
+    assert sample_memory.structured_data["nested"]["items"][0]["value"] == "original"
+
+    entry = _entry_from_memory(sample_memory)
+    sample_memory.structured_data["nested"]["items"].append({"value": "memory"})
+    assert entry.metadata["structured_data"] == {
+        "nested": {"items": [{"value": "original"}]},
+    }
+
+    rebuilt = entry.to_memory(file_path="session.md")
+    rebuilt.structured_data["nested"]["items"][0]["value"] = "rebuilt"
+    assert entry.metadata["structured_data"]["nested"]["items"][0]["value"] == "original"
+
+
+def test_legacy_render_entry_behavior_remains_available() -> None:
+    entry = SessionEntry(
+        id="legacy-1",
+        title="Legacy entry",
+        what="Readable legacy value",
+        why=None,
+        impact=None,
+        source=None,
+        details=None,
+        category="context",
+    )
+
+    rendered = render_entry(entry)
+
+    assert rendered.startswith("### Legacy entry\n<!-- memory-id: legacy-1 -->")
+    assert "**What:** Readable legacy value" in rendered
+    assert "echovault-metadata-v2" not in rendered
