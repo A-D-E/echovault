@@ -1,14 +1,18 @@
 """Tests for SQLite database layer with FTS5 and sqlite-vec."""
 
+from dataclasses import replace
 import json
+from queue import Queue
+import sqlite3
 import struct
 import tempfile
+import threading
 from pathlib import Path
 
 import pytest
 
 from memory.db import DimensionMismatchError, MemoryDB, _build_fts_query
-from memory.models import Memory, MemoryDetail, RawMemoryInput
+from memory.models import Memory, MemoryDetail, MemoryOperation, RawMemoryInput
 
 
 @pytest.fixture
@@ -476,3 +480,280 @@ def test_update_memory_returns_false_for_nonexistent(db):
     """Test that update_memory returns False for unknown IDs."""
     result = db.update_memory("nonexistent-id", what="new")
     assert result is False
+
+
+def test_transaction_rolls_back_memory_and_operation(db: MemoryDB, sample_memory: Memory) -> None:
+    operation = MemoryOperation(
+        "op-1", "cursor", "created", "req-1", "2026-07-14T10:00:00+00:00"
+    )
+
+    with pytest.raises(RuntimeError, match="inject rollback"):
+        with db.transaction():
+            db.upsert_memory(sample_memory, "details")
+            db.upsert_operation(sample_memory.project, sample_memory.id, operation)
+            raise RuntimeError("inject rollback")
+
+    assert db.get_memory(sample_memory.id) is None
+    assert db.get_operation(sample_memory.project, operation.operation_id) is None
+
+
+def test_transaction_refuses_nested_ownership(db: MemoryDB) -> None:
+    with db.transaction():
+        with pytest.raises(
+            RuntimeError, match="Nested MemoryDB transactions are not supported"
+        ):
+            with db.transaction():
+                pass
+
+
+def test_transaction_rolls_back_on_base_exception(
+    db: MemoryDB, sample_memory: Memory
+) -> None:
+    class InjectedBaseException(BaseException):
+        pass
+
+    with pytest.raises(InjectedBaseException):
+        with db.transaction():
+            db.upsert_memory(sample_memory, None)
+            raise InjectedBaseException
+
+    assert db.get_memory(sample_memory.id) is None
+    assert db.conn.in_transaction is False
+
+
+def test_public_write_wrapper_auto_transactions_but_joins_active_transaction(
+    db: MemoryDB, sample_memory: Memory
+) -> None:
+    first = replace(sample_memory, id="wrapper-committed")
+    db.upsert_memory(first, None)
+    assert db.conn.in_transaction is False
+    assert db.get_memory(first.id) is not None
+
+    second = replace(sample_memory, id="wrapper-rolled-back")
+    with pytest.raises(RuntimeError, match="rollback wrapper"):
+        with db.transaction():
+            db.upsert_memory(second, None)
+            assert db.conn.in_transaction is True
+            raise RuntimeError("rollback wrapper")
+
+    assert db.get_memory(second.id) is None
+
+
+def test_existing_database_adds_projection_columns_without_rebuild(tmp_path: Path) -> None:
+    db_path = tmp_path / "existing.db"
+    legacy = sqlite3.connect(db_path)
+    legacy.execute("""
+        CREATE TABLE memories (
+            rowid INTEGER PRIMARY KEY AUTOINCREMENT,
+            id TEXT UNIQUE NOT NULL,
+            title TEXT NOT NULL,
+            what TEXT NOT NULL,
+            why TEXT,
+            impact TEXT,
+            tags TEXT,
+            category TEXT,
+            project TEXT NOT NULL,
+            source TEXT,
+            related_files TEXT,
+            file_path TEXT NOT NULL,
+            section_anchor TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            status TEXT DEFAULT 'active',
+            archived_at TEXT,
+            archive_reason TEXT,
+            superseded_by TEXT
+        )
+    """)
+    legacy.execute("""
+        INSERT INTO memories (
+            id, title, what, project, file_path, created_at, updated_at
+        ) VALUES (
+            'legacy', 'Legacy', 'Old projection', 'project', 'legacy.md',
+            '2026-07-14T09:00:00+00:00', '2026-07-14T09:00:00+00:00'
+        )
+    """)
+    legacy.commit()
+    legacy.close()
+
+    migrated = MemoryDB(str(db_path))
+    try:
+        columns = {
+            row["name"]: row for row in migrated.conn.execute("PRAGMA table_info(memories)")
+        }
+        assert {
+            "creator_source",
+            "last_updated_by",
+            "contributors",
+            "operation_history",
+            "content_fingerprint",
+            "history_complete",
+        } <= columns.keys()
+        legacy_row = migrated.get_memory("legacy")
+        assert legacy_row is not None
+        assert legacy_row["contributors"] == "[]"
+        assert legacy_row["operation_history"] == "[]"
+        assert legacy_row["history_complete"] == 1
+    finally:
+        migrated.close()
+
+
+def test_connection_enables_fk_wal_and_bounded_busy_timeout(tmp_path: Path) -> None:
+    db = MemoryDB(str(tmp_path / "pragmas.db"))
+    try:
+        assert db.conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+        assert db.conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+        busy_timeout = db.conn.execute("PRAGMA busy_timeout").fetchone()[0]
+        assert 0 < busy_timeout <= 5_000
+    finally:
+        db.close()
+
+
+def test_operation_id_is_unique_within_project_only(
+    db: MemoryDB, sample_memory: Memory
+) -> None:
+    operation = MemoryOperation(
+        "same-op", "cursor", "created", "req-1", "2026-07-14T10:00:00+00:00"
+    )
+    with db.transaction():
+        db.upsert_memory(sample_memory, None)
+        db.upsert_operation("one", sample_memory.id, operation)
+        db.upsert_operation("two", sample_memory.id, operation)
+
+    assert db.get_operation("one", "same-op") is not None
+    assert db.get_operation("two", "same-op") is not None
+
+
+def test_operation_ledger_returns_exact_fields(
+    db: MemoryDB, sample_memory: Memory
+) -> None:
+    operation = MemoryOperation(
+        operation_id="op-exact",
+        source="cursor",
+        action="updated",
+        request_fingerprint="req-exact",
+        timestamp="2026-07-14T10:00:00+00:00",
+        branch="feat/ledger",
+        commit_sha="abc123",
+    )
+    with db.transaction():
+        db.upsert_memory(sample_memory, None)
+        db.upsert_operation(sample_memory.project, sample_memory.id, operation)
+
+    assert db.get_operation(sample_memory.project, operation.operation_id) == {
+        "project": sample_memory.project,
+        "operation_id": "op-exact",
+        "memory_id": sample_memory.id,
+        "request_fingerprint": "req-exact",
+        "action": "updated",
+        "source": "cursor",
+        "timestamp": "2026-07-14T10:00:00+00:00",
+        "branch": "feat/ledger",
+        "commit_sha": "abc123",
+    }
+    assert db.get_operation("another-project", operation.operation_id) is None
+
+
+def test_old_embedding_cannot_replace_new_fingerprint(
+    db: MemoryDB, sample_memory: Memory
+) -> None:
+    sample_memory.content_fingerprint = "new"
+    with db.transaction():
+        db.upsert_memory(sample_memory, None)
+
+    assert db.upsert_vector_if_current(sample_memory.id, "old", [0.1, 0.2]) is False
+    assert db.upsert_vector_if_current(sample_memory.id, "new", [0.1, 0.2]) is True
+    assert db.has_vector(sample_memory.id) is True
+
+
+def test_vector_cas_rejects_missing_memory_and_fingerprint_mismatch(
+    db: MemoryDB, sample_memory: Memory
+) -> None:
+    assert db.upsert_vector_if_current("missing", "fingerprint", [0.1, 0.2]) is False
+
+    sample_memory.content_fingerprint = "current"
+    db.upsert_memory(sample_memory, None)
+    assert db.upsert_vector_if_current(sample_memory.id, "stale", [0.1, 0.2]) is False
+    assert db.has_vector(sample_memory.id) is False
+
+
+def test_vector_cas_exception_rolls_back_and_releases_transaction(
+    db: MemoryDB, sample_memory: Memory
+) -> None:
+    sample_memory.content_fingerprint = "current"
+    db.upsert_memory(sample_memory, None)
+
+    def fail_after_read() -> None:
+        raise RuntimeError("barrier failed")
+
+    db._vector_cas_test_barrier = fail_after_read
+    with pytest.raises(RuntimeError, match="barrier failed"):
+        db.upsert_vector_if_current(sample_memory.id, "current", [0.1, 0.2])
+
+    assert db.conn.in_transaction is False
+    assert db.has_vector(sample_memory.id) is False
+    db._vector_cas_test_barrier = None
+    assert db.upsert_vector_if_current(sample_memory.id, "current", [0.1, 0.2]) is True
+
+
+def test_vector_cas_check_delete_insert_is_one_write_transaction(
+    tmp_path: Path, sample_memory: Memory,
+) -> None:
+    db_path = tmp_path / "index.db"
+    bootstrap_db = MemoryDB(str(db_path))
+    sample_memory.content_fingerprint = "first"
+    with bootstrap_db.transaction():
+        bootstrap_db.upsert_memory(sample_memory, None)
+    bootstrap_db.close()
+    fingerprint_read = threading.Event()
+    allow_vector_write = threading.Event()
+    update_finished = threading.Event()
+    cas_result: Queue[bool] = Queue()
+
+    def run_cas() -> None:
+        embedding_db = MemoryDB(str(db_path))
+        try:
+            embedding_db._vector_cas_test_barrier = lambda: (
+                fingerprint_read.set(), allow_vector_write.wait(timeout=2.0)
+            )
+            cas_result.put(embedding_db.upsert_vector_if_current(
+                sample_memory.id, "first", [0.1, 0.2]
+            ))
+        finally:
+            embedding_db.close()
+
+    cas = threading.Thread(target=run_cas)
+    def update_to_second() -> None:
+        updater_db = MemoryDB(str(db_path))
+        try:
+            changed = replace(sample_memory, content_fingerprint="second")
+            with updater_db.transaction():
+                updater_db.upsert_memory(changed, None)
+                updater_db.invalidate_vector(changed.id)
+            update_finished.set()
+        finally:
+            updater_db.close()
+
+    updater: threading.Thread | None = None
+    cas.start()
+    try:
+        assert fingerprint_read.wait(timeout=2.0)
+        updater = threading.Thread(target=update_to_second)
+        updater.start()
+        assert update_finished.wait(timeout=0.05) is False
+    finally:
+        allow_vector_write.set()
+        cas.join(timeout=2.0)
+        if updater is not None:
+            updater.join(timeout=2.0)
+
+    assert not cas.is_alive()
+    assert updater is not None
+    assert not updater.is_alive()
+    assert cas_result.get_nowait() is True
+    verification_db = MemoryDB(str(db_path))
+    try:
+        assert verification_db.get_memory(sample_memory.id)["content_fingerprint"] == "second"
+        assert verification_db.has_vector(sample_memory.id) is False
+    finally:
+        verification_db.close()
