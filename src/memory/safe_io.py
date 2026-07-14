@@ -125,9 +125,9 @@ class PreparedAtomicWrite:
 
     def replace(self) -> None:
         if self.original_mode is not None:
-            self.temporary.chmod(self.original_mode)
             descriptor = os.open(self.temporary, os.O_RDWR)
             try:
+                self.temporary.chmod(self.original_mode)
                 os.fsync(descriptor)
             finally:
                 os.close(descriptor)

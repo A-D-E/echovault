@@ -60,8 +60,8 @@ def test_windows_process_lock_contends_across_processes(tmp_path: Path) -> None:
     result = Queue()
     lock_path = tmp_path / 'project.lock'
     holder = Process(target=_hold_lock, args=(str(lock_path), ready, release))
-    holder.start()
     contender = Process(target=_report_lock_timeout, args=(str(lock_path), result))
+    holder.start()
     try:
         assert ready.wait(2.0)
         contender.start()
@@ -88,6 +88,23 @@ def test_prepared_write_is_invisible_until_replace_and_preserves_mode(tmp_path: 
     assert target.read_text(encoding='utf-8') == 'new\n'
     assert target.stat().st_mode & 0o777 == 0o640
     assert digest_file(target) is not None
+
+
+def test_prepared_write_replaces_read_only_target_and_preserves_mode(tmp_path: Path) -> None:
+    target = tmp_path / 'session.md'
+    target.write_text('old\n', encoding='utf-8')
+    target.chmod(0o444)
+    prepared = prepare_atomic_text(target, 'new\n')
+    try:
+        prepared.replace()
+        assert target.read_text(encoding='utf-8') == 'new\n'
+        assert target.stat().st_mode & 0o777 == 0o444
+    finally:
+        if prepared.temporary.exists():
+            prepared.temporary.chmod(0o600)
+        prepared.discard()
+        if target.exists():
+            target.chmod(0o600)
 
 
 def test_preserved_mode_is_synced_before_replace(tmp_path: Path, monkeypatch) -> None:
