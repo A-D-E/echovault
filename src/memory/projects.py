@@ -292,25 +292,34 @@ def _canonical(path: Path) -> Path:
     return Path(os.path.realpath(os.path.abspath(os.path.expanduser(str(path)))))
 
 
+def _is_within(path: Path, boundary: Path) -> bool:
+    try:
+        _canonical(path).relative_to(_canonical(boundary))
+    except ValueError:
+        return False
+    return True
+
+
 def select_project_candidate(candidates: ProjectCandidates) -> Path:
     if candidates.explicit_root is not None:
         return _canonical(candidates.explicit_root)
-    if len(candidates.mcp_roots) > 1:
-        roots = tuple(_canonical(root) for root in candidates.mcp_roots)
-        if candidates.protocol_cwd is not None:
-            protocol_cwd = _canonical(candidates.protocol_cwd)
-            matches = tuple(
-                root
-                for root in roots
-                if protocol_cwd == root or root in protocol_cwd.parents
+
+    roots = tuple(_canonical(root) for root in candidates.mcp_roots)
+    if len(roots) == 1:
+        return roots[0]
+    if len(roots) > 1:
+        if candidates.protocol_cwd is None:
+            raise MultiRootError(
+                'Multiple MCP roots require cwd inside exactly one root'
             )
-            if len(matches) == 1:
-                return matches[0]
-        raise MultiRootError(
-            'Multiple MCP roots require a protocol cwd contained by exactly one root'
-        )
-    if candidates.mcp_roots:
-        return _canonical(candidates.mcp_roots[0])
+        cwd = _canonical(candidates.protocol_cwd)
+        containing = tuple(root for root in roots if _is_within(cwd, root))
+        if len(containing) != 1:
+            raise MultiRootError(
+                'Multiple MCP roots require cwd inside exactly one root'
+            )
+        return cwd
+
     if candidates.protocol_cwd is not None:
         return _canonical(candidates.protocol_cwd)
     if candidates.startup_cwd is not None:

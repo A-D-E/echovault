@@ -68,6 +68,51 @@ def test_multiple_mcp_roots_require_explicit_resolution(tmp_path: Path) -> None:
         select_project_candidate(candidates)
 
 
+def marked_workspace(path: Path) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "package.json").write_text("{}", encoding="utf-8")
+    return path
+
+
+def test_multiple_mcp_roots_accept_cwd_inside_exactly_one(
+    tmp_path: Path,
+) -> None:
+    left = marked_workspace(tmp_path / "left")
+    right = marked_workspace(tmp_path / "right")
+    nested = right / "src"
+    nested.mkdir()
+    selected = select_project_candidate(
+        ProjectCandidates(mcp_roots=(left, right), protocol_cwd=nested)
+    )
+    assert selected == nested.resolve()
+
+
+@pytest.mark.parametrize("cwd_kind", ["missing", "outside", "overlap"])
+def test_multiple_mcp_roots_require_one_unambiguous_cwd(
+    tmp_path: Path,
+    cwd_kind: str,
+) -> None:
+    outer = marked_workspace(tmp_path / "outer")
+    nested_root = marked_workspace(outer / "nested")
+    other = marked_workspace(tmp_path / "other")
+    cwd = {
+        "missing": None,
+        "outside": tmp_path / "outside",
+        "overlap": nested_root / "src",
+    }[cwd_kind]
+    if cwd is not None:
+        cwd.mkdir(parents=True, exist_ok=True)
+    roots = (
+        (outer, nested_root)
+        if cwd_kind == "overlap"
+        else (outer, other)
+    )
+    with pytest.raises(MultiRootError, match="exactly one"):
+        select_project_candidate(
+            ProjectCandidates(mcp_roots=roots, protocol_cwd=cwd)
+        )
+
+
 def test_explicit_root_precedes_multiple_mcp_roots(tmp_path: Path) -> None:
     explicit = tmp_path / 'explicit'
     candidates = ProjectCandidates(
@@ -90,7 +135,7 @@ def test_protocol_cwd_selects_unique_containing_mcp_root(tmp_path: Path) -> None
         protocol_cwd=protocol_cwd,
     )
 
-    assert select_project_candidate(candidates) == second.resolve()
+    assert select_project_candidate(candidates) == protocol_cwd.resolve()
 
 
 def test_protocol_cwd_outside_mcp_roots_is_ambiguous(tmp_path: Path) -> None:
