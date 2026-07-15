@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import importlib.metadata
 from importlib.resources import files
+import json
 from pathlib import Path
+
+import yaml
 
 from memory.integrations.asset_io import (
     REQUIRED_PACKAGE_ASSETS,
@@ -51,3 +54,28 @@ def test_read_package_asset_rejects_unlisted_paths() -> None:
         assert "not a required package asset" in str(error)
     else:  # pragma: no cover - required security boundary
         raise AssertionError("unlisted package resource was accepted")
+
+
+def test_ci_matrix_and_pinned_validator_are_explicit() -> None:
+    workflow = yaml.safe_load(Path(".github/workflows/ci.yml").read_text())
+    matrix = workflow["jobs"]["python-tests"]["strategy"]["matrix"][
+        "include"
+    ]
+    cells = {(item["os"], str(item["python"])) for item in matrix}
+    assert cells == {
+        ("ubuntu-latest", "3.10"),
+        ("ubuntu-latest", "3.11"),
+        ("ubuntu-latest", "3.12"),
+        ("ubuntu-latest", "3.13"),
+        ("ubuntu-latest", "3.14"),
+        ("macos-latest", "3.10"),
+        ("macos-latest", "3.14"),
+        ("windows-latest", "3.10"),
+        ("windows-latest", "3.14"),
+    }
+    package_steps = workflow["jobs"]["package-gate"]["steps"]
+    serialized = json.dumps(package_steps)
+    assert "@google/gemini-cli@0.50.0" in serialized
+    assert "gemini extensions validate" in serialized
+    assert "verify_installed_tool.py" in serialized
+    assert "cursor-agent" not in serialized

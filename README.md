@@ -70,6 +70,12 @@ pip install git+https://github.com/mraza007/echovault.git@main
 
 Release notes live in [CHANGELOG.md](CHANGELOG.md) and on the [GitHub Releases](https://github.com/mraza007/echovault/releases) page.
 
+Every change is gated in CI across Python 3.10–3.14 on Linux, the boundary
+versions on macOS and Windows, the Rust dashboard suite, an installed-wheel
+black-box check, Cursor bundle validation, and Gemini CLI 0.50.0 extension
+validation. CI uses no agent credentials and does not claim authenticated model
+behavior.
+
 By default config is installed globally. To install for a specific project:
 
 ```bash

@@ -1,0 +1,88 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  python-tests:
+    name: Python ${{ matrix.python }} / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python: "3.10"
+          - os: ubuntu-latest
+            python: "3.11"
+          - os: ubuntu-latest
+            python: "3.12"
+          - os: ubuntu-latest
+            python: "3.13"
+          - os: ubuntu-latest
+            python: "3.14"
+          - os: macos-latest
+            python: "3.10"
+          - os: macos-latest
+            python: "3.14"
+          - os: windows-latest
+            python: "3.10"
+          - os: windows-latest
+            python: "3.14"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - name: Sync dependencies
+        run: uv sync --python "${{ matrix.python }}" --extra dev
+      - name: Run Python tests
+        run: uv run --no-sync pytest -q
+
+  package-gate:
+    name: Package and native validators
+    needs: python-tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - name: Sync release dependencies
+        run: uv sync --python "3.14" --extra dev
+      - name: Build distributions
+        run: uv build
+      - name: Verify distribution assets
+        run: uv run --no-sync python scripts/verify_wheel_assets.py dist/*.whl dist/*.tar.gz
+      - name: Verify installed wheel
+        run: |
+          uv venv build/wheel-venv --python "3.14"
+          uv pip install --python build/wheel-venv/bin/python dist/*.whl
+          build/wheel-venv/bin/python scripts/verify_installed_tool.py --memory-executable build/wheel-venv/bin/memory
+      - name: Render and validate Cursor plugin
+        run: |
+          uv run --no-sync python scripts/render_integration_fixture.py --client cursor --output build/validation/cursor --memory-command memory --version 0.6.0
+          uv run --no-sync python scripts/validate_cursor_plugin.py build/validation/cursor
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install pinned Gemini validator
+        run: npm install --global @google/gemini-cli@0.50.0
+      - name: Render and validate Gemini extension
+        run: |
+          uv run --no-sync python scripts/render_integration_fixture.py --client gemini --output build/validation/gemini --memory-command memory --version 0.6.0
+          gemini extensions validate build/validation/gemini
+
+  rust-dashboard:
+    name: Rust dashboard tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Rust tests
+        run: cargo test --manifest-path dashboard/Cargo.toml
