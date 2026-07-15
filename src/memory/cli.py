@@ -23,6 +23,12 @@ from memory.config import (
     resolve_context_mode,
 )
 from memory.core import MemoryService
+from memory.integrations.registry import get_adapter
+from memory.integrations.types import (
+    InstallMode,
+    InstallScope,
+    IntegrationOptions,
+)
 from memory.models import RawMemoryInput
 from memory.persistence import MemoryPatch
 from memory.projects import (
@@ -1169,13 +1175,6 @@ def setup_claude_code_cmd(config_dir, project):
 )
 def setup_cursor_cmd(config_dir, project, command, force_managed):
     """Install curated EchoVault memory into Cursor."""
-    from memory.integrations.registry import get_adapter
-    from memory.integrations.types import (
-        InstallMode,
-        InstallScope,
-        IntegrationOptions,
-    )
-
     explicit_root = config_dir is not None
     result = get_adapter("cursor").setup(
         IntegrationOptions(
@@ -1192,6 +1191,88 @@ def setup_cursor_cmd(config_dir, project, command, force_managed):
             config_root_explicit=explicit_root,
         )
     )
+    click.echo(result.message)
+    for warning in result.warnings:
+        click.echo(f"Warning: {warning}")
+
+
+def _gemini_integration_options(
+    *,
+    config_dir: Path | None,
+    direct: bool,
+    project: bool,
+    command: str | None,
+    force_managed: bool,
+) -> IntegrationOptions:
+    if config_dir is not None and not (direct or project):
+        raise click.UsageError(
+            "--config-dir requires --direct or --project"
+        )
+    scope = InstallScope.PROJECT if project else InstallScope.USER
+    mode = InstallMode.DIRECT if direct or project else InstallMode.NATIVE
+    if config_dir is not None:
+        config_root = config_dir.expanduser().resolve()
+    elif project:
+        config_root = None
+    else:
+        config_root = Path.home() / ".gemini"
+    return IntegrationOptions(
+        scope=scope,
+        mode=mode,
+        config_root=config_root,
+        project_root=Path.cwd().resolve() if project else None,
+        command=command,
+        force_managed=force_managed,
+        config_root_explicit=config_dir is not None,
+    )
+
+
+@setup.command("gemini")
+@click.option(
+    "--config-dir",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=None,
+    help="Exact .gemini directory for a direct target",
+)
+@click.option(
+    "--direct",
+    is_flag=True,
+    default=False,
+    help="Install user-direct instead of the native extension",
+)
+@click.option(
+    "--project",
+    is_flag=True,
+    default=False,
+    help="Install direct integration in the current project",
+)
+@click.option(
+    "--command",
+    default=None,
+    help="Exact EchoVault command",
+)
+@click.option(
+    "--force-managed",
+    is_flag=True,
+    default=False,
+    help="Replace modified EchoVault-managed assets",
+)
+def setup_gemini_cmd(
+    config_dir: Path | None,
+    direct: bool,
+    project: bool,
+    command: str | None,
+    force_managed: bool,
+) -> None:
+    """Install curated EchoVault memory into Gemini CLI."""
+    options = _gemini_integration_options(
+        config_dir=config_dir,
+        direct=direct,
+        project=project,
+        command=command,
+        force_managed=force_managed,
+    )
+    result = get_adapter("gemini").setup(options)
     click.echo(result.message)
     for warning in result.warnings:
         click.echo(f"Warning: {warning}")
@@ -1248,13 +1329,6 @@ def uninstall_claude_code_cmd(config_dir, project):
 )
 def uninstall_cursor_cmd(config_dir, project, force_managed):
     """Remove one curated EchoVault Cursor scope."""
-    from memory.integrations.registry import get_adapter
-    from memory.integrations.types import (
-        InstallMode,
-        InstallScope,
-        IntegrationOptions,
-    )
-
     explicit_root = config_dir is not None
     result = get_adapter("cursor").uninstall(
         IntegrationOptions(
@@ -1271,6 +1345,49 @@ def uninstall_cursor_cmd(config_dir, project, force_managed):
             config_root_explicit=explicit_root,
         )
     )
+    click.echo(result.message)
+
+
+@uninstall.command("gemini")
+@click.option(
+    "--config-dir",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=None,
+    help="Exact .gemini directory for a direct target",
+)
+@click.option(
+    "--direct",
+    is_flag=True,
+    default=False,
+    help="Remove the user-direct integration",
+)
+@click.option(
+    "--project",
+    is_flag=True,
+    default=False,
+    help="Remove direct integration from the current project",
+)
+@click.option(
+    "--force-managed",
+    is_flag=True,
+    default=False,
+    help="Remove modified EchoVault-managed assets",
+)
+def uninstall_gemini_cmd(
+    config_dir: Path | None,
+    direct: bool,
+    project: bool,
+    force_managed: bool,
+) -> None:
+    """Remove one curated EchoVault Gemini scope."""
+    options = _gemini_integration_options(
+        config_dir=config_dir,
+        direct=direct,
+        project=project,
+        command=None,
+        force_managed=force_managed,
+    )
+    result = get_adapter("gemini").uninstall(options)
     click.echo(result.message)
 
 
@@ -1294,6 +1411,42 @@ def uninstall_opencode_cmd(project):
 
     result = uninstall_opencode(project=project)
     click.echo(result["message"])
+
+
+@main.group()
+def hook() -> None:
+    """Run supported agent lifecycle hooks."""
+    pass
+
+
+@hook.group("gemini")
+def hook_gemini() -> None:
+    """Run Gemini CLI hooks."""
+    pass
+
+
+@hook_gemini.command("before-agent")
+def hook_gemini_before_agent_cmd() -> None:
+    """Read one BeforeAgent event from stdin and emit one JSON response."""
+    from memory.integrations.gemini_hook import handle_before_agent
+
+    response: dict[str, object] = {}
+    try:
+        payload = json.loads(click.get_text_stream("stdin").read())
+        if isinstance(payload, dict):
+            observed = handle_before_agent(payload)
+            if isinstance(observed, dict):
+                response = observed
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        response = {}
+    click.echo(
+        json.dumps(
+            response,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    )
 
 
 @main.command()

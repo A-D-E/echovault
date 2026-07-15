@@ -3,6 +3,7 @@
 import json
 import os
 import shutil
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -14,6 +15,12 @@ from memory.core import MemoryService
 from memory.mcp_authority import MCPServerBinding
 from memory.mcp_server import tool_definitions
 from memory.models import RawMemoryInput
+from memory.integrations.types import (
+    InstallMode,
+    InstallScope,
+    IntegrationOptions,
+    IntegrationResult,
+)
 from memory.persistence import MemoryPatch
 from memory.projects import ProjectRegistry, build_project_identity, discover_project_root
 from memory.safe_io import LockTimeoutError
@@ -1642,6 +1649,192 @@ def test_cursor_uninstall_rejects_setup_only_command_option(env_home):
     )
     assert result.exit_code == 2
     assert "No such option: --command" in result.output
+
+
+@dataclass
+class CapturedGeminiAdapter:
+    options: IntegrationOptions | None = None
+
+    def setup(self, options: IntegrationOptions) -> IntegrationResult:
+        self.options = options
+        return IntegrationResult("installed", "installed")
+
+    def uninstall(self, options: IntegrationOptions) -> IntegrationResult:
+        self.options = options
+        return IntegrationResult("removed", "removed")
+
+
+def install_fake_gemini_adapter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> CapturedGeminiAdapter:
+    captured = CapturedGeminiAdapter()
+    monkeypatch.setattr(cli_module, "get_adapter", lambda name: captured)
+    return captured
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected_mode", "expected_scope"),
+    [
+        (["setup", "gemini"], InstallMode.NATIVE, InstallScope.USER),
+        (
+            ["setup", "gemini", "--direct"],
+            InstallMode.DIRECT,
+            InstallScope.USER,
+        ),
+        (
+            ["setup", "gemini", "--project"],
+            InstallMode.DIRECT,
+            InstallScope.PROJECT,
+        ),
+        (
+            ["setup", "gemini", "--project", "--direct"],
+            InstallMode.DIRECT,
+            InstallScope.PROJECT,
+        ),
+    ],
+)
+def test_gemini_setup_cli_matrix(
+    argv: list[str],
+    expected_mode: InstallMode,
+    expected_scope: InstallScope,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured = install_fake_gemini_adapter(monkeypatch)
+    result = CliRunner().invoke(main, argv)
+    assert result.exit_code == 0, result.output
+    assert captured.options is not None
+    assert captured.options.mode is expected_mode
+    assert captured.options.scope is expected_scope
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["uninstall", "gemini"],
+        ["uninstall", "gemini", "--direct"],
+        ["uninstall", "gemini", "--project"],
+        ["uninstall", "gemini", "--project", "--direct"],
+    ],
+)
+def test_gemini_uninstall_cli_matrix(
+    argv: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured = install_fake_gemini_adapter(monkeypatch)
+    result = CliRunner().invoke(main, argv)
+    assert result.exit_code == 0, result.output
+    assert captured.options is not None
+    assert captured.options.scope is (
+        InstallScope.PROJECT if "--project" in argv else InstallScope.USER
+    )
+    assert captured.options.mode is (
+        InstallMode.DIRECT
+        if "--direct" in argv or "--project" in argv
+        else InstallMode.NATIVE
+    )
+
+
+@pytest.mark.parametrize("verb", ["setup", "uninstall"])
+def test_gemini_native_config_dir_is_usage_error(verb: str) -> None:
+    result = CliRunner().invoke(
+        main,
+        [verb, "gemini", "--config-dir", "/tmp/.gemini"],
+    )
+    assert result.exit_code == 2
+    assert "--config-dir requires --direct or --project" in result.output
+
+
+@pytest.mark.parametrize("verb", ["setup", "uninstall"])
+@pytest.mark.parametrize("scope_args", [[], ["--direct"], ["--project"]])
+def test_force_managed_reaches_every_gemini_variant(
+    verb: str,
+    scope_args: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured = install_fake_gemini_adapter(monkeypatch)
+    result = CliRunner().invoke(
+        main,
+        [verb, "gemini", *scope_args, "--force-managed"],
+    )
+    assert result.exit_code == 0, result.output
+    assert captured.options is not None
+    assert captured.options.force_managed is True
+
+
+@pytest.mark.parametrize("scope_args", [[], ["--direct"], ["--project"]])
+def test_gemini_command_is_setup_only(
+    scope_args: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured = install_fake_gemini_adapter(monkeypatch)
+    setup_result = CliRunner().invoke(
+        main,
+        [
+            "setup",
+            "gemini",
+            *scope_args,
+            "--command",
+            "/opt/echovault/bin/memory",
+        ],
+    )
+    assert setup_result.exit_code == 0, setup_result.output
+    assert captured.options is not None
+    assert captured.options.command == "/opt/echovault/bin/memory"
+    uninstall_result = CliRunner().invoke(
+        main,
+        [
+            "uninstall",
+            "gemini",
+            *scope_args,
+            "--command",
+            "/opt/echovault/bin/memory",
+        ],
+    )
+    assert uninstall_result.exit_code == 2
+    assert "No such option: --command" in uninstall_result.output
+
+
+@pytest.mark.parametrize("verb", ["setup", "uninstall"])
+@pytest.mark.parametrize("scope_args", [["--direct"], ["--project"]])
+def test_gemini_config_dir_is_valid_for_direct_targets(
+    verb: str,
+    scope_args: list[str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured = install_fake_gemini_adapter(monkeypatch)
+    target = tmp_path / ".gemini"
+    result = CliRunner().invoke(
+        main,
+        [verb, "gemini", *scope_args, "--config-dir", str(target)],
+    )
+    assert result.exit_code == 0, result.output
+    assert captured.options is not None
+    assert captured.options.config_root == target.resolve()
+    assert captured.options.config_root_explicit is True
+
+
+def test_gemini_hook_command_always_writes_one_json_document(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "memory.integrations.gemini_hook.handle_before_agent",
+        lambda payload: {},
+    )
+    event = {
+        "session_id": "session-1",
+        "cwd": "/workspace/repo",
+        "hook_event_name": "BeforeAgent",
+        "timestamp": "2026-07-14T12:00:00Z",
+        "prompt": "Find ALPHA-42",
+    }
+    result = CliRunner().invoke(
+        main,
+        ["hook", "gemini", "before-agent"],
+        input=json.dumps(event),
+    )
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output) == {}
 
 
 def test_doctor_cursor_accepts_project_root_and_reports_integration(

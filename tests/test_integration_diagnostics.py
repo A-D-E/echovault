@@ -7,6 +7,11 @@ from memory.core import MemoryService
 from memory.health import doctor, doctor_home
 from memory.integrations.process import CommandResult
 from tests.integration_helpers import cursor_adapter, project_options, snapshot_tree
+from tests.gemini_helpers import (
+    RecordingRunner as GeminiRunner,
+    gemini_adapter,
+    project_direct_options,
+)
 
 
 class RecordingRunner:
@@ -191,3 +196,103 @@ def test_cursor_doctor_uses_legacy_cli_alias_when_agent_command_is_absent(
         "list-tools",
         "echovault",
     )
+
+
+def test_gemini_doctor_is_read_only_and_reports_full_contract(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    home = tmp_path / "home"
+    memory_home = tmp_path / "memory-home"
+    project = tmp_path / "repo"
+    home.mkdir()
+    project.mkdir()
+    (project / "package.json").write_text("{}")
+    monkeypatch.setenv("HOME", str(home))
+    runner = GeminiRunner(client_version="0.50.1")
+    gemini_adapter(runner).setup(project_direct_options(project))
+    service = MemoryService(str(memory_home))
+    runner.argv.clear()
+    runner.calls.clear()
+    before = snapshot_tree(tmp_path)
+    try:
+        report = doctor(
+            service,
+            agent="gemini-cli",
+            project_root=project,
+            runner=runner,
+        )
+        assert snapshot_tree(tmp_path) == before
+    finally:
+        service.close()
+
+    findings = {
+        item["code"]: item for item in report["integration_findings"]
+    }
+    assert set(findings) >= {
+        "gemini.project",
+        "gemini.version",
+        "gemini.state",
+        "gemini.native-enabled",
+        "gemini.manifest",
+        "gemini.mcp",
+        "gemini.context",
+        "gemini.skill",
+        "gemini.hook",
+        "gemini.tools",
+        "gemini.project-scope",
+        "gemini.claims",
+        "gemini.context-policy",
+        "gemini.query-privacy",
+        "gemini.mcp.precedence",
+    }
+    assert findings["gemini.tools"]["expected_tools"] == [
+        "memory_context",
+        "memory_search",
+        "memory_details",
+        "memory_save",
+    ]
+    assert findings["gemini.project-scope"]["project_key"]
+    assert findings["gemini.context-policy"]["mode"] == "auto"
+    assert not (memory_home / "hook-events").exists()
+    assert all(
+        call in (
+            ["gemini", "--version"],
+            ["gemini", "extensions", "list"],
+        )
+        for call in runner.argv
+    )
+
+
+def test_gemini_doctor_reports_disabled_hook_policy_without_claims(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    home = tmp_path / "home"
+    memory_home = tmp_path / "memory-home"
+    project = tmp_path / "repo"
+    home.mkdir()
+    project.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    runner = GeminiRunner(client_version="0.50.1")
+    gemini_adapter(runner).setup(project_direct_options(project))
+    service = MemoryService(str(memory_home))
+    service.config.context.agent_modes["gemini-cli"] = "off"
+    try:
+        report = doctor(
+            service,
+            agent="gemini-cli",
+            project_root=project,
+            runner=runner,
+        )
+    finally:
+        service.close()
+    policy = next(
+        item
+        for item in report["integration_findings"]
+        if item["code"] == "gemini.context-policy"
+    )
+    assert policy["status"] == "degraded"
+    assert policy["mode"] == "off"
+    assert policy["source"] == "agent:gemini-cli"
+    assert not (memory_home / "hook-events").exists()

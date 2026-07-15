@@ -455,3 +455,25 @@ class TestUninstall:
         from memory.setup import uninstall_claude_code
         result = uninstall_claude_code(str(claude_home), project=True)
         assert result["status"] == "ok"
+
+
+class TestGeminiSetupCompatibility:
+    def test_user_direct_setup_and_uninstall_use_managed_adapter(
+        self,
+        tmp_path,
+        fake_memory,
+    ):
+        from memory.setup import setup_gemini, uninstall_gemini
+
+        gemini_home = tmp_path / ".gemini"
+        installed = setup_gemini(
+            str(gemini_home),
+            direct=True,
+            command=str(fake_memory),
+        )
+        assert installed["status"] == "ok"
+        assert (gemini_home / ".echovault-managed.json").is_file()
+
+        removed = uninstall_gemini(str(gemini_home), direct=True)
+        assert removed["status"] == "ok"
+        assert not (gemini_home / ".echovault-managed.json").exists()

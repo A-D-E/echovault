@@ -463,6 +463,43 @@ def setup_cursor(cursor_home: str) -> dict[str, str]:
     return {"status": "ok", "message": result.message}
 
 
+def setup_gemini(
+    gemini_home: str,
+    *,
+    direct: bool = False,
+    project_root: str | None = None,
+    command: str | None = None,
+    force_managed: bool = False,
+) -> dict[str, str]:
+    """Install one managed Gemini integration through the canonical adapter."""
+    from memory.integrations.registry import get_adapter
+    from memory.integrations.types import (
+        InstallMode,
+        InstallScope,
+        IntegrationOptions,
+    )
+
+    project = Path(project_root).expanduser().resolve() if project_root else None
+    result = get_adapter("gemini").setup(
+        IntegrationOptions(
+            scope=(
+                InstallScope.PROJECT if project is not None else InstallScope.USER
+            ),
+            mode=(
+                InstallMode.DIRECT
+                if direct or project is not None
+                else InstallMode.NATIVE
+            ),
+            config_root=Path(gemini_home).expanduser().resolve(),
+            project_root=project,
+            command=command,
+            force_managed=force_managed,
+            config_root_explicit=True,
+        )
+    )
+    return {"status": "ok", "message": result.message}
+
+
 CODEX_AGENTS_MD_SECTION = """\
 
 ## EchoVault — Persistent Memory
@@ -618,6 +655,42 @@ def uninstall_cursor(cursor_home: str) -> dict[str, str]:
             config_root=Path(cursor_home),
             project_root=None,
             command=None,
+            config_root_explicit=True,
+        )
+    )
+    return {"status": "ok", "message": result.message}
+
+
+def uninstall_gemini(
+    gemini_home: str,
+    *,
+    direct: bool = False,
+    project_root: str | None = None,
+    force_managed: bool = False,
+) -> dict[str, str]:
+    """Remove one managed Gemini integration through the canonical adapter."""
+    from memory.integrations.registry import get_adapter
+    from memory.integrations.types import (
+        InstallMode,
+        InstallScope,
+        IntegrationOptions,
+    )
+
+    project = Path(project_root).expanduser().resolve() if project_root else None
+    result = get_adapter("gemini").uninstall(
+        IntegrationOptions(
+            scope=(
+                InstallScope.PROJECT if project is not None else InstallScope.USER
+            ),
+            mode=(
+                InstallMode.DIRECT
+                if direct or project is not None
+                else InstallMode.NATIVE
+            ),
+            config_root=Path(gemini_home).expanduser().resolve(),
+            project_root=project,
+            command=None,
+            force_managed=force_managed,
             config_root_explicit=True,
         )
     )
