@@ -2,18 +2,40 @@
 
 import copy
 import json
+import logging
 import os
+from collections.abc import Awaitable, Callable, Mapping
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
-from mcp.types import TextContent, Tool
+from mcp.types import CallToolResult, TextContent, Tool
 
 from memory.core import MemoryService
-from memory.mcp_authority import MCPServerBinding
+from memory.mcp_authority import (
+    AuthorityConflict,
+    MCPServerBinding,
+    file_uri_to_path,
+    public_project_error,
+    resolve_project_scope,
+)
 from memory.models import RawMemoryInput
+from memory.projects import (
+    ProjectRegistry,
+    ProjectResolutionError,
+    ProjectScope,
+)
+
+
+logger = logging.getLogger(__name__)
+INTERNAL_ERROR = "EchoVault could not complete the tool request"
+ResolvedScope = ProjectScope | str | None
+ScopedDispatch = Callable[
+    [str, Mapping[str, object], ResolvedScope],
+    Awaitable[CallToolResult],
+]
 
 VALID_CATEGORIES = (
     "decision", "bug", "pattern", "learning", "context", "playbook",
@@ -340,12 +362,204 @@ def tool_definitions(binding: MCPServerBinding) -> tuple[Tool, ...]:
     return tools
 
 
+def tool_error(message: str) -> CallToolResult:
+    return CallToolResult(
+        isError=True,
+        content=[TextContent(type="text", text=message)],
+    )
+
+
+def success_text(text: str) -> CallToolResult:
+    payload = json.loads(text)
+    if isinstance(payload, dict):
+        payload.pop("file_path", None)
+    return CallToolResult(
+        isError=False,
+        content=[
+            TextContent(
+                type="text",
+                text=json.dumps(payload),
+            )
+        ],
+    )
+
+
+def legacy_project(scope: ResolvedScope) -> str:
+    if isinstance(scope, ProjectScope):
+        return scope.identity.key
+    if isinstance(scope, str):
+        return scope
+    return os.path.basename(os.getcwd())
+
+
+def make_legacy_scoped_dispatch(service: MemoryService) -> ScopedDispatch:
+    """Bridge resolved scope to the existing direct handlers."""
+    async def dispatch(
+        name: str,
+        arguments: Mapping[str, object],
+        scope: ResolvedScope,
+    ) -> CallToolResult:
+        project = legacy_project(scope)
+        call_arguments = dict(arguments)
+        call_arguments.pop("cwd", None)
+        call_arguments.pop("project", None)
+
+        if name == "memory_save":
+            call_arguments.pop("idempotency_key", None)
+            call_arguments.pop("source", None)
+            return success_text(
+                handle_memory_save(
+                    service,
+                    project=project,
+                    **call_arguments,
+                )
+            )
+        if name == "memory_search":
+            return success_text(
+                handle_memory_search(
+                    service,
+                    project=project,
+                    **call_arguments,
+                )
+            )
+        if name == "memory_context":
+            return success_text(
+                handle_memory_context(
+                    service,
+                    project=project,
+                    **call_arguments,
+                )
+            )
+        if name == "memory_details":
+            memory_id = call_arguments.get("memory_id")
+            if not isinstance(memory_id, str) or not memory_id:
+                return tool_error("memory_id must be a non-empty string")
+            detail = service.get_details(memory_id, project=project)
+            payload = (
+                {"status": "not_found"}
+                if detail is None
+                else {
+                    "status": "ok",
+                    "memory_id": detail.memory_id,
+                    "body": detail.body,
+                }
+            )
+            return success_text(json.dumps(payload))
+        return tool_error("Unknown EchoVault tool")
+
+    return dispatch
+
+
+async def resolve_call_scope(
+    server: Server,
+    binding: MCPServerBinding,
+    registry: ProjectRegistry,
+    arguments: Mapping[str, object],
+) -> ResolvedScope:
+    if not binding.is_bound:
+        requested_project = arguments.get("project")
+        return resolve_project_scope(
+            binding,
+            registry,
+            client_roots=(),
+            cwd=None,
+            requested_project=(
+                requested_project
+                if isinstance(requested_project, str)
+                else None
+            ),
+        )
+
+    capabilities = server.request_context.session.client_params.capabilities
+    client_roots: tuple[Path, ...] = ()
+    if capabilities.roots is not None:
+        roots_result = await server.request_context.session.list_roots()
+        client_roots = tuple(
+            file_uri_to_path(str(root.uri))
+            for root in roots_result.roots
+        )
+
+    raw_cwd = arguments.get("cwd")
+    if raw_cwd is not None and not isinstance(raw_cwd, str):
+        raise AuthorityConflict("authority", "cwd must be a string path")
+    raw_project = arguments.get("project")
+    if raw_project is not None and not isinstance(raw_project, str):
+        raise AuthorityConflict("authority", "project must be a string")
+    return resolve_project_scope(
+        binding,
+        registry,
+        client_roots=client_roots,
+        cwd=Path(raw_cwd) if raw_cwd else None,
+        requested_project=raw_project,
+    )
+
+
+async def project_safe_dispatch(
+    operation: Callable[[], Awaitable[CallToolResult]],
+) -> CallToolResult:
+    try:
+        return await operation()
+    except ProjectResolutionError as error:
+        return tool_error(public_project_error(error))
+    except Exception as error:
+        logger.error(
+            "Unhandled MCP tool failure (%s)",
+            type(error).__name__,
+        )
+        return tool_error(INTERNAL_ERROR)
+
+
+def install_scoped_call_handler(
+    server: Server,
+    binding: MCPServerBinding,
+    registry: ProjectRegistry,
+    selected_dispatch: ScopedDispatch,
+) -> None:
+    @server.call_tool()
+    async def call_tool(
+        name: str,
+        arguments: dict[str, object],
+    ) -> CallToolResult:
+        async def resolve_and_dispatch() -> CallToolResult:
+            scope = await resolve_call_scope(
+                server,
+                binding,
+                registry,
+                arguments,
+            )
+            return await selected_dispatch(name, arguments, scope)
+
+        return await project_safe_dispatch(resolve_and_dispatch)
+
+
+def configure_task4_dispatch(
+    server: Server,
+    service: MemoryService,
+    binding: MCPServerBinding,
+    registry: ProjectRegistry,
+    scoped_dispatch: ScopedDispatch | None,
+) -> None:
+    selected_dispatch = scoped_dispatch or make_legacy_scoped_dispatch(service)
+    install_scoped_call_handler(
+        server,
+        binding,
+        registry,
+        selected_dispatch,
+    )
+
+
 def _create_server(
     service: MemoryService,
     binding: MCPServerBinding | None = None,
+    registry: ProjectRegistry | None = None,
+    *,
+    worker_service_factory: Callable[[], MemoryService] | None = None,
+    scoped_dispatch: ScopedDispatch | None = None,
 ) -> Server:
     """Create and configure the MCP server with memory tools."""
     binding = binding or MCPServerBinding(None, None, Path.cwd())
+    registry = registry or ProjectRegistry(Path(service.memory_home))
+    _ = worker_service_factory
     server = Server("echovault")
 
     @server.list_tools()
@@ -357,18 +571,13 @@ def _create_server(
         )
         return list(definitions)
 
-    @server.call_tool()
-    async def call_tool(name: str, arguments: dict) -> list[TextContent]:
-        if name == "memory_save":
-            result = handle_memory_save(service, **arguments)
-        elif name == "memory_search":
-            result = handle_memory_search(service, **arguments)
-        elif name == "memory_context":
-            result = handle_memory_context(service, **arguments)
-        else:
-            result = json.dumps({"error": f"Unknown tool: {name}"})
-
-        return [TextContent(type="text", text=result)]
+    configure_task4_dispatch(
+        server,
+        service,
+        binding,
+        registry,
+        scoped_dispatch,
+    )
 
     return server
 
@@ -387,7 +596,8 @@ async def run_server(
             project_root,
             startup_cwd or Path.cwd(),
         )
-        server = _create_server(service, binding)
+        registry = ProjectRegistry(Path(service.memory_home))
+        server = _create_server(service, binding, registry)
         async with stdio_server() as (read_stream, write_stream):
             await server.run(read_stream, write_stream, server.create_initialization_options())
     finally:
