@@ -1228,12 +1228,24 @@ def uninstall_opencode_cmd(project):
 
 
 @main.command()
-def mcp():
+@click.option("--agent", envvar="MEMORY_AGENT", default=None)
+@click.option(
+    "--project-root",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=None,
+)
+def mcp(agent: str | None, project_root: Path | None) -> None:
     """Start the EchoVault MCP server (stdio transport)."""
     import asyncio
     from memory.mcp_server import run_server
 
-    asyncio.run(run_server())
+    asyncio.run(
+        run_server(
+            agent=agent,
+            project_root=project_root,
+            startup_cwd=Path.cwd(),
+        )
+    )
 
 
 if __name__ == "__main__":

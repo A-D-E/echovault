@@ -3,6 +3,7 @@
 import json
 import os
 import shutil
+from pathlib import Path
 
 import pytest
 from click.testing import CliRunner
@@ -10,10 +11,70 @@ from click.testing import CliRunner
 import memory.cli as cli_module
 from memory.cli import main
 from memory.core import MemoryService
+from memory.mcp_authority import MCPServerBinding
+from memory.mcp_server import tool_definitions
 from memory.models import RawMemoryInput
 from memory.persistence import MemoryPatch
 from memory.projects import ProjectRegistry, build_project_identity, discover_project_root
 from memory.safe_io import LockTimeoutError
+
+
+def test_mcp_cli_passes_explicit_binding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    async def fake_run_server(**kwargs) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr("memory.mcp_server.run_server", fake_run_server)
+    project_root = Path("/tmp/repo")
+    result = CliRunner().invoke(
+        main,
+        [
+            "mcp",
+            "--agent",
+            "cursor",
+            "--project-root",
+            str(project_root),
+        ],
+    )
+    assert result.exit_code == 0
+    assert captured["agent"] == "cursor"
+    assert captured["project_root"] == project_root
+    assert isinstance(captured["startup_cwd"], Path)
+
+
+def test_explicit_agent_overrides_memory_agent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    async def fake_run_server(**kwargs) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setenv("MEMORY_AGENT", "gemini-cli")
+    monkeypatch.setattr("memory.mcp_server.run_server", fake_run_server)
+    result = CliRunner().invoke(main, ["mcp", "--agent", "cursor"])
+    assert result.exit_code == 0
+    assert captured["agent"] == "cursor"
+
+
+@pytest.mark.anyio
+async def test_bound_save_schema_requires_idempotency(tmp_path: Path) -> None:
+    binding = MCPServerBinding("cursor", tmp_path, tmp_path)
+    tools = tool_definitions(binding)
+    save = next(tool for tool in tools if tool.name == "memory_save")
+    details = next(tool for tool in tools if tool.name == "memory_details")
+    context = next(tool for tool in tools if tool.name == "memory_context")
+    assert "idempotency_key" in save.inputSchema["required"]
+    assert "cwd" in save.inputSchema["properties"]
+    assert "source" in save.inputSchema["properties"]
+    assert "authoritative" in save.inputSchema["properties"]["source"][
+        "description"
+    ]
+    assert "agent" in context.inputSchema["properties"]
+    assert details.inputSchema["properties"]["memory_id"]["minLength"] == 1
 
 
 def test_cli_help():

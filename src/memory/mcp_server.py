@@ -1,8 +1,10 @@
 """MCP server exposing memory tools for coding agents."""
 
+import copy
 import json
 import os
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
 from mcp.server import Server
@@ -10,6 +12,7 @@ from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
 
 from memory.core import MemoryService
+from memory.mcp_authority import MCPServerBinding
 from memory.models import RawMemoryInput
 
 VALID_CATEGORIES = (
@@ -204,13 +207,9 @@ def handle_memory_context(
     })
 
 
-def _create_server(service: MemoryService) -> Server:
-    """Create and configure the MCP server with memory tools."""
-    server = Server("echovault")
-
-    @server.list_tools()
-    async def list_tools() -> list[Tool]:
-        return [
+def legacy_tool_definitions() -> tuple[Tool, ...]:
+    """Return the stable unbound MCP tool contract."""
+    return (
             Tool(
                 name="memory_save",
                 description=SAVE_DESCRIPTION,
@@ -280,7 +279,83 @@ def _create_server(service: MemoryService) -> Server:
                     },
                 },
             ),
+            Tool(
+                name="memory_details",
+                description="Get the full details body for one memory ID or unique prefix.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "memory_id": {
+                            "type": "string",
+                            "minLength": 1,
+                            "description": "Full memory ID or unique literal prefix.",
+                        },
+                    },
+                    "required": ["memory_id"],
+                },
+            ),
+        )
+
+
+def tool_definitions(binding: MCPServerBinding) -> tuple[Tool, ...]:
+    """Derive bound schemas without mutating the legacy definitions."""
+    tools = copy.deepcopy(legacy_tool_definitions())
+    by_name = {tool.name: tool for tool in tools}
+    for tool in tools:
+        tool.inputSchema.setdefault("properties", {})["cwd"] = {
+            "type": "string",
+            "description": (
+                "Caller cwd; must remain inside the negotiated project root."
+            ),
+        }
+        project_schema = tool.inputSchema["properties"].get("project")
+        if project_schema is not None:
+            project_schema["description"] = (
+                "Optional validation value; must match the authoritative "
+                "bound project."
+            )
+    save_schema = by_name["memory_save"].inputSchema
+    save_schema["properties"]["source"] = {
+        "type": "string",
+        "description": (
+            "Optional validation value; must match the authoritative bound "
+            "agent identity when one is configured."
+        ),
+    }
+    if binding.agent is not None:
+        save_schema["properties"]["idempotency_key"] = {
+            "type": "string",
+            "format": "uuid",
+        }
+        save_schema["required"] = [
+            *save_schema.get("required", []),
+            "idempotency_key",
         ]
+        by_name["memory_context"].inputSchema["properties"]["agent"][
+            "description"
+        ] = (
+            "Optional validation value; must match the authoritative bound "
+            "agent identity."
+        )
+    return tools
+
+
+def _create_server(
+    service: MemoryService,
+    binding: MCPServerBinding | None = None,
+) -> Server:
+    """Create and configure the MCP server with memory tools."""
+    binding = binding or MCPServerBinding(None, None, Path.cwd())
+    server = Server("echovault")
+
+    @server.list_tools()
+    async def list_tools() -> list[Tool]:
+        definitions = (
+            tool_definitions(binding)
+            if binding.is_bound
+            else legacy_tool_definitions()
+        )
+        return list(definitions)
 
     @server.call_tool()
     async def call_tool(name: str, arguments: dict) -> list[TextContent]:
@@ -298,11 +373,21 @@ def _create_server(service: MemoryService) -> Server:
     return server
 
 
-async def run_server():
+async def run_server(
+    *,
+    agent: str | None = None,
+    project_root: Path | None = None,
+    startup_cwd: Path | None = None,
+) -> None:
     """Run the MCP server with stdio transport."""
     service = MemoryService()
     try:
-        server = _create_server(service)
+        binding = MCPServerBinding(
+            agent,
+            project_root,
+            startup_cwd or Path.cwd(),
+        )
+        server = _create_server(service, binding)
         async with stdio_server() as (read_stream, write_stream):
             await server.run(read_stream, write_stream, server.create_initialization_options())
     finally:
