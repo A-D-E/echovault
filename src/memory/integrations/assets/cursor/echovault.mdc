@@ -1,0 +1,15 @@
+---
+description: Retrieve EchoVault context before substantive work and save curated durable learnings.
+alwaysApply: true
+---
+
+# EchoVault curated memory
+
+Behavior version: {{VERSION}}
+
+Before substantive planning, debugging, architecture, or implementation, call `memory_context` with the current request.
+Use `memory_search` and `memory_details` only when the context pack is insufficient.
+If `memory_context` reports `context.mode=off`, continue without automatic `memory_search`; explicit user-directed retrieval remains available.
+Before the final response, call `memory_save` only for durable decisions, fixes, patterns, project state, or clarified requirements.
+Generate one UUID per conceptual save and reuse it for one retry through `idempotency_key`.
+Never store secrets, complete prompts, responses, or transcripts. Skip trivial and duplicate memories.

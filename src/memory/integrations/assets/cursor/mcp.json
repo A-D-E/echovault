@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "echovault": {
+      "command": "{{MEMORY_COMMAND}}",
+      "args": ["mcp", "--agent", "cursor"]
+    }
+  }
+}
