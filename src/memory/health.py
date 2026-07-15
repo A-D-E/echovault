@@ -195,6 +195,7 @@ def _empty_doctor_report(
         },
         "operation_journals": operation_journals,
         "vault_metadata": vault_metadata,
+        "findings": [],
     }
     if database_error is not None:
         report["database_error"] = database_error
@@ -235,6 +236,8 @@ def lifecycle_review(db, project: str | None = None) -> dict[str, list]:
 
 
 def doctor(service, project: str | None = None) -> dict:
+    from memory.reconcile import canonical_findings
+
     db = service.db
     memories = db.list_memories(limit=100000, project=project, include_archived=True)
     cursor = db.conn.cursor()
@@ -265,6 +268,7 @@ def doctor(service, project: str | None = None) -> dict:
     vault_warnings = bool(
         vault_metadata["schema_v1_files"] or vault_metadata["unreadable_files"]
     )
+    findings = canonical_findings(service, project)
     return {
         "status": (
             "ok"
@@ -273,6 +277,7 @@ def doctor(service, project: str | None = None) -> dict:
                 or missing_files
                 or operation_journals
                 or vault_warnings
+                or findings
             )
             else "warning"
         ),
@@ -284,6 +289,7 @@ def doctor(service, project: str | None = None) -> dict:
         "lifecycle_counts": {key: len(value) for key, value in lifecycle.items()},
         "operation_journals": operation_journals,
         "vault_metadata": vault_metadata,
+        "findings": findings,
     }
 
 
@@ -310,6 +316,8 @@ def doctor_home(memory_home: Path, project: str | None = None) -> dict:
         )
 
     def inspect_database(path: Path, *, immutable: bool) -> dict:
+        from memory.persistence import CanonicalPersistence
+
         try:
             database = MemoryDB(
                 str(path),
@@ -322,10 +330,16 @@ def doctor_home(memory_home: Path, project: str | None = None) -> dict:
                 project,
                 database_error="index_read_failed",
             )
+        persistence = CanonicalPersistence(memory_home.resolve(), database, [])
         service = type(
             "ReadOnlyDoctorService",
             (),
-            {"db": database, "memory_home": str(memory_home)},
+            {
+                "db": database,
+                "memory_home": str(memory_home),
+                "vault_dir": str(memory_home.resolve() / "vault"),
+                "persistence": persistence,
+            },
         )()
         try:
             return doctor(service, project)

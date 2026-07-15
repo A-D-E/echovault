@@ -16,7 +16,7 @@ import os
 import re
 import uuid
 from difflib import SequenceMatcher
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -29,7 +29,6 @@ from memory.markdown import (
     assign_entry_anchors,
     make_section_anchor,
     parse_session_file,
-    read_markdown_text,
     write_session_document,
     write_session_memory,
 )
@@ -879,155 +878,13 @@ class MemoryService:
             "model": self.config.embedding.model,
         }
 
-    # ------------------------------------------------------------------
-    # Vault import — parse markdown session files into SQLite index
-    # ------------------------------------------------------------------
-
-    _HEADING_TO_CATEGORY: dict[str, str] = {
-        "Decisions": "decision",
-        "Patterns": "pattern",
-        "Bugs Fixed": "bug",
-        "Context": "context",
-        "Learnings": "learning",
-        "Archived": "__archived__",
-    }
-
-    @staticmethod
-    def _normalize_markdown_content(content: str) -> str:
-        """Normalize markdown text for line-oriented parsing."""
-        return content.lstrip("\ufeff").replace("\r\n", "\n").replace("\r", "\n")
-
-    @staticmethod
-    def _make_section_anchor(title: str, occurrence: int = 1) -> str:
-        """Create a stable section anchor, suffixing repeated titles."""
-        base = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-") or "memory"
-        if occurrence <= 1:
-            return base
-        return f"{base}-{occurrence}"
-
-    @staticmethod
-    def _parse_frontmatter(content: str) -> dict:
-        """Extract simple key-value frontmatter from ``---`` fenced block."""
-        fm: dict = {}
-        normalized = MemoryService._normalize_markdown_content(content)
-        if not normalized.startswith("---\n"):
-            return fm
-        parts = normalized.split("---\n", 2)
-        if len(parts) < 3:
-            return fm
-        for line in parts[1].strip().split("\n"):
-            if ":" not in line:
-                continue
-            key, val = line.split(":", 1)
-            key = key.strip()
-            val = val.strip()
-            if val.startswith("[") and val.endswith("]"):
-                val = [v.strip() for v in val[1:-1].split(",") if v.strip()]
-            fm[key] = val
-        return fm
-
-    @classmethod
-    def _parse_memories_from_md(cls, filepath: str, project: str) -> list[dict]:
-        """Parse H3 sections from a vault session markdown file.
-
-        Each ``### Title`` followed by ``**What:** …`` (and optional
-        ``**Why:**``, ``**Impact:**``, ``**Source:**``, ``<details>``)
-        becomes one memory dict.
-        """
-        content = cls._normalize_markdown_content(read_markdown_text(Path(filepath)))
-        fm = cls._parse_frontmatter(content)
-
-        date_match = re.match(r"(\d{4}-\d{2}-\d{2})", Path(filepath).stem)
-        date_str = date_match.group(1) if date_match else date.today().isoformat()
-
-        memories: list[dict] = []
-        current_category: Optional[str] = None
-        anchor_counts: dict[str, int] = {}
-        current_status = "active"
-
-        lines = content.split("\n")
-        i = 0
-        while i < len(lines):
-            line = lines[i]
-
-            if line.startswith("## "):
-                heading = line[3:].strip()
-                current_category = cls._HEADING_TO_CATEGORY.get(heading)
-                current_status = "archived" if current_category == "__archived__" else "active"
-
-            if line.startswith("### "):
-                title = line[4:].strip()
-                what: Optional[str] = None
-                why: Optional[str] = None
-                impact: Optional[str] = None
-                source: Optional[str] = None
-                living_data: dict = {}
-                details_lines: list[str] = []
-                in_details = False
-
-                i += 1
-                while i < len(lines) and not lines[i].startswith("### ") and not lines[i].startswith("## "):
-                    stripped = lines[i].strip()
-
-                    if stripped == "<details>":
-                        in_details = True
-                        i += 1
-                        continue
-                    if stripped == "</details>":
-                        in_details = False
-                        i += 1
-                        continue
-                    if in_details:
-                        details_lines.append(lines[i])
-                        i += 1
-                        continue
-
-                    if stripped.startswith("**What:**"):
-                        what = stripped[len("**What:**"):].strip()
-                    elif stripped.startswith("**Why:**"):
-                        why = stripped[len("**Why:**"):].strip()
-                    elif stripped.startswith("**Impact:**"):
-                        impact = stripped[len("**Impact:**"):].strip()
-                    elif stripped.startswith("**Source:**"):
-                        source = stripped[len("**Source:**"):].strip()
-                    elif stripped.startswith("**Living Memory:**"):
-                        try:
-                            living_data = json.loads(stripped[len("**Living Memory:**"):].strip())
-                        except json.JSONDecodeError:
-                            living_data = {}
-
-                    i += 1
-
-                if title and what and current_status != "archived":
-                    base_anchor = cls._make_section_anchor(title)
-                    occurrence = anchor_counts.get(base_anchor, 0) + 1
-                    anchor_counts[base_anchor] = occurrence
-                    fm_tags = fm.get("tags", [])
-                    memories.append({
-                        "title": title,
-                        "what": what,
-                        "why": why,
-                        "impact": impact,
-                        "source": source,
-                        "category": current_category,
-                        "project": project,
-                        "tags": fm_tags if isinstance(fm_tags, list) else [],
-                        "date": date_str,
-                        "file_path": filepath,
-                        "section_anchor": cls._make_section_anchor(title, occurrence),
-                        "details": "\n".join(details_lines).strip() or None,
-                        "living_data": living_data,
-                    })
-                continue
-
-            i += 1
-
-        return memories
-
     def import_from_vault(
         self,
         dry_run: bool = False,
         progress_callback=None,
+        *,
+        reconcile: bool = False,
+        project: str | None = None,
     ) -> dict:
         """Scan vault/ markdown files and import memories missing from SQLite.
 
@@ -1046,6 +903,15 @@ class MemoryService:
             Dict with ``imported`` (int), ``skipped`` (int), ``projects``
             (list of project names that had new imports).
         """
+        if reconcile:
+            if dry_run:
+                raise ValueError("Reconciliation cannot be combined with dry-run")
+            from memory.reconcile import reconcile_vault
+
+            return reconcile_vault(self, project=project)
+        if project is not None:
+            raise ValueError("Project selection requires reconciliation")
+
         if not os.path.isdir(self.vault_dir):
             return {"imported": 0, "skipped": 0, "projects": []}
 
@@ -1056,7 +922,7 @@ class MemoryService:
             (
                 row[0],
                 row[1],
-                row[2] or self._make_section_anchor(row[3]),
+                row[2] or make_section_anchor(row[3]),
             )
             for row in cursor.fetchall()
         }
@@ -1072,7 +938,56 @@ class MemoryService:
             project = project_dir.name
 
             for md_file in sorted(project_dir.glob("*.md")):
-                parsed = self._parse_memories_from_md(str(md_file), project)
+                document = parse_session_file(md_file)
+                if document.schema_version == 2:
+                    active_entries = [
+                        entry
+                        for entry in document.entries
+                        if entry.title and entry.what and entry.status != "archived"
+                    ]
+                    missing_ids = [
+                        entry.id
+                        for entry in active_entries
+                        if not isinstance(entry.id, str)
+                        or self.db.get_memory(entry.id) is None
+                    ]
+                    if missing_ids:
+                        raise ValueError(
+                            "Schema-v2 canonical Markdown requires "
+                            "import_from_vault(reconcile=True) or "
+                            "'memory import --reconcile'"
+                        )
+                    skipped += len(active_entries)
+                    for entry in active_entries:
+                        if progress_callback:
+                            progress_callback(
+                                imported,
+                                skipped,
+                                project,
+                                entry.title,
+                            )
+                    continue
+                parsed = [
+                    {
+                        "title": entry.title,
+                        "what": entry.what,
+                        "why": entry.why,
+                        "impact": entry.impact,
+                        "source": entry.source,
+                        "category": entry.category,
+                        "project": project,
+                        "tags": list(document.tags),
+                        "file_path": str(md_file),
+                        "section_anchor": (
+                            entry.section_anchor
+                            or make_section_anchor(entry.title)
+                        ),
+                        "details": entry.details,
+                        "living_data": dict(entry.living_data),
+                    }
+                    for entry in document.entries
+                    if entry.title and entry.what and entry.status != "archived"
+                ]
 
                 for mem_data in parsed:
                     key = (
@@ -1126,6 +1041,12 @@ class MemoryService:
             "skipped": skipped,
             "projects": sorted(touched_projects),
         }
+
+    def doctor(self, project: str | None = None) -> dict:
+        """Return read-only health and canonical-drift diagnostics."""
+        from memory.health import doctor
+
+        return doctor(self, project)
 
     def close(self) -> None:
         """Close database connection and clean up resources."""

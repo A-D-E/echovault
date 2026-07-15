@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import stat
 import uuid
 from dataclasses import asdict, dataclass
@@ -871,8 +872,11 @@ def _discover_scopes(
     if project is not None:
         return [persistence._resolve_scope(project)]
     vault_root = Path(service.vault_dir)
-    if not vault_root.exists():
+    if not os.path.lexists(vault_root):
         return []
+    metadata = vault_root.lstat()
+    if vault_root.is_symlink() or not stat.S_ISDIR(metadata.st_mode):
+        raise OSError("vault root is not a local directory")
     scopes: dict[str, _MigrationScope] = {}
     for candidate in sorted(vault_root.iterdir(), key=lambda item: item.name):
         if candidate.name.startswith(".") or not candidate.is_dir():
@@ -1180,3 +1184,1140 @@ def migrate_vault_metadata(
                 result.setdefault("warnings", []).append(warning)
 
     return result
+
+
+@dataclass
+class ReconcileReport:
+    inserted: int = 0
+    updated: int = 0
+    deleted: int = 0
+    ledger_rows: int = 0
+    rebuilt_vectors: int = 0
+    invalid_fingerprints: list[str] | None = None
+    blockers: list[dict[str, object]] | None = None
+    destructive_cleanup: bool = True
+
+    def __post_init__(self) -> None:
+        if self.invalid_fingerprints is None:
+            self.invalid_fingerprints = []
+        if self.blockers is None:
+            self.blockers = []
+
+    def as_dict(self) -> dict[str, object]:
+        invalid = sorted(set(self.invalid_fingerprints or []))
+        blockers = sorted(
+            self.blockers or [],
+            key=lambda item: (
+                str(item.get("project", "")),
+                str(item.get("code", "")),
+                str(item.get("file", "")),
+                str(item.get("memory_id", "")),
+                str(item.get("operation_id", "")),
+            ),
+        )
+        return {
+            "inserted": self.inserted,
+            "updated": self.updated,
+            "deleted": self.deleted,
+            "ledger_rows": self.ledger_rows,
+            "rebuilt_vectors": self.rebuilt_vectors,
+            "invalid_fingerprints": invalid,
+            "blockers": blockers,
+            "destructive_cleanup": self.destructive_cleanup,
+        }
+
+
+@dataclass(frozen=True)
+class _CanonicalProjection:
+    memory: Memory
+    details: str | None
+    relative_path: str
+    embedding_bytes: bytes
+
+
+@dataclass
+class _ReconcileScan:
+    scope: _MigrationScope
+    projections: dict[str, _CanonicalProjection]
+    blockers: list[dict[str, object]]
+    invalid_fingerprints: list[str]
+    files: tuple[Path, ...]
+    digests: dict[Path, str]
+    project_dirs: tuple[Path, ...]
+    complete: bool
+
+
+class _VaultIdentityConflict(RuntimeError):
+    def __init__(self, conflicts: list[dict[str, object]]) -> None:
+        super().__init__("Canonical memory ID is claimed by multiple projects")
+        self.conflicts = conflicts
+
+
+def _blocker(
+    scope: _MigrationScope,
+    code: str,
+    **fields: object,
+) -> dict[str, object]:
+    return {"project": scope.canonical_key, "code": code, **fields}
+
+
+def _canonical_uuid(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        canonical = str(uuid.UUID(value))
+    except ValueError:
+        return None
+    return canonical if canonical == value else None
+
+
+def _reconcile_scope_paths(
+    service: MemoryService,
+    scope: _MigrationScope,
+) -> tuple[list[Path], list[Path], list[dict[str, object]]]:
+    files: list[Path] = []
+    project_dirs: list[Path] = []
+    blockers: list[dict[str, object]] = []
+    vault_root = Path(service.vault_dir)
+    if not os.path.lexists(vault_root):
+        return files, project_dirs, [_blocker(scope, "missing_vault_root")]
+    try:
+        vault_metadata = vault_root.lstat()
+    except OSError:
+        return files, project_dirs, [_blocker(scope, "unreadable_vault_root")]
+    if vault_root.is_symlink() or not stat.S_ISDIR(vault_metadata.st_mode):
+        return files, project_dirs, [_blocker(scope, "unsafe_vault_root")]
+
+    for storage_key in scope.storage_keys:
+        try:
+            project_dir = service.persistence._project_dir(storage_key)
+        except ProjectResolutionError:
+            blockers.append(
+                _blocker(scope, "invalid_project_path", storage_key=storage_key)
+            )
+            continue
+        if not os.path.lexists(project_dir):
+            continue
+        try:
+            metadata = project_dir.lstat()
+        except OSError:
+            blockers.append(
+                _blocker(scope, "unreadable_project_directory", file=storage_key)
+            )
+            continue
+        if project_dir.is_symlink() or not stat.S_ISDIR(metadata.st_mode):
+            blockers.append(
+                _blocker(scope, "unsafe_project_directory", file=storage_key)
+            )
+            continue
+        project_dirs.append(project_dir)
+        try:
+            files.extend(sorted(project_dir.glob("*-session.md")))
+        except OSError:
+            blockers.append(
+                _blocker(scope, "unreadable_project_directory", file=storage_key)
+            )
+    return (
+        sorted(set(files), key=lambda path: str(path)),
+        sorted(set(project_dirs), key=lambda path: str(path)),
+        blockers,
+    )
+
+
+def _scan_reconcile_scope(
+    service: MemoryService,
+    scope: _MigrationScope,
+) -> _ReconcileScan:
+    files, project_dirs, blockers = _reconcile_scope_paths(service, scope)
+    vault_root = Path(service.vault_dir).absolute()
+    digests: dict[Path, str] = {}
+    candidates: dict[str, list[_CanonicalProjection]] = {}
+
+    scoped_rows = _scope_rows(service, scope.storage_keys)
+    cross_project_ledger_ids: set[str] = set()
+    if scoped_rows and not project_dirs:
+        blockers.append(_blocker(scope, "missing_project_directory"))
+    scope_placeholders = ", ".join("?" for _ in scope.storage_keys)
+    for row in scoped_rows:
+        memory_id = row.get("id")
+        if not isinstance(memory_id, str):
+            continue
+        outside_ledger = service.db.conn.execute(
+            f"""
+            SELECT project, operation_id
+            FROM save_operations
+            WHERE memory_id = ? AND project NOT IN ({scope_placeholders})
+            LIMIT 1
+            """,
+            (memory_id, *scope.storage_keys),
+        ).fetchone()
+        if outside_ledger is not None:
+            cross_project_ledger_ids.add(memory_id)
+            blockers.append(
+                _blocker(
+                    scope,
+                    "cross_project_operation_ledger",
+                    memory_id=memory_id,
+                    operation_id=outside_ledger["operation_id"],
+                )
+            )
+
+    for path in files:
+        try:
+            metadata = path.lstat()
+            if path.is_symlink() or not stat.S_ISREG(metadata.st_mode):
+                raise OSError("session path is not a local regular file")
+            resolved = path.resolve(strict=False)
+            if resolved != path:
+                raise OSError("session path changes identity")
+            relative_path = resolved.relative_to(vault_root).as_posix()
+            before = digest_file(resolved)
+            if before is None:
+                raise OSError("session path disappeared")
+            document = parse_session_file(resolved)
+            if digest_file(resolved) != before:
+                raise ConcurrentModificationError(
+                    f"Session changed while scanning {relative_path}"
+                )
+            digests[path] = before
+        except ConcurrentModificationError:
+            blockers.append(
+                _blocker(scope, "concurrent_markdown_change", file=path.name)
+            )
+            continue
+        except (OSError, UnicodeError, ValueError):
+            blockers.append(
+                _blocker(scope, "unreadable_markdown", file=path.name)
+            )
+            continue
+
+        if document.schema_version != 2:
+            blockers.append(
+                _blocker(scope, "schema_v1", file=relative_path)
+            )
+            continue
+        if document.project not in {*scope.storage_keys, scope.canonical_key}:
+            blockers.append(
+                _blocker(scope, "document_project_mismatch", file=relative_path)
+            )
+            continue
+
+        for entry in document.entries:
+            try:
+                memory = entry.to_memory(str(path))
+            except (TypeError, ValueError):
+                blockers.append(
+                    _blocker(scope, "invalid_v2_entry", file=relative_path)
+                )
+                continue
+            memory_id = _canonical_uuid(memory.id)
+            if memory_id is None:
+                blockers.append(
+                    _blocker(
+                        scope,
+                        "invalid_memory_id",
+                        file=relative_path,
+                        memory_id=memory.id,
+                    )
+                )
+                continue
+            if memory.project not in {*scope.storage_keys, scope.canonical_key}:
+                blockers.append(
+                    _blocker(
+                        scope,
+                        "memory_project_mismatch",
+                        file=relative_path,
+                        memory_id=memory_id,
+                    )
+                )
+                continue
+            outside = service.db.conn.execute(
+                """
+                SELECT project FROM memories
+                WHERE id = ? AND project NOT IN ({})
+                """.format(", ".join("?" for _ in scope.storage_keys)),
+                (memory_id, *scope.storage_keys),
+            ).fetchone()
+            if outside is not None:
+                blockers.append(
+                    _blocker(
+                        scope,
+                        "cross_project_memory_id",
+                        file=relative_path,
+                        memory_id=memory_id,
+                    )
+                )
+                continue
+            expected_fingerprint = content_fingerprint(memory)
+            if memory.content_fingerprint != expected_fingerprint:
+                blockers.append(
+                    _blocker(
+                        scope,
+                        "invalid_content_fingerprint",
+                        file=relative_path,
+                        memory_id=memory_id,
+                    )
+                )
+                continue
+            memory.project = scope.canonical_key
+            projection = _CanonicalProjection(
+                memory=memory,
+                details=entry.details,
+                relative_path=relative_path,
+                embedding_bytes=service.persistence._embedding_bytes(memory),
+            )
+            candidates.setdefault(memory_id, []).append(projection)
+
+    invalid_fingerprints = [
+        str(item["memory_id"])
+        for item in blockers
+        if item.get("code") == "invalid_content_fingerprint"
+        and isinstance(item.get("memory_id"), str)
+    ]
+    projections: dict[str, _CanonicalProjection] = {}
+    for memory_id, matches in candidates.items():
+        if len(matches) != 1:
+            blockers.append(
+                _blocker(scope, "duplicate_memory_id", memory_id=memory_id)
+            )
+            continue
+        projections[memory_id] = matches[0]
+
+    for memory_id in sorted(set(projections) - cross_project_ledger_ids):
+        outside_ledger = service.db.conn.execute(
+            f"""
+            SELECT project, operation_id
+            FROM save_operations
+            WHERE memory_id = ? AND project NOT IN ({scope_placeholders})
+            LIMIT 1
+            """,
+            (memory_id, *scope.storage_keys),
+        ).fetchone()
+        if outside_ledger is None:
+            continue
+        cross_project_ledger_ids.add(memory_id)
+        blockers.append(
+            _blocker(
+                scope,
+                "cross_project_operation_ledger",
+                memory_id=memory_id,
+                operation_id=outside_ledger["operation_id"],
+            )
+        )
+    for memory_id in cross_project_ledger_ids:
+        projections.pop(memory_id, None)
+
+    operation_occurrences: dict[str, list[str]] = {}
+    for memory_id, projection in projections.items():
+        for operation in projection.memory.operations:
+            operation_occurrences.setdefault(operation.operation_id, []).append(
+                memory_id
+            )
+    conflicting_operations = {
+        operation_id: memory_ids
+        for operation_id, memory_ids in operation_occurrences.items()
+        if len(memory_ids) != 1
+    }
+    blocked_memory_ids = {
+        memory_id
+        for memory_ids in conflicting_operations.values()
+        for memory_id in memory_ids
+    }
+    for operation_id, memory_ids in conflicting_operations.items():
+        blockers.append(
+            _blocker(
+                scope,
+                "duplicate_operation_id",
+                operation_id=operation_id,
+                memory_ids=sorted(set(memory_ids)),
+            )
+        )
+    for memory_id in blocked_memory_ids:
+        projections.pop(memory_id, None)
+
+    complete = not blockers
+    return _ReconcileScan(
+        scope=scope,
+        projections=projections,
+        blockers=blockers,
+        invalid_fingerprints=invalid_fingerprints,
+        files=tuple(files),
+        digests=digests,
+        project_dirs=tuple(project_dirs),
+        complete=complete,
+    )
+
+
+def _verify_reconcile_scan(
+    service: MemoryService,
+    scan: _ReconcileScan,
+) -> None:
+    try:
+        current_files, project_dirs, blockers = _reconcile_scope_paths(
+            service, scan.scope
+        )
+    except OSError as error:
+        raise ConcurrentModificationError(
+            "Canonical Markdown scope became unreadable"
+        ) from error
+    initial_path_blockers = [
+        item
+        for item in scan.blockers
+        if item.get("code")
+        in {
+            "missing_vault_root",
+            "unreadable_vault_root",
+            "unsafe_vault_root",
+            "invalid_project_path",
+            "unreadable_project_directory",
+            "unsafe_project_directory",
+        }
+    ]
+    if (
+        tuple(current_files) != scan.files
+        or tuple(project_dirs) != scan.project_dirs
+        or blockers != initial_path_blockers
+    ):
+        raise ConcurrentModificationError("Canonical Markdown scope changed")
+    for path, expected in scan.digests.items():
+        try:
+            actual = digest_file(path)
+        except OSError as error:
+            raise ConcurrentModificationError(
+                f"Canonical Markdown became unreadable: {path.name}"
+            ) from error
+        if actual != expected:
+            raise ConcurrentModificationError(
+                f"Canonical Markdown changed after scan: {path.name}"
+            )
+
+
+def _json_column(row: dict[str, object], field: str) -> object:
+    value = row.get(field)
+    if not isinstance(value, str):
+        return value
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        return object()
+
+
+def _projection_matches(
+    service: MemoryService,
+    projection: _CanonicalProjection,
+    row: dict[str, object],
+) -> bool:
+    memory = projection.memory
+    scalar_fields = (
+        "id",
+        "title",
+        "what",
+        "why",
+        "impact",
+        "category",
+        "project",
+        "source",
+        "file_path",
+        "section_anchor",
+        "created_at",
+        "updated_at",
+        "status",
+        "archived_at",
+        "archive_reason",
+        "superseded_by",
+        "confidence",
+        "valid_from",
+        "valid_until",
+        "commit_sha",
+        "branch",
+        "last_verified",
+        "creator_source",
+        "last_updated_by",
+        "content_fingerprint",
+        "updated_count",
+    )
+    if any(row.get(field) != getattr(memory, field) for field in scalar_fields):
+        return False
+    if bool(row.get("history_complete")) != memory.history_complete:
+        return False
+    expected_json = {
+        "tags": memory.tags,
+        "related_files": memory.related_files,
+        "structured_data": memory.structured_data,
+        "links": memory.links,
+        "contributors": memory.contributors,
+        "operation_history": [asdict(operation) for operation in memory.operations],
+    }
+    if any(
+        _json_column(row, field) != expected
+        for field, expected in expected_json.items()
+    ):
+        return False
+    detail_row = service.db.conn.execute(
+        "SELECT body FROM memory_details WHERE memory_id = ?",
+        (memory.id,),
+    ).fetchone()
+    actual_details = detail_row["body"] if detail_row is not None else None
+    return actual_details == projection.details
+
+
+def _filter_incomplete_ledger_conflicts(
+    service: MemoryService,
+    scan: _ReconcileScan,
+) -> dict[str, _CanonicalProjection]:
+    if scan.complete:
+        return dict(scan.projections)
+    accepted: dict[str, _CanonicalProjection] = {}
+    placeholders = ", ".join("?" for _ in scan.scope.storage_keys)
+    for memory_id, projection in scan.projections.items():
+        conflict = False
+        for operation in projection.memory.operations:
+            rows = service.db.conn.execute(
+                f"""
+                SELECT memory_id FROM save_operations
+                WHERE operation_id = ? AND project IN ({placeholders})
+                """,
+                (operation.operation_id, *scan.scope.storage_keys),
+            ).fetchall()
+            if any(row["memory_id"] != memory_id for row in rows):
+                scan.blockers.append(
+                    _blocker(
+                        scan.scope,
+                        "operation_ledger_conflict",
+                        memory_id=memory_id,
+                        operation_id=operation.operation_id,
+                    )
+                )
+                conflict = True
+                break
+        if not conflict:
+            accepted[memory_id] = projection
+    return accepted
+
+
+def _apply_reconcile_scan(
+    service: MemoryService,
+    scan: _ReconcileScan,
+    report: ReconcileReport,
+) -> tuple[tuple[str, str, bytes], ...]:
+    scope_placeholders = ", ".join("?" for _ in scan.scope.storage_keys)
+    embeddings: list[tuple[str, str, bytes]] = []
+    inserted_count = 0
+    updated_count = 0
+    deleted_count = 0
+    ledger_count = 0
+
+    with service.db.transaction():
+        conflicts = _project_vault_id_conflicts(
+            service,
+            scan.scope.canonical_key,
+        )
+        if conflicts:
+            raise _VaultIdentityConflict(conflicts)
+        _verify_reconcile_scan(service, scan)
+        projections = dict(scan.projections)
+        for memory_id in sorted(tuple(projections)):
+            outside = service.db.conn.execute(
+                f"""
+                SELECT project FROM memories
+                WHERE id = ? AND project NOT IN ({scope_placeholders})
+                """,
+                (memory_id, *scan.scope.storage_keys),
+            ).fetchone()
+            if outside is None:
+                continue
+            scan.blockers.append(
+                _blocker(
+                    scan.scope,
+                    "cross_project_memory_id",
+                    memory_id=memory_id,
+                )
+            )
+            scan.complete = False
+            projections.pop(memory_id, None)
+        current_rows = {
+            str(row["id"]): dict(row)
+            for row in service.db.conn.execute(
+                f"SELECT * FROM memories WHERE project IN ({scope_placeholders})",
+                scan.scope.storage_keys,
+            ).fetchall()
+        }
+        for memory_id in sorted(set(current_rows) | set(projections)):
+            outside_ledger = service.db.conn.execute(
+                f"""
+                SELECT operation_id FROM save_operations
+                WHERE memory_id = ?
+                  AND project NOT IN ({scope_placeholders})
+                LIMIT 1
+                """,
+                (memory_id, *scan.scope.storage_keys),
+            ).fetchone()
+            if outside_ledger is None:
+                continue
+            blocker = _blocker(
+                scan.scope,
+                "cross_project_operation_ledger",
+                memory_id=memory_id,
+                operation_id=outside_ledger["operation_id"],
+            )
+            if blocker not in scan.blockers:
+                scan.blockers.append(blocker)
+            scan.complete = False
+            projections.pop(memory_id, None)
+        scan.projections = projections
+        projections = _filter_incomplete_ledger_conflicts(service, scan)
+        ledger_count = sum(
+            len(projection.memory.operations)
+            for projection in projections.values()
+        )
+
+        if scan.complete:
+            service.db.conn.execute(
+                f"DELETE FROM save_operations WHERE project IN ({scope_placeholders})",
+                scan.scope.storage_keys,
+            )
+
+        for memory_id, projection in projections.items():
+            memory = projection.memory
+            existing = current_rows.get(memory_id)
+            inserted = existing is None
+            changed = inserted or not _projection_matches(
+                service, projection, existing
+            )
+            old_fingerprint = (
+                existing.get("content_fingerprint") if existing is not None else None
+            )
+            had_vector = service.db.has_vector(memory_id)
+            if inserted:
+                inserted_count += 1
+            elif changed:
+                updated_count += 1
+            if changed:
+                if existing is not None and old_fingerprint != memory.content_fingerprint:
+                    service.db.invalidate_vector(memory_id)
+                service.db.upsert_memory(memory, projection.details)
+
+            for operation in memory.operations:
+                service.db.upsert_operation(
+                    scan.scope.canonical_key,
+                    memory_id,
+                    operation,
+                )
+
+            if memory.status != "active":
+                service.db.invalidate_vector(memory_id)
+                service.db.clear_vector_repair(memory_id)
+                continue
+            if inserted or changed or not had_vector:
+                fingerprint = str(memory.content_fingerprint)
+                service.db.queue_vector_repair(
+                    memory_id,
+                    fingerprint,
+                    memory.updated_at,
+                )
+                embeddings.append(
+                    (memory_id, fingerprint, projection.embedding_bytes)
+                )
+            elif scan.complete:
+                service.db.clear_vector_repair(memory_id)
+
+        if scan.complete:
+            canonical_ids = set(projections)
+            for memory_id in sorted(set(current_rows) - canonical_ids):
+                service.db.conn.execute(
+                    "DELETE FROM pending_vector_repairs WHERE memory_id = ?",
+                    (memory_id,),
+                )
+                service.db.delete_memory_exact(memory_id)
+                deleted_count += 1
+
+        _verify_reconcile_scan(service, scan)
+        conflicts = _project_vault_id_conflicts(
+            service,
+            scan.scope.canonical_key,
+        )
+        if conflicts:
+            raise _VaultIdentityConflict(conflicts)
+
+    report.inserted += inserted_count
+    report.updated += updated_count
+    report.deleted += deleted_count
+    report.ledger_rows += ledger_count
+    return tuple(embeddings)
+
+
+def _finish_reconcile_vectors(
+    service: MemoryService,
+    embeddings: tuple[tuple[str, str, bytes], ...],
+    report: ReconcileReport,
+) -> None:
+    for memory_id, fingerprint, payload in embeddings:
+        try:
+            embedding = service.embedding_provider.embed(payload.decode("utf-8"))
+            written = service.db.upsert_vector_if_current(
+                memory_id,
+                fingerprint,
+                embedding,
+            )
+        except Exception as error:
+            assert report.blockers is not None
+            report.blockers.append(
+                {
+                    "code": "embedding_failed",
+                    "memory_id": memory_id,
+                    "error": type(error).__name__,
+                }
+            )
+            continue
+        if not written:
+            assert report.blockers is not None
+            report.blockers.append(
+                {"code": "vector_cas_miss", "memory_id": memory_id}
+            )
+            continue
+        service.db.clear_vector_repair(memory_id, fingerprint)
+        report.rebuilt_vectors += 1
+
+
+def _vault_wide_memory_id_conflicts(
+    service: MemoryService,
+) -> list[dict[str, object]]:
+    """Find stable IDs claimed by valid v2 Markdown in multiple projects."""
+    owners: dict[str, list[dict[str, str]]] = {}
+    try:
+        scopes = _discover_scopes(service, None)
+    except (OSError, ProjectResolutionError):
+        return []
+    vault_root = Path(service.vault_dir).absolute()
+    for scope in scopes:
+        files, _project_dirs, path_blockers = _reconcile_scope_paths(
+            service, scope
+        )
+        if path_blockers:
+            continue
+        for path in files:
+            try:
+                metadata = path.lstat()
+                if path.is_symlink() or not stat.S_ISREG(metadata.st_mode):
+                    continue
+                before = digest_file(path)
+                if before is None:
+                    continue
+                document = parse_session_file(path)
+                if digest_file(path) != before or document.schema_version != 2:
+                    continue
+                if document.project not in {
+                    *scope.storage_keys,
+                    scope.canonical_key,
+                }:
+                    continue
+                relative = path.relative_to(vault_root).as_posix()
+            except (OSError, UnicodeError, ValueError):
+                continue
+            for entry in document.entries:
+                try:
+                    memory = entry.to_memory(str(path))
+                except (TypeError, ValueError):
+                    continue
+                memory_id = _canonical_uuid(memory.id)
+                if (
+                    memory_id is None
+                    or memory.project
+                    not in {*scope.storage_keys, scope.canonical_key}
+                    or memory.content_fingerprint != content_fingerprint(memory)
+                ):
+                    continue
+                owners.setdefault(memory_id, []).append(
+                    {
+                        "project": scope.canonical_key,
+                        "file": relative,
+                    }
+                )
+
+    conflicts: list[dict[str, object]] = []
+    for memory_id, claimed in sorted(owners.items()):
+        projects = sorted({owner["project"] for owner in claimed})
+        if len(projects) <= 1:
+            continue
+        conflicts.append(
+            {
+                "code": "duplicate_memory_id_across_projects",
+                "memory_id": memory_id,
+                "projects": projects,
+                "files": sorted({owner["file"] for owner in claimed}),
+            }
+        )
+    return conflicts
+
+
+def _project_vault_id_conflicts(
+    service: MemoryService,
+    project: str,
+) -> list[dict[str, object]]:
+    return [
+        conflict
+        for conflict in _vault_wide_memory_id_conflicts(service)
+        if isinstance(conflict.get("projects"), list)
+        and project in conflict["projects"]
+    ]
+
+
+def reconcile_project(
+    service: MemoryService,
+    project: str,
+) -> ReconcileReport:
+    """Rebuild one derived project scope from canonical Markdown."""
+    report = ReconcileReport()
+    try:
+        scope = service.persistence._resolve_scope(project)
+    except (OSError, ProjectResolutionError) as error:
+        assert report.blockers is not None
+        report.blockers.append(
+            {
+                "project": project,
+                "code": "project_resolution_failed",
+                "error": type(error).__name__,
+            }
+        )
+        report.destructive_cleanup = False
+        return report
+
+    embeddings: tuple[tuple[str, str, bytes], ...] = ()
+    try:
+        with service.persistence._locked_after_recovery((scope.canonical_key,)):
+            conflicts = _project_vault_id_conflicts(
+                service,
+                scope.canonical_key,
+            )
+            if conflicts:
+                raise _VaultIdentityConflict(conflicts)
+            scan = _scan_reconcile_scope(service, scope)
+            _verify_reconcile_scan(service, scan)
+            assert report.blockers is not None
+            assert report.invalid_fingerprints is not None
+            report.blockers.extend(scan.blockers)
+            report.invalid_fingerprints.extend(scan.invalid_fingerprints)
+            embeddings = _apply_reconcile_scan(service, scan, report)
+            for blocker in scan.blockers:
+                if blocker not in report.blockers:
+                    report.blockers.append(blocker)
+            report.destructive_cleanup = scan.complete
+    except _VaultIdentityConflict as error:
+        assert report.blockers is not None
+        report.blockers.extend(
+            {"project": scope.canonical_key, **conflict}
+            for conflict in error.conflicts
+        )
+        report.destructive_cleanup = False
+        return report
+    except JournalRecoveryConflict as error:
+        assert report.blockers is not None
+        report.blockers.append(
+            {
+                "project": scope.canonical_key,
+                "code": "journal_recovery_conflict",
+                "error": type(error).__name__,
+            }
+        )
+        report.destructive_cleanup = False
+        return report
+    except ConcurrentModificationError:
+        assert report.blockers is not None
+        report.blockers.append(
+            {
+                "project": scope.canonical_key,
+                "code": "concurrent_markdown_change",
+            }
+        )
+        report.destructive_cleanup = False
+        return report
+
+    _finish_reconcile_vectors(service, embeddings, report)
+    return report
+
+
+def _reconcile_scopes(
+    service: MemoryService,
+    project: str | None,
+) -> list[_MigrationScope]:
+    if project is not None:
+        return [service.persistence._resolve_scope(project)]
+    scopes = {
+        scope.canonical_key: scope for scope in _discover_scopes(service, None)
+    }
+    for row in service.db.conn.execute(
+        """
+        SELECT project FROM memories
+        UNION
+        SELECT project FROM save_operations
+        ORDER BY project
+        """
+    ).fetchall():
+        value = row["project"]
+        if not isinstance(value, str):
+            continue
+        try:
+            scope = service.persistence._resolve_scope(value)
+        except (OSError, ProjectResolutionError):
+            continue
+        scopes.setdefault(scope.canonical_key, scope)
+    return [scopes[key] for key in sorted(scopes)]
+
+
+def reconcile_vault(
+    service: MemoryService,
+    project: str | None = None,
+) -> dict[str, object]:
+    """Reconcile one or every discovered canonical project scope."""
+    combined = ReconcileReport()
+    try:
+        scopes = _reconcile_scopes(service, project)
+    except (OSError, ProjectResolutionError) as error:
+        assert combined.blockers is not None
+        combined.blockers.append(
+            {
+                "project": project or "",
+                "code": "scope_discovery_failed",
+                "error": type(error).__name__,
+            }
+        )
+        combined.destructive_cleanup = False
+        return combined.as_dict()
+    for scope in scopes:
+        current = reconcile_project(service, scope.canonical_key)
+        combined.inserted += current.inserted
+        combined.updated += current.updated
+        combined.deleted += current.deleted
+        combined.ledger_rows += current.ledger_rows
+        combined.rebuilt_vectors += current.rebuilt_vectors
+        assert combined.invalid_fingerprints is not None
+        assert combined.blockers is not None
+        combined.invalid_fingerprints.extend(current.invalid_fingerprints or [])
+        combined.blockers.extend(current.blockers or [])
+        combined.destructive_cleanup = (
+            combined.destructive_cleanup and current.destructive_cleanup
+        )
+    return combined.as_dict()
+
+
+def _repair_command(project: str) -> str:
+    return f"memory import --reconcile --project {project}"
+
+
+def _canonical_operation_rows(
+    service: MemoryService,
+    scan: _ReconcileScan,
+) -> list[dict[str, object]]:
+    placeholders = ", ".join("?" for _ in scan.scope.storage_keys)
+    return [
+        dict(row)
+        for row in service.db.conn.execute(
+            f"""
+            SELECT project, operation_id, memory_id, request_fingerprint,
+                   action, source, timestamp, branch, commit_sha
+            FROM save_operations
+            WHERE project IN ({placeholders})
+            ORDER BY project, operation_id
+            """,
+            scan.scope.storage_keys,
+        ).fetchall()
+    ]
+
+
+def _operation_drift_findings(
+    service: MemoryService,
+    scan: _ReconcileScan,
+) -> list[dict[str, object]]:
+    expected = {
+        operation.operation_id: {
+            "project": scan.scope.canonical_key,
+            "operation_id": operation.operation_id,
+            "memory_id": projection.memory.id,
+            "request_fingerprint": operation.request_fingerprint,
+            "action": operation.action,
+            "source": operation.source,
+            "timestamp": operation.timestamp,
+            "branch": operation.branch,
+            "commit_sha": operation.commit_sha,
+        }
+        for projection in scan.projections.values()
+        for operation in projection.memory.operations
+    }
+    actual_rows = _canonical_operation_rows(service, scan)
+    actual: dict[str, list[dict[str, object]]] = {}
+    for row in actual_rows:
+        actual.setdefault(str(row["operation_id"]), []).append(row)
+
+    operation_ids = set(expected)
+    if scan.complete:
+        operation_ids.update(actual)
+    findings: list[dict[str, object]] = []
+    for operation_id in sorted(operation_ids):
+        rows = actual.get(operation_id, [])
+        matches = len(rows) == 1 and rows[0] == expected.get(operation_id)
+        if matches:
+            continue
+        findings.append(
+            {
+                "code": "operation_ledger_drift",
+                "project": scan.scope.canonical_key,
+                "operation_id": operation_id,
+                "repair": _repair_command(scan.scope.canonical_key),
+            }
+        )
+    return findings
+
+
+def _journal_prepared_paths(service: MemoryService) -> set[Path]:
+    from memory.persistence import load_operation_journal
+
+    memory_home = Path(service.memory_home).resolve()
+    transactions = memory_home / "transactions"
+    if not transactions.is_dir() or transactions.is_symlink():
+        return set()
+    prepared: set[Path] = set()
+    for journal_path in sorted(transactions.glob("*.json")):
+        try:
+            operation = load_operation_journal(memory_home, journal_path)
+        except (JournalRecoveryConflict, OSError, UnicodeError, ValueError):
+            continue
+        prepared.update(
+            memory_home / target.temporary for target in operation.targets
+        )
+    return prepared
+
+
+def _stale_prepared_findings(
+    service: MemoryService,
+    scan: _ReconcileScan,
+    journal_prepared: set[Path],
+) -> list[dict[str, object]]:
+    findings: list[dict[str, object]] = []
+    vault_root = Path(service.vault_dir).resolve()
+    for project_dir in scan.project_dirs:
+        try:
+            candidates = sorted(project_dir.glob(".*-session.md.*.tmp"))
+        except OSError:
+            continue
+        for path in candidates:
+            if path in journal_prepared:
+                continue
+            try:
+                metadata = path.lstat()
+                if path.is_symlink() or not stat.S_ISREG(metadata.st_mode):
+                    continue
+                relative = path.relative_to(vault_root).as_posix()
+            except (OSError, ValueError):
+                continue
+            findings.append(
+                {
+                    "code": "stale_prepared_file",
+                    "project": scan.scope.canonical_key,
+                    "file": relative,
+                    "repair": (
+                        "Inspect the prepared file and pending journals before "
+                        "removing it"
+                    ),
+                }
+            )
+    return findings
+
+
+def canonical_findings(
+    service: MemoryService,
+    project: str | None = None,
+) -> list[dict[str, object]]:
+    """Return canonical drift findings without acquiring locks or mutating state."""
+    try:
+        scopes = _reconcile_scopes(service, project)
+    except (OSError, ProjectResolutionError) as error:
+        return [
+            {
+                "code": "project_resolution_failed",
+                "project": project or "",
+                "error": type(error).__name__,
+            }
+        ]
+
+    findings: list[dict[str, object]] = []
+    selected_projects = {scope.canonical_key for scope in scopes}
+    for conflict in _vault_wide_memory_id_conflicts(service):
+        projects = conflict.get("projects")
+        if project is not None and (
+            not isinstance(projects, list)
+            or selected_projects.isdisjoint(projects)
+        ):
+            continue
+        repair_project = (
+            projects[0]
+            if isinstance(projects, list) and projects
+            else project or ""
+        )
+        findings.append(
+            {
+                **conflict,
+                "project": repair_project,
+                "repair": (
+                    "Assign a unique stable memory ID in canonical Markdown "
+                    "before reconciliation"
+                ),
+            }
+        )
+    journal_prepared = _journal_prepared_paths(service)
+    for scope in scopes:
+        scan = _scan_reconcile_scope(service, scope)
+        repair = _repair_command(scope.canonical_key)
+        for blocker in scan.blockers:
+            finding = dict(blocker)
+            if blocker.get("code") == "schema_v1":
+                finding["repair"] = (
+                    f"memory migrate vault-metadata --project {scope.canonical_key}"
+                )
+            elif blocker.get("code") == "invalid_content_fingerprint":
+                finding["repair"] = (
+                    "Fix or restore canonical Markdown, then run: " + repair
+                )
+            else:
+                finding["repair"] = repair
+            findings.append(finding)
+
+        for memory_id, projection in sorted(scan.projections.items()):
+            row = service.db.get_memory(memory_id)
+            if row is None or not _projection_matches(service, projection, row):
+                findings.append(
+                    {
+                        "code": "projection_drift",
+                        "project": scope.canonical_key,
+                        "memory_id": memory_id,
+                        "repair": repair,
+                    }
+                )
+        if scan.complete:
+            canonical_ids = set(scan.projections)
+            for row in _scope_rows(service, scope.storage_keys):
+                memory_id = row.get("id")
+                if not isinstance(memory_id, str) or memory_id in canonical_ids:
+                    continue
+                findings.append(
+                    {
+                        "code": "projection_drift",
+                        "project": scope.canonical_key,
+                        "memory_id": memory_id,
+                        "repair": repair,
+                    }
+                )
+        findings.extend(_operation_drift_findings(service, scan))
+        findings.extend(
+            _stale_prepared_findings(service, scan, journal_prepared)
+        )
+
+    return sorted(
+        findings,
+        key=lambda item: (
+            str(item.get("project", "")),
+            str(item.get("code", "")),
+            str(item.get("file", "")),
+            str(item.get("memory_id", "")),
+            str(item.get("operation_id", "")),
+        ),
+    )

@@ -625,6 +625,7 @@ class _MutationPlan:
 
 
 _VECTOR_WARNING = "Memory saved, but semantic indexing is temporarily unavailable."
+VAULT_IDENTITY_LOCK_KEY = ".vault-identity"
 
 
 def embedding_text(
@@ -1259,7 +1260,10 @@ class CanonicalPersistence:
         closure, _journals = self._journal_lock_closure(project_keys)
         recovered_embeddings: list[tuple[str, str, bytes]] = []
         try:
-            with acquire_project_locks(self.memory_home, closure):
+            with acquire_project_locks(
+                self.memory_home,
+                (*closure, VAULT_IDENTITY_LOCK_KEY),
+            ):
                 current_closure, current_journals = self._journal_lock_closure(project_keys)
                 if tuple(current_closure) != tuple(closure):
                     raise JournalRecoveryConflict(
@@ -1462,7 +1466,10 @@ class CanonicalPersistence:
             return []
         recovered: list[str] = []
         embeddings: list[tuple[str, str, bytes]] = []
-        with acquire_project_locks(self.memory_home, closure):
+        with acquire_project_locks(
+            self.memory_home,
+            (*closure, VAULT_IDENTITY_LOCK_KEY),
+        ):
             current_closure, current_journals = self._journal_lock_closure(project_keys)
             if tuple(current_closure) != tuple(closure):
                 raise JournalRecoveryConflict(

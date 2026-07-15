@@ -945,7 +945,19 @@ def migrate_vault_metadata_cmd(project, dry_run):
 @main.command("import")
 @click.option("--dry-run", is_flag=True, default=False, help="Show what would be imported without changing anything")
 @click.option("--reindex", "do_reindex", is_flag=True, default=False, help="Run reindex after importing")
-def import_vault(dry_run, do_reindex):
+@click.option(
+    "--reconcile",
+    is_flag=True,
+    default=False,
+    help="Repair the derived index from complete canonical v2 Markdown",
+)
+@click.option(
+    "--project",
+    type=str,
+    default=None,
+    help="Limit reconciliation to one project",
+)
+def import_vault(dry_run, do_reindex, reconcile, project):
     """Import memories from vault markdown files into the local index.
 
     Scans all .md files in vault/ sub-directories, parses H3 memory
@@ -955,7 +967,14 @@ def import_vault(dry_run, do_reindex):
 
     Deduplication is by (project, file_path, section_anchor) — existing memories are skipped.
     """
-    svc = MemoryService()
+    if dry_run and reconcile:
+        raise click.UsageError("--dry-run cannot be combined with --reconcile")
+    if project is not None and not reconcile:
+        raise click.UsageError("--project requires --reconcile")
+    if do_reindex and reconcile:
+        raise click.UsageError("--reindex cannot be combined with --reconcile")
+
+    svc = MemoryService(recover_pending=not reconcile)
 
     if dry_run:
         click.echo("Dry run — no changes will be made.\n")
@@ -964,28 +983,38 @@ def import_vault(dry_run, do_reindex):
         if dry_run:
             click.echo(f"  [new] {project}/{title}")
 
-    result = svc.import_from_vault(dry_run=dry_run, progress_callback=progress)
-
-    click.echo(f"\nImported: {result['imported']}, Skipped (already exists): {result['skipped']}")
-    if result["projects"]:
-        click.echo(f"Projects with new imports: {', '.join(result['projects'])}")
-
-    if do_reindex and result["imported"] > 0 and not dry_run:
-        total = svc.db.count_memories()
-        click.echo(f"\nReindexing {total} memories with {svc.config.embedding.provider}/{svc.config.embedding.model}...")
-
-        def reindex_progress(current, count):
-            click.echo(f"  {current}/{count}", nl=(current == count))
-            if current < count:
-                click.echo("\r", nl=False)
-
-        reindex_result = svc.reindex(progress_callback=reindex_progress)
-        click.echo(
-            f"Re-indexed {reindex_result['count']} memories with "
-            f"{reindex_result['model']} ({reindex_result['dim']} dims)"
+    try:
+        result = svc.import_from_vault(
+            dry_run=dry_run,
+            progress_callback=progress,
+            reconcile=reconcile,
+            project=project,
         )
 
-    svc.close()
+        if reconcile:
+            click.echo(yaml.safe_dump(result, sort_keys=False).rstrip())
+            return
+
+        click.echo(f"\nImported: {result['imported']}, Skipped (already exists): {result['skipped']}")
+        if result["projects"]:
+            click.echo(f"Projects with new imports: {', '.join(result['projects'])}")
+
+        if do_reindex and result["imported"] > 0 and not dry_run:
+            total = svc.db.count_memories()
+            click.echo(f"\nReindexing {total} memories with {svc.config.embedding.provider}/{svc.config.embedding.model}...")
+
+            def reindex_progress(current, count):
+                click.echo(f"  {current}/{count}", nl=(current == count))
+                if current < count:
+                    click.echo("\r", nl=False)
+
+            reindex_result = svc.reindex(progress_callback=reindex_progress)
+            click.echo(
+                f"Re-indexed {reindex_result['count']} memories with "
+                f"{reindex_result['model']} ({reindex_result['dim']} dims)"
+            )
+    finally:
+        svc.close()
 
 
 @main.command()

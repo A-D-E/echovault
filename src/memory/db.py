@@ -208,6 +208,14 @@ class MemoryDB:
             END
         """)
 
+        # FTS5 auto-sync trigger for DELETE
+        cursor.execute("""
+            CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
+                INSERT INTO memories_fts(memories_fts, rowid, title, what, why, impact, tags, category, project, source)
+                VALUES ('delete', old.rowid, old.title, old.what, old.why, old.impact, old.tags, old.category, old.project, old.source);
+            END
+        """)
+
         # Migration: add updated_count column if missing
         cursor.execute("PRAGMA table_info(memories)")
         columns = {row[1] for row in cursor.fetchall()}
