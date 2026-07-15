@@ -12,6 +12,7 @@ from memory.integrations.asset_io import REQUIRED_PACKAGE_ASSETS
 from scripts.render_integration_fixture import render_fixture
 from scripts.validate_cursor_plugin import validate_cursor_plugin
 from scripts.verify_wheel_assets import inspect_sdist, inspect_wheel
+from scripts.verify_installed_tool import resolve_memory_executable
 
 
 def test_rendered_cursor_bundle_passes_checked_in_validator(
@@ -129,3 +130,10 @@ def test_archive_inspection_reports_unsafe_and_missing_members(
     assert result.duplicate_members == (
         "memory/integrations/assets/common/echovault-skill.md",
     )
+
+
+def test_installed_verifier_rejects_non_executable(tmp_path: Path) -> None:
+    candidate = tmp_path / "memory"
+    candidate.write_text("not executable")
+    with pytest.raises(ValueError, match="executable regular file"):
+        resolve_memory_executable(candidate)

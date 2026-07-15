@@ -330,6 +330,50 @@ async def test_bound_details_hides_other_project_without_feedback(
 
 
 @pytest.mark.anyio
+async def test_unbound_details_can_read_memory_created_by_bound_server(
+    tmp_path: Path,
+) -> None:
+    root = make_workspace(tmp_path / "repo")
+    memory_home = tmp_path / "memory-home"
+    service = MemoryService(str(memory_home))
+    registry = ProjectRegistry(memory_home)
+    try:
+        async with open_test_client(
+            service,
+            MCPServerBinding("cursor", root, root),
+            registry,
+        ) as client:
+            saved = decode_object(
+                await client.call_tool(
+                    "memory_save",
+                    {
+                        "title": "Cross-mode detail",
+                        "what": "saved through bound MCP",
+                        "details": "BOUND-TO-UNBOUND-DETAIL",
+                        "idempotency_key": str(uuid.uuid4()),
+                    },
+                )
+            )
+
+        async with open_test_client(
+            service,
+            MCPServerBinding(None, None, root),
+            registry,
+        ) as client:
+            detail = decode_object(
+                await client.call_tool(
+                    "memory_details",
+                    {"memory_id": saved["id"]},
+                )
+            )
+
+        assert detail["status"] == "ok"
+        assert detail["body"] == "BOUND-TO-UNBOUND-DETAIL"
+    finally:
+        service.close()
+
+
+@pytest.mark.anyio
 async def test_reads_use_aliases_but_save_writes_only_hashed_key(
     tmp_path: Path,
 ) -> None:

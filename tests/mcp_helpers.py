@@ -1,6 +1,13 @@
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Awaitable, Callable, MutableMapping
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Mapping,
+    MutableMapping,
+    Sequence,
+)
 from contextlib import asynccontextmanager
 import json
 import os
@@ -173,6 +180,28 @@ async def open_stdio_client(
                 yield client, stderr
     finally:
         stderr.close()
+
+
+@asynccontextmanager
+async def open_stdio_session(
+    memory_executable: Path,
+    args: Sequence[str],
+    env: Mapping[str, str],
+    *,
+    cwd: Path | None = None,
+) -> AsyncIterator[ClientSession]:
+    """Open a real MCP subprocess using an exact installed executable."""
+
+    parameters = StdioServerParameters(
+        command=str(memory_executable),
+        args=list(args),
+        env=dict(env),
+        cwd=cwd,
+    )
+    async with stdio_client(parameters) as streams:
+        async with ClientSession(*streams) as session:
+            await session.initialize()
+            yield session
 
 
 async def save_with_details(

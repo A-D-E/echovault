@@ -409,7 +409,11 @@ def make_legacy_scoped_dispatch(service: MemoryService) -> ScopedDispatch:
             memory_id = call_arguments.get("memory_id")
             if not isinstance(memory_id, str) or not memory_id:
                 return tool_error("memory_id must be a non-empty string")
-            detail = service.get_details(memory_id, project=project)
+            # Legacy unbound clients only supply a memory ID. Keep that
+            # cross-project lookup working for records written through a
+            # canonical bound server, whose storage key is intentionally not
+            # exposed through the legacy tool schema.
+            detail = service.get_details(memory_id, project=None)
             payload = (
                 {"status": "not_found"}
                 if detail is None
