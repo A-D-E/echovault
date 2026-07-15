@@ -536,7 +536,10 @@ class GeminiAdapter:
     @staticmethod
     def _installed_version(output: str) -> str | None:
         for line in output.splitlines():
-            match = re.match(r"^\s*echovault\s+(\S+)", line)
+            match = re.match(
+                r"^\s*(?:✓\s+)?echovault\s+\(?([^\s)]+)\)?(?:\s|$)",
+                line,
+            )
             if match:
                 return match.group(1)
         return None

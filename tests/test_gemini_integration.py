@@ -155,6 +155,17 @@ def test_registry_exposes_gemini_only_after_adapter_exists() -> None:
     )
 
 
+def test_installed_version_parses_gemini_050_extension_list() -> None:
+    output = """\
+✓ echovault (0.6.0)
+ ID: 24107e41bc4aac1955135dd5154df187bf20f21378d2f1da45f98c839f8a3329
+ Path: /Users/example/.gemini/extensions/echovault
+ Enabled (User): true
+"""
+
+    assert GeminiAdapter._installed_version(output) == "0.6.0"
+
+
 def test_old_client_gets_static_and_mcp_with_degraded_warning(
     tmp_path: Path,
 ) -> None:
