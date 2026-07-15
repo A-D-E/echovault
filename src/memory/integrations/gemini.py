@@ -33,6 +33,13 @@ from memory.integrations.ownership import (
     write_manifest_atomic,
 )
 from memory.integrations.process import CommandRunner, SubprocessRunner
+from memory.integrations.gemini_state import (
+    ArtifactState,
+    GeminiInstallationState,
+    GeminiStateConflict,
+    GeminiTarget,
+    plan_gemini_transition,
+)
 from memory.integrations.types import (
     AdapterCapabilities,
     DiagnosticFinding,
@@ -192,6 +199,16 @@ class GeminiAdapter:
         self,
         options: IntegrationOptions,
     ) -> tuple[Path, Path, str]:
+        config_root, context_path = self._direct_roots(options)
+        if options.scope is InstallScope.PROJECT:
+            return config_root, context_path, options.command or "memory"
+        command = str(self._resolve_executable(options.command))
+        return config_root, context_path, command
+
+    def _direct_roots(
+        self,
+        options: IntegrationOptions,
+    ) -> tuple[Path, Path]:
         if options.scope is InstallScope.PROJECT:
             if options.project_root is None:
                 raise ValueError("Gemini project setup requires a project root")
@@ -204,20 +221,272 @@ class GeminiAdapter:
                 project,
                 options.config_root_explicit,
             )
-            return config_root, project / "GEMINI.md", options.command or "memory"
+            return config_root, project / "GEMINI.md"
         target = options.config_root or Path.home() / ".gemini"
         config_root = validate_target_root(
             target,
             Path.home(),
             options.config_root_explicit,
         )
-        command = str(self._resolve_executable(options.command))
-        return config_root, config_root / "GEMINI.md", command
+        return config_root, config_root / "GEMINI.md"
+
+    @staticmethod
+    def _raise_preflight_state(
+        artifact: ArtifactState,
+        *,
+        target: GeminiTarget,
+        force_managed: bool,
+    ) -> None:
+        if artifact is ArtifactState.MALFORMED:
+            raise ConfigMalformedError(
+                f"Gemini {target.value} configuration is malformed"
+            )
+        if artifact is ArtifactState.CUSTOM:
+            raise GeminiStateConflict(
+                "custom Gemini hook or MCP integration exists"
+            )
+        if artifact is ArtifactState.MODIFIED and not force_managed:
+            raise GeminiStateConflict(
+                f"{target.value} is modified; use --force-managed"
+            )
+
+    def _preflight_target(self, options: IntegrationOptions) -> None:
+        target = self._target(options)
+        if target is GeminiTarget.NATIVE:
+            source, _gemini_root = self._native_paths(options)
+            artifact = self._native_artifact_state(
+                source,
+                installed_version=None,
+            )
+        else:
+            config_root, context_path = self._direct_roots(options)
+            artifact = self._direct_artifact_state(
+                config_root,
+                scope=options.scope,
+                context_path=context_path,
+            )
+        self._raise_preflight_state(
+            artifact,
+            target=target,
+            force_managed=options.force_managed,
+        )
 
     def setup(self, options: IntegrationOptions) -> IntegrationResult:
+        self._preflight_target(options)
+        target = self._target(options)
+        if target is GeminiTarget.NATIVE:
+            user_root = options.config_root or Path.home() / ".gemini"
+            user_direct = self._direct_artifact_state(
+                user_root.expanduser().resolve(),
+                scope=InstallScope.USER,
+                context_path=user_root.expanduser().resolve() / "GEMINI.md",
+            )
+            if user_direct is not ArtifactState.ABSENT:
+                transition = plan_gemini_transition(
+                    GeminiInstallationState(user_direct=user_direct),
+                    target,
+                    operation="setup",
+                    force_managed=options.force_managed,
+                )
+                if transition.code.startswith("conflict_"):
+                    raise GeminiStateConflict(
+                        f"{transition.code}: {transition.message}"
+                    )
+        state = self.detect_gemini_state(options)
+        transition = plan_gemini_transition(
+            state,
+            target,
+            operation="setup",
+            force_managed=options.force_managed,
+        )
+        if transition.code.startswith("conflict_"):
+            raise GeminiStateConflict(
+                f"{transition.code}: {transition.message}"
+            )
         if options.mode is InstallMode.NATIVE:
             return self._setup_native(options)
         return self._setup_direct(options)
+
+    @staticmethod
+    def _target(options: IntegrationOptions) -> GeminiTarget:
+        if options.scope is InstallScope.PROJECT:
+            return GeminiTarget.PROJECT_DIRECT
+        if options.mode is InstallMode.NATIVE:
+            return GeminiTarget.NATIVE
+        return GeminiTarget.USER_DIRECT
+
+    def _list_extension_version(self, cwd: Path) -> str | None:
+        try:
+            result = self.runner.run(
+                ["gemini", "extensions", "list"],
+                timeout=10.0,
+                cwd=cwd.resolve(),
+                env=dict(os.environ),
+            )
+        except (OSError, TimeoutError):
+            return None
+        if result.returncode != 0:
+            return None
+        return self._installed_version(result.stdout)
+
+    def _direct_artifact_state(
+        self,
+        root: Path,
+        *,
+        scope: InstallScope,
+        context_path: Path,
+    ) -> ArtifactState:
+        manifest_path = root / MANIFEST_NAME
+        settings_path = root / "settings.json"
+        try:
+            document = read_json_strict(settings_path)
+            servers = document.data.get("mcpServers", {})
+            if not isinstance(servers, dict):
+                return ArtifactState.MALFORMED
+            current_mcp = servers.get("echovault")
+            current_hook = _find_named_hook(document.data)
+        except ConfigMalformedError:
+            return ArtifactState.MALFORMED
+        except OwnershipConflict:
+            return ArtifactState.CUSTOM
+        try:
+            context = (
+                context_path.read_text(encoding="utf-8")
+                if context_path.is_file()
+                else ""
+            )
+        except (OSError, UnicodeError):
+            return ArtifactState.MALFORMED
+        begin = "<!-- echovault:start -->"
+        end = "<!-- echovault:end -->"
+        if context.count(begin) != context.count(end) or context.count(begin) > 1:
+            return ArtifactState.MALFORMED
+        marked = context.count(begin) == 1
+        if not manifest_path.is_file():
+            skill = root / "skills/echovault/SKILL.md"
+            return (
+                ArtifactState.CUSTOM
+                if current_mcp is not None
+                or current_hook is not None
+                or skill.exists()
+                or marked
+                else ArtifactState.ABSENT
+            )
+        try:
+            manifest = load_manifest(root)
+        except OwnershipConflict:
+            return ArtifactState.MALFORMED
+        if manifest.integration_id != f"gemini-{scope.value}-direct":
+            return ArtifactState.CUSTOM
+        if verify_managed_content(root, manifest) or not marked:
+            return ArtifactState.MODIFIED
+        if manifest.asset_version != GEMINI_ASSET_VERSION:
+            return ArtifactState.OWNED_OUTDATED
+        return ArtifactState.OWNED
+
+    def _native_artifact_state(
+        self,
+        source: Path,
+        *,
+        installed_version: str | None,
+    ) -> ArtifactState:
+        if os.path.lexists(source) and source.is_symlink():
+            return ArtifactState.MALFORMED
+        manifest_path = source / MANIFEST_NAME
+        if manifest_path.is_file():
+            try:
+                manifest = load_manifest(source)
+            except OwnershipConflict:
+                return ArtifactState.MALFORMED
+            if manifest.integration_id != "gemini-native":
+                return ArtifactState.CUSTOM
+            if verify_managed_content(source, manifest):
+                return ArtifactState.MODIFIED
+            if (
+                manifest.asset_version != GEMINI_ASSET_VERSION
+                or installed_version != GEMINI_ASSET_VERSION
+            ):
+                return ArtifactState.OWNED_OUTDATED
+            return ArtifactState.OWNED
+        if source.exists() and any(source.iterdir()):
+            return ArtifactState.CUSTOM
+        if installed_version is not None:
+            return (
+                ArtifactState.OWNED
+                if installed_version == GEMINI_ASSET_VERSION
+                else ArtifactState.OWNED_OUTDATED
+            )
+        return ArtifactState.ABSENT
+
+    def detect_gemini_state(
+        self,
+        options: IntegrationOptions,
+    ) -> GeminiInstallationState:
+        if options.scope is InstallScope.USER and options.config_root is not None:
+            user_root = options.config_root.expanduser().resolve()
+            home = user_root.parent
+        else:
+            home = Path.home().resolve()
+            user_root = home / ".gemini"
+        return self._detect_roots(
+            home=home,
+            user_root=user_root,
+            project_root=options.project_root,
+            project_config_root=(
+                options.config_root
+                if options.scope is InstallScope.PROJECT
+                else None
+            ),
+        )
+
+    def _detect_roots(
+        self,
+        *,
+        home: Path,
+        user_root: Path,
+        project_root: Path | None,
+        project_config_root: Path | None = None,
+    ) -> GeminiInstallationState:
+        platform_root = self._platform_config(home)
+        source = platform_root / "integrations/gemini-extension/echovault"
+        installed_version = self._list_extension_version(platform_root)
+        native = self._native_artifact_state(
+            source,
+            installed_version=installed_version,
+        )
+        user_direct = self._direct_artifact_state(
+            user_root,
+            scope=InstallScope.USER,
+            context_path=user_root / "GEMINI.md",
+        )
+        project_direct = ArtifactState.ABSENT
+        if project_root is not None:
+            project = project_root.expanduser().resolve()
+            project_config = project_config_root or project / ".gemini"
+            project_direct = self._direct_artifact_state(
+                project_config.expanduser().resolve(),
+                scope=InstallScope.PROJECT,
+                context_path=project / "GEMINI.md",
+            )
+        return GeminiInstallationState(
+            native=native,
+            user_direct=user_direct,
+            project_direct=project_direct,
+            native_enabled=installed_version is not None,
+        )
+
+    def detect(
+        self,
+        *,
+        project_root: Path | None = None,
+        user_root: Path | None = None,
+    ) -> GeminiInstallationState:
+        root = (user_root or Path.home() / ".gemini").expanduser().resolve()
+        return self._detect_roots(
+            home=root.parent,
+            user_root=root,
+            project_root=project_root,
+        )
 
     @staticmethod
     def _platform_config(home: Path) -> Path:
@@ -496,10 +765,158 @@ class GeminiAdapter:
         return len(groups) if isinstance(groups, list) else 0
 
     def uninstall(self, options: IntegrationOptions) -> IntegrationResult:
-        _ = options
+        self._preflight_target(options)
+        state = self.detect_gemini_state(options)
+        target = self._target(options)
+        transition = plan_gemini_transition(
+            state,
+            target,
+            operation="uninstall",
+            force_managed=options.force_managed,
+        )
+        if transition.mutation == "none":
+            return IntegrationResult(
+                status="unchanged",
+                message="Gemini integration is not installed",
+            )
+        if options.mode is InstallMode.NATIVE:
+            return self._uninstall_native(options, state)
+        return self._uninstall_direct(options)
+
+    @staticmethod
+    def _remove_empty_parents(path: Path, *, stop: Path) -> None:
+        parent = path.parent
+        while parent != stop and parent.is_dir():
+            try:
+                parent.rmdir()
+            except OSError:
+                return
+            parent = parent.parent
+
+    def _uninstall_direct(
+        self,
+        options: IntegrationOptions,
+    ) -> IntegrationResult:
+        config_root, context_path = self._direct_roots(options)
+        manifest = load_manifest(config_root)
+        expected_id = f"gemini-{options.scope.value}-direct"
+        if manifest.integration_id != expected_id:
+            raise GeminiStateConflict(
+                "Gemini direct manifest belongs to another integration"
+            )
+        conflicts = verify_managed_content(config_root, manifest)
+        if conflicts and not options.force_managed:
+            raise GeminiStateConflict("Managed Gemini direct content was modified")
+
+        settings_path = config_root / "settings.json"
+
+        def remove_settings(data: dict[str, Any]) -> dict[str, Any]:
+            servers = data.get("mcpServers")
+            if servers is not None:
+                if not isinstance(servers, dict):
+                    raise ConfigMalformedError("mcpServers must be a JSON object")
+                servers.pop("echovault", None)
+                if not servers:
+                    data.pop("mcpServers", None)
+            observed = _find_named_hook(data)
+            if observed is not None:
+                hooks = data["hooks"]
+                groups = hooks["BeforeAgent"]
+                del groups[observed[0]]
+                if not groups:
+                    del hooks["BeforeAgent"]
+                if not hooks:
+                    del data["hooks"]
+            return data
+
+        mutate_json_atomic(
+            settings_path,
+            remove_settings,
+            remove_if_empty=True,
+        )
+        mutate_marked_block(
+            context_path,
+            marker="echovault",
+            block=None,
+        )
+        removed: list[Path] = [settings_path, context_path]
+        for artifact in manifest.managed:
+            if artifact.kind != "file":
+                continue
+            path = config_root.joinpath(*artifact.path.split("/"))
+            path.unlink(missing_ok=True)
+            removed.append(path)
+            self._remove_empty_parents(path, stop=config_root)
+        manifest_path = config_root / MANIFEST_NAME
+        manifest_path.unlink()
+        removed.append(manifest_path)
+        try:
+            config_root.rmdir()
+        except OSError:
+            pass
         return IntegrationResult(
-            status="unchanged",
-            message="Gemini integration is not installed",
+            status="removed",
+            message="Removed Gemini direct integration",
+            paths=tuple(removed),
+        )
+
+    def _uninstall_native(
+        self,
+        options: IntegrationOptions,
+        state: GeminiInstallationState,
+    ) -> IntegrationResult:
+        source, _gemini_root = self._native_paths(options)
+        manifest: OwnershipManifest | None = None
+        manifest_path = source / MANIFEST_NAME
+        if manifest_path.is_file():
+            manifest = load_manifest(source)
+            if manifest.integration_id != "gemini-native":
+                raise GeminiStateConflict(
+                    "Gemini native manifest belongs to another integration"
+                )
+            conflicts = verify_managed_content(source, manifest)
+            if conflicts and not options.force_managed:
+                raise GeminiStateConflict(
+                    "Managed Gemini native content was modified"
+                )
+
+        manager_cwd = source.parent
+        if state.native_enabled:
+            self._manager(
+                ["gemini", "extensions", "uninstall", "echovault"],
+                cwd=manager_cwd,
+                capture_output=False,
+            )
+            verified = self._manager(
+                ["gemini", "extensions", "list"],
+                cwd=manager_cwd,
+            )
+            if self._installed_version(verified.stdout) is not None:
+                raise RuntimeError(
+                    "Gemini extension manager did not remove EchoVault"
+                )
+
+        removed: list[Path] = []
+        if manifest is not None:
+            for artifact in manifest.managed:
+                if artifact.kind != "file":
+                    raise GeminiStateConflict(
+                        "Gemini native manifest contains a non-file claim"
+                    )
+                path = source.joinpath(*artifact.path.split("/"))
+                path.unlink(missing_ok=True)
+                removed.append(path)
+                self._remove_empty_parents(path, stop=source)
+            manifest_path.unlink()
+            removed.append(manifest_path)
+            try:
+                source.rmdir()
+            except OSError:
+                pass
+        return IntegrationResult(
+            status="removed",
+            message="Removed Gemini native extension",
+            paths=tuple(removed),
         )
 
     def diagnose(
@@ -508,12 +925,37 @@ class GeminiAdapter:
     ) -> tuple[DiagnosticFinding, ...]:
         if options.mode is InstallMode.NATIVE:
             return ()
-        config_root, _context, _command = self._direct_paths(options)
-        return (
+        config_root, _context = self._direct_roots(options)
+        findings: list[DiagnosticFinding] = [
             DiagnosticFinding(
                 code="gemini.scope",
                 status="ok" if config_root.is_dir() else "warning",
                 message=f"Gemini direct configuration: {config_root}",
                 path=config_root,
-            ),
-        )
+            )
+        ]
+        if options.scope is InstallScope.PROJECT:
+            state = self.detect_gemini_state(options)
+            global_present = state.native in {
+                ArtifactState.OWNED,
+                ArtifactState.OWNED_OUTDATED,
+                ArtifactState.MODIFIED,
+            } or state.user_direct in {
+                ArtifactState.OWNED,
+                ArtifactState.OWNED_OUTDATED,
+                ArtifactState.MODIFIED,
+            }
+            findings.append(
+                DiagnosticFinding(
+                    code="gemini.mcp.precedence",
+                    status="shadowed" if global_present else "ok",
+                    message=(
+                        "Project Gemini MCP takes precedence over the global "
+                        "EchoVault integration"
+                        if global_present
+                        else "Project Gemini MCP is the active EchoVault scope"
+                    ),
+                    path=config_root / "settings.json",
+                )
+            )
+        return tuple(findings)

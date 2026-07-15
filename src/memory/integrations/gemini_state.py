@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Literal
 
+from memory.integrations.ownership import OwnershipConflict
+
 
 class GeminiTarget(str, Enum):
     NATIVE = "native"
@@ -41,7 +43,7 @@ class InvalidGeminiState(ValueError):
     pass
 
 
-class GeminiStateConflict(ValueError):
+class GeminiStateConflict(OwnershipConflict):
     pass
 
 
@@ -69,7 +71,7 @@ def plan_gemini_transition(
     operation: Literal["setup", "uninstall"],
     force_managed: bool = False,
 ) -> GeminiTransition:
-    if (
+    if operation == "setup" and (
         state.native in _PRESENT_MANAGED
         and state.user_direct in _PRESENT_MANAGED
     ):

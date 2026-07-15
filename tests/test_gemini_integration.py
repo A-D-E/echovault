@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from memory.integrations.config_io import ConfigBoundaryError
 from memory.integrations.gemini import GeminiAdapter
+from memory.integrations.gemini_state import ArtifactState, GeminiStateConflict
+from memory.integrations.config_io import ConfigMalformedError
 from memory.integrations.ownership import OwnershipConflict
 from memory.integrations.registry import get_adapter
 from memory.integrations.types import AdapterCapabilities
@@ -235,20 +238,22 @@ def test_native_install_validates_then_invokes_consent_prompt(
         platform_echovault_config(tmp_path)
         / "integrations/gemini-extension/echovault"
     )
-    assert runner.argv[0] == [
+    validate = [
         "gemini",
         "extensions",
         "validate",
         str(source),
     ]
+    assert validate in runner.argv
     assert ["gemini", "extensions", "install", str(source)] in runner.argv
     install_index = runner.argv.index(
         ["gemini", "extensions", "install", str(source)]
     )
     assert "--consent" not in runner.argv[install_index]
-    assert runner.calls[0]["capture_output"] is True
+    validate_index = runner.argv.index(validate)
+    assert runner.calls[validate_index]["capture_output"] is True
     assert runner.calls[install_index]["capture_output"] is False
-    assert runner.calls[0]["cwd"] == source.parent.resolve()
+    assert runner.calls[validate_index]["cwd"] == source.parent.resolve()
     assert runner.calls[install_index]["cwd"] == source.parent.resolve()
     assert result.status == "installed"
 
@@ -318,3 +323,238 @@ def test_native_current_install_is_byte_stable_and_does_not_update(
     assert result.status == "unchanged"
     assert ["gemini", "extensions", "update", "echovault"] not in runner.argv
     assert snapshot_tree(source) == before
+
+
+def test_native_and_project_direct_coexist_and_native_uninstall_is_exact(
+    tmp_path: Path,
+    fake_memory: Path,
+) -> None:
+    home = tmp_path / "home"
+    project = tmp_path / "repo"
+    home.mkdir()
+    project.mkdir()
+    runner = RecordingRunner()
+    adapter = gemini_adapter(runner)
+    native = native_options(home, fake_memory)
+    project_options = project_direct_options(project)
+    adapter.setup(native)
+    adapter.setup(project_options)
+    project_before = snapshot_tree(project)
+
+    result = adapter.uninstall(native)
+
+    state = adapter.detect(project_root=project, user_root=home / ".gemini")
+    assert result.status == "removed"
+    assert state.native is ArtifactState.ABSENT
+    assert state.project_direct is ArtifactState.OWNED
+    assert snapshot_tree(project) == project_before
+    settings = json.loads((project / ".gemini/settings.json").read_text())
+    assert "echovault" in settings["mcpServers"]
+    assert named_hook(settings, "BeforeAgent", "echovault-context") is not None
+
+
+def test_project_diagnostics_report_native_mcp_shadowing(
+    tmp_path: Path,
+    fake_memory: Path,
+) -> None:
+    home = tmp_path / "home"
+    project = tmp_path / "repo"
+    home.mkdir()
+    project.mkdir()
+    runner = RecordingRunner()
+    adapter = gemini_adapter(runner)
+    adapter.setup(native_options(home, fake_memory))
+    options = project_direct_options(project)
+    adapter.setup(options)
+
+    findings = {item.code: item for item in adapter.diagnose(options)}
+
+    assert findings["gemini.mcp.precedence"].status == "shadowed"
+    assert "project" in findings["gemini.mcp.precedence"].message.lower()
+
+
+def test_project_uninstall_preserves_native_and_unrelated_project_config(
+    tmp_path: Path,
+    fake_memory: Path,
+) -> None:
+    home = tmp_path / "home"
+    project = tmp_path / "repo"
+    home.mkdir()
+    project.mkdir()
+    runner = RecordingRunner()
+    adapter = gemini_adapter(runner)
+    native = native_options(home, fake_memory)
+    project_options = project_direct_options(project)
+    adapter.setup(native)
+    source = (
+        platform_echovault_config(home)
+        / "integrations/gemini-extension/echovault"
+    )
+    native_before = snapshot_tree(source)
+    adapter.setup(project_options)
+    settings_path = project / ".gemini/settings.json"
+    settings = json.loads(settings_path.read_text())
+    settings["theme"] = "mine"
+    settings["hooks"]["BeforeAgent"].append(
+        {
+            "matcher": "*",
+            "hooks": [
+                {"name": "mine", "type": "command", "command": "mine"}
+            ],
+        }
+    )
+    settings_path.write_text(json.dumps(settings))
+
+    result = adapter.uninstall(project_options)
+
+    assert result.status == "removed"
+    assert runner.installed is True
+    assert snapshot_tree(source) == native_before
+    remaining = json.loads(settings_path.read_text())
+    assert remaining["theme"] == "mine"
+    assert named_hook(remaining, "BeforeAgent", "mine") is not None
+    assert "echovault" not in remaining.get("mcpServers", {})
+    assert named_hook(remaining, "BeforeAgent", "echovault-context") is None
+
+
+def test_native_setup_rejects_existing_user_direct_before_mutation(
+    tmp_path: Path,
+    fake_memory: Path,
+) -> None:
+    home = tmp_path / "home"
+    root = home / ".gemini"
+    home.mkdir()
+    runner = RecordingRunner()
+    adapter = gemini_adapter(runner)
+    adapter.setup(user_direct_options(root, fake_memory))
+    before = snapshot_tree(home)
+    runner.argv.clear()
+
+    with pytest.raises(GeminiStateConflict, match="uninstall_user_direct"):
+        adapter.setup(native_options(home, fake_memory))
+
+    assert snapshot_tree(home) == before
+    assert runner.argv == []
+
+
+def test_user_direct_setup_rejects_existing_native_without_mutation(
+    tmp_path: Path,
+    fake_memory: Path,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    runner = RecordingRunner()
+    adapter = gemini_adapter(runner)
+    native = native_options(home, fake_memory)
+    adapter.setup(native)
+    source = (
+        platform_echovault_config(home)
+        / "integrations/gemini-extension/echovault"
+    )
+    before = snapshot_tree(source)
+    runner.argv.clear()
+
+    with pytest.raises(GeminiStateConflict, match="uninstall_native"):
+        adapter.setup(user_direct_options(home / ".gemini", fake_memory))
+
+    assert snapshot_tree(source) == before
+    assert runner.argv == [["gemini", "extensions", "list"]]
+
+
+def test_modified_project_direct_requires_force_for_setup_and_uninstall(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "repo"
+    project.mkdir()
+    runner = RecordingRunner()
+    adapter = gemini_adapter(runner)
+    options = project_direct_options(project)
+    adapter.setup(options)
+    skill = project / ".gemini/skills/echovault/SKILL.md"
+    skill.write_text("mine\n")
+    before = snapshot_tree(project)
+
+    with pytest.raises(GeminiStateConflict, match="modified"):
+        adapter.setup(options)
+    assert snapshot_tree(project) == before
+    assert adapter.setup(replace(options, force_managed=True)).status == "updated"
+
+    skill.write_text("mine again\n")
+    before = snapshot_tree(project)
+    with pytest.raises(GeminiStateConflict, match="modified"):
+        adapter.uninstall(options)
+    assert snapshot_tree(project) == before
+    assert adapter.uninstall(
+        replace(options, force_managed=True)
+    ).status == "removed"
+
+
+@pytest.mark.parametrize("operation", ["setup", "uninstall"])
+def test_force_never_mutates_custom_direct_target(
+    tmp_path: Path,
+    operation: str,
+) -> None:
+    project = tmp_path / "repo"
+    root = project / ".gemini"
+    root.mkdir(parents=True)
+    (root / "settings.json").write_text(
+        json.dumps({"mcpServers": {"echovault": {"command": "custom"}}})
+    )
+    options = project_direct_options(project, force_managed=True)
+    adapter = gemini_adapter(RecordingRunner())
+    before = snapshot_tree(project)
+
+    with pytest.raises(GeminiStateConflict, match="custom"):
+        getattr(adapter, operation)(options)
+
+    assert snapshot_tree(project) == before
+
+
+@pytest.mark.parametrize("operation", ["setup", "uninstall"])
+def test_force_never_mutates_malformed_direct_target(
+    tmp_path: Path,
+    operation: str,
+) -> None:
+    project = tmp_path / "repo"
+    root = project / ".gemini"
+    root.mkdir(parents=True)
+    (root / "settings.json").write_text('{"mcpServers":')
+    options = project_direct_options(project, force_managed=True)
+    adapter = gemini_adapter(RecordingRunner())
+    before = snapshot_tree(project)
+
+    with pytest.raises(ConfigMalformedError):
+        getattr(adapter, operation)(options)
+
+    assert snapshot_tree(project) == before
+
+
+def test_native_force_uninstall_removes_only_manifest_claims(
+    tmp_path: Path,
+    fake_memory: Path,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    runner = RecordingRunner()
+    adapter = gemini_adapter(runner)
+    options = native_options(home, fake_memory)
+    adapter.setup(options)
+    source = (
+        platform_echovault_config(home)
+        / "integrations/gemini-extension/echovault"
+    )
+    managed = source / "GEMINI.md"
+    managed.write_text("modified\n")
+    (source / "mine.txt").write_text("mine\n")
+    before = snapshot_tree(source)
+
+    with pytest.raises(GeminiStateConflict, match="modified"):
+        adapter.uninstall(options)
+    assert snapshot_tree(source) == before
+    assert runner.installed is True
+
+    result = adapter.uninstall(replace(options, force_managed=True))
+    assert result.status == "removed"
+    assert runner.installed is False
+    assert (source / "mine.txt").read_text() == "mine\n"
+    assert not managed.exists()

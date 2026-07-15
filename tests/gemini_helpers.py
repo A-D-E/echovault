@@ -121,13 +121,19 @@ def project_direct_options(
     )
 
 
-def user_direct_options(root: Path, memory: Path) -> IntegrationOptions:
+def user_direct_options(
+    root: Path,
+    memory: Path,
+    *,
+    force_managed: bool = False,
+) -> IntegrationOptions:
     return IntegrationOptions(
         scope=InstallScope.USER,
         mode=InstallMode.DIRECT,
         config_root=root,
         project_root=None,
         command=str(memory),
+        force_managed=force_managed,
         config_root_explicit=True,
     )
 
