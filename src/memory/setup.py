@@ -3,8 +3,17 @@
 import json
 import os
 import shutil
-import sys
+import copy
+from pathlib import Path
 from typing import Any
+
+from memory.integrations.config_io import (
+    ConfigMalformedError,
+    mutate_json_atomic,
+    mutate_toml_atomic,
+    read_json_strict,
+    read_toml_strict,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -12,20 +21,14 @@ from typing import Any
 # ---------------------------------------------------------------------------
 
 def _read_json(path: str) -> dict:
-    """Read a JSON file, returning empty dict if missing or empty."""
-    try:
-        with open(path) as f:
-            return json.load(f) or {}
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
+    """Read one JSON object without treating malformed input as empty."""
+    return copy.deepcopy(read_json_strict(Path(path)).data)
 
 
 def _write_json(path: str, data: dict) -> None:
-    """Write a dict as formatted JSON."""
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w") as f:
-        json.dump(data, f, indent=2)
-        f.write("\n")
+    """Atomically replace one JSON object with digest-CAS protection."""
+    snapshot = copy.deepcopy(data)
+    mutate_json_atomic(Path(path), lambda _current: copy.deepcopy(snapshot))
 
 
 # ---------------------------------------------------------------------------
@@ -33,53 +36,15 @@ def _write_json(path: str, data: dict) -> None:
 # ---------------------------------------------------------------------------
 
 def _read_toml(path: str) -> dict:
-    """Read a TOML file, returning empty dict if missing or empty."""
-    try:
-        with open(path, "rb") as f:
-            data = f.read()
-    except FileNotFoundError:
-        return {}
-    if not data.strip():
-        return {}
-    if sys.version_info >= (3, 11):
-        import tomllib
-        return tomllib.loads(data.decode())
-    else:
-        import tomli
-        return tomli.loads(data.decode())
+    """Read one TOML document without malformed-state fallback."""
+    document = read_toml_strict(Path(path)).data
+    return document.unwrap() if hasattr(document, "unwrap") else dict(document)
 
 
 def _write_toml(path: str, data: dict) -> None:
-    """Write a dict as TOML.
-
-    Only supports the subset we need: top-level key/value pairs and
-    one level of nested tables with string/list-of-string values.
-    """
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    lines: list[str] = []
-
-    # Write top-level scalar keys first
-    for key, value in data.items():
-        if not isinstance(value, dict):
-            lines.append(f"{key} = {_toml_value(value)}")
-
-    # Write tables
-    for key, value in data.items():
-        if isinstance(value, dict):
-            if lines and lines[-1] != "":
-                lines.append("")
-            lines.append(f"[{key}]")
-            for k, v in value.items():
-                if isinstance(v, dict):
-                    lines.append("")
-                    lines.append(f"[{key}.{k}]")
-                    for kk, vv in v.items():
-                        lines.append(f"{kk} = {_toml_value(vv)}")
-                else:
-                    lines.append(f"{k} = {_toml_value(v)}")
-
-    with open(path, "w") as f:
-        f.write("\n".join(lines) + "\n")
+    """Atomically replace one TOML document."""
+    snapshot = copy.deepcopy(data)
+    mutate_toml_atomic(Path(path), lambda _current: copy.deepcopy(snapshot))
 
 
 def _toml_value(v: object) -> str:
@@ -117,31 +82,33 @@ def _install_mcp_servers(path: str) -> bool:
 
     Used by Claude Code and Cursor.  Returns True if the entry was added.
     """
-    data = _read_json(path)
-    servers = data.setdefault("mcpServers", {})
-    if "echovault" in servers:
-        return False
-    servers["echovault"] = MCP_CONFIG
-    _write_json(path, data)
-    return True
+    def install(data: dict[str, Any]) -> dict[str, Any]:
+        servers = data.setdefault("mcpServers", {})
+        if not isinstance(servers, dict):
+            raise ConfigMalformedError("mcpServers must be a JSON object")
+        if "echovault" not in servers:
+            servers["echovault"] = copy.deepcopy(MCP_CONFIG)
+        return data
+
+    return mutate_json_atomic(Path(path), install).changed
 
 
 def _uninstall_mcp_servers(path: str) -> bool:
     """Remove echovault from a JSON ``mcpServers`` key.  Returns True if removed."""
-    if not os.path.exists(path):
-        return False
-    data = _read_json(path)
-    servers = data.get("mcpServers", {})
-    if "echovault" not in servers:
-        return False
-    del servers["echovault"]
-    if not servers:
-        del data["mcpServers"]
-    if data:
-        _write_json(path, data)
-    else:
-        os.remove(path)
-    return True
+    def uninstall(data: dict[str, Any]) -> dict[str, Any]:
+        servers = data.get("mcpServers", {})
+        if not isinstance(servers, dict):
+            raise ConfigMalformedError("mcpServers must be a JSON object")
+        servers.pop("echovault", None)
+        if not servers:
+            data.pop("mcpServers", None)
+        return data
+
+    return mutate_json_atomic(
+        Path(path),
+        uninstall,
+        remove_if_empty=True,
+    ).changed
 
 
 def _install_toml_mcp(path: str) -> bool:
@@ -151,18 +118,21 @@ def _install_toml_mcp(path: str) -> bool:
     If the existing file can't be parsed (e.g. Codex writes non-standard
     TOML keys), falls back to appending the section directly.
     """
-    try:
-        data = _read_toml(path)
-    except Exception:
-        # File exists but has non-standard TOML — append directly
-        return _append_toml_mcp_section(path)
+    def install(data: Any) -> Any:
+        servers = data.get("mcp_servers")
+        if servers is None:
+            data["mcp_servers"] = {}
+            servers = data["mcp_servers"]
+        if not hasattr(servers, "__setitem__"):
+            raise ConfigMalformedError("mcp_servers must be a TOML table")
+        if "echovault" not in servers:
+            servers["echovault"] = {
+                "command": "memory",
+                "args": ["mcp"],
+            }
+        return data
 
-    servers = data.setdefault("mcp_servers", {})
-    if "echovault" in servers:
-        return False
-    servers["echovault"] = {"command": "memory", "args": ["mcp"]}
-    _write_toml(path, data)
-    return True
+    return mutate_toml_atomic(Path(path), install).changed
 
 
 def _append_toml_mcp_section(path: str) -> bool:
@@ -186,35 +156,19 @@ def _append_toml_mcp_section(path: str) -> bool:
 
 def _uninstall_toml_mcp(path: str) -> bool:
     """Remove echovault from a TOML ``[mcp_servers]`` table.  Returns True if removed."""
-    import re
-
-    if not os.path.exists(path):
-        return False
-
-    try:
-        data = _read_toml(path)
-        servers = data.get("mcp_servers", {})
-        if "echovault" not in servers:
-            return False
-        del servers["echovault"]
+    def uninstall(data: Any) -> Any:
+        servers = data.get("mcp_servers")
+        if servers is None:
+            return data
+        if not hasattr(servers, "__delitem__"):
+            raise ConfigMalformedError("mcp_servers must be a TOML table")
+        if "echovault" in servers:
+            del servers["echovault"]
         if not servers:
             del data["mcp_servers"]
-        _write_toml(path, data)
-        return True
-    except Exception:
-        # Non-standard TOML — use regex removal
-        with open(path) as f:
-            content = f.read()
-        if "mcp_servers.echovault" not in content:
-            return False
-        cleaned = re.sub(
-            r"\n*\[mcp_servers\.echovault\]\n(?:(?!\[)[^\n]*\n?)*",
-            "",
-            content,
-        )
-        with open(path, "w") as f:
-            f.write(cleaned)
-        return True
+        return data
+
+    return mutate_toml_atomic(Path(path), uninstall).changed
 
 
 def _install_opencode_mcp(path: str) -> bool:
@@ -222,31 +176,33 @@ def _install_opencode_mcp(path: str) -> bool:
 
     Returns True if the entry was added.
     """
-    data = _read_json(path)
-    mcp = data.setdefault("mcp", {})
-    if "echovault" in mcp:
-        return False
-    mcp["echovault"] = OPENCODE_MCP_CONFIG
-    _write_json(path, data)
-    return True
+    def install(data: dict[str, Any]) -> dict[str, Any]:
+        mcp = data.setdefault("mcp", {})
+        if not isinstance(mcp, dict):
+            raise ConfigMalformedError("mcp must be a JSON object")
+        if "echovault" not in mcp:
+            mcp["echovault"] = copy.deepcopy(OPENCODE_MCP_CONFIG)
+        return data
+
+    return mutate_json_atomic(Path(path), install).changed
 
 
 def _uninstall_opencode_mcp(path: str) -> bool:
     """Remove echovault from a JSON ``mcp`` key.  Returns True if removed."""
-    if not os.path.exists(path):
-        return False
-    data = _read_json(path)
-    mcp = data.get("mcp", {})
-    if "echovault" not in mcp:
-        return False
-    del mcp["echovault"]
-    if not mcp:
-        del data["mcp"]
-    if data:
-        _write_json(path, data)
-    else:
-        os.remove(path)
-    return True
+    def uninstall(data: dict[str, Any]) -> dict[str, Any]:
+        mcp = data.get("mcp", {})
+        if not isinstance(mcp, dict):
+            raise ConfigMalformedError("mcp must be a JSON object")
+        mcp.pop("echovault", None)
+        if not mcp:
+            data.pop("mcp", None)
+        return data
+
+    return mutate_json_atomic(
+        Path(path),
+        uninstall,
+        remove_if_empty=True,
+    ).changed
 
 
 def _remove_old_hooks(settings: dict) -> list[str]:
