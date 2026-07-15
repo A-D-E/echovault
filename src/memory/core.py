@@ -634,9 +634,15 @@ class MemoryService:
         source_ids: list[str],
         *,
         actor: str = "dashboard",
+        operation_id: str | None = None,
     ) -> dict[str, object]:
         """Merge source memories into a canonical memory and archive the sources."""
-        return self.persistence.merge(canonical_id, source_ids, actor=actor)
+        return self.persistence.merge(
+            canonical_id,
+            source_ids,
+            actor=actor,
+            operation_id=operation_id,
+        )
 
     def find_duplicate_candidates(
         self,

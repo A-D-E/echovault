@@ -17,6 +17,7 @@ except ImportError:
 import sqlite_vec
 
 from memory.models import Memory, MemoryDetail, MemoryOperation
+from memory.safe_io import ProcessFileLock
 
 
 _FTS_STOPWORDS = {
@@ -95,8 +96,6 @@ class MemoryDB:
         self.conn.execute("PRAGMA foreign_keys = ON")
         if read_only:
             self.conn.execute("PRAGMA query_only = ON")
-        else:
-            self.conn.execute("PRAGMA journal_mode = WAL")
         self._vector_cas_test_barrier: Optional[Callable[[], object]] = None
 
         # Enable extension loading and load sqlite-vec extension
@@ -104,9 +103,14 @@ class MemoryDB:
         sqlite_vec.load(self.conn)
         self.conn.enable_load_extension(False)
 
-        # Create schema (vec table is deferred until dimension is known)
+        # Schema bootstrap and additive migrations must be single-writer across
+        # processes. SQLite serializes transactions, but the PRAGMA-table-info
+        # then ALTER sequence otherwise races between fresh agent processes.
         if not read_only:
-            self._create_schema()
+            schema_lock = Path(f"{db_path}.schema.lock")
+            with ProcessFileLock(schema_lock):
+                self.conn.execute("PRAGMA journal_mode = WAL")
+                self._create_schema()
 
     def _create_schema(self) -> None:
         """Create database tables and indexes (excluding vec table)."""

@@ -1038,6 +1038,7 @@ class CanonicalPersistence:
         source_ids: Sequence[str],
         *,
         actor: str,
+        operation_id: str | None = None,
     ) -> dict[str, object]:
         actor = self._validate_actor(actor)
         if not source_ids:
@@ -1054,7 +1055,11 @@ class CanonicalPersistence:
         if canonical_full in source_full:
             raise ValueError("Canonical memory cannot also be a source memory")
 
-        operation_id = str(uuid.uuid4())
+        operation_id = (
+            str(uuid.uuid4())
+            if operation_id is None
+            else self._canonical_uuid(operation_id, "Operation ID")
+        )
         timestamp = datetime.now().astimezone().isoformat()
         with self._locked_after_recovery((scope.canonical_key,)):
             documents = self._scope_documents(scope)
@@ -1472,6 +1477,8 @@ class CanonicalPersistence:
         ):
             current_closure, current_journals = self._journal_lock_closure(project_keys)
             if tuple(current_closure) != tuple(closure):
+                if not current_journals:
+                    return []
                 raise JournalRecoveryConflict(
                     "Pending operation lock closure changed during acquisition"
                 )
