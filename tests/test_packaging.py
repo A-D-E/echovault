@@ -4,7 +4,9 @@ import importlib.metadata
 from importlib.resources import files
 import json
 from pathlib import Path
+import subprocess
 
+import pytest
 import yaml
 
 from memory.integrations.asset_io import (
@@ -79,3 +81,69 @@ def test_ci_matrix_and_pinned_validator_are_explicit() -> None:
     assert "gemini extensions validate" in serialized
     assert "verify_installed_tool.py" in serialized
     assert "cursor-agent" not in serialized
+
+
+@pytest.mark.parametrize(
+    ("path", "phrases"),
+    [
+        (
+            "docs/integrations/cursor.md",
+            (
+                "memory setup cursor",
+                "memory doctor --agent cursor",
+                "policy-guided",
+            ),
+        ),
+        (
+            "docs/integrations/gemini-cli.md",
+            (
+                "memory setup gemini",
+                "BeforeAgent",
+                "N/U/P",
+                "not verified",
+            ),
+        ),
+        (
+            "docs/migrations/cross-agent-v0.6.md",
+            (
+                "memory migrate vault-metadata",
+                "--force-managed",
+                "schema v1",
+            ),
+        ),
+        (
+            "docs/security-and-privacy.md",
+            (
+                "allow_remote_query_embeddings",
+                "transcripts",
+                "redacted copy",
+            ),
+        ),
+    ],
+)
+def test_support_docs_cover_required_contracts(
+    path: str,
+    phrases: tuple[str, ...],
+) -> None:
+    content = Path(path).read_text()
+    for phrase in phrases:
+        assert phrase in content
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "docs/integrations/cursor.md",
+        "docs/integrations/gemini-cli.md",
+        "docs/migrations/cross-agent-v0.6.md",
+        "docs/security-and-privacy.md",
+        "docs/dogfood/README.md",
+    ],
+)
+def test_support_docs_are_not_git_ignored(path: str) -> None:
+    result = subprocess.run(
+        ["git", "check-ignore", "--no-index", "--quiet", path],
+        check=False,
+        shell=False,
+    )
+    assert result.returncode == 1

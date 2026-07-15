@@ -7,6 +7,10 @@ The format is inspired by Keep a Changelog and follows semantic versioning.
 ## [Unreleased]
 
 ### Added
+- Added canonical schema v2 provenance, living-memory metadata, explicit
+  schema-v1 metadata migration, and lossless v1 read compatibility.
+- Added four-tool project-bound MCP authority with scoped details,
+  cross-agent retrieval, and idempotent UUID-backed save replay.
 - Added a managed Gemini CLI integration with a native extension, user-direct fallback, project-direct fallback, bound MCP authority, curated context/skill assets, and a privacy-bounded `BeforeAgent` hook.
 - Added complete Gemini native/user/project coexistence detection, scope-exact uninstall, ownership-safe force handling, duplicate-event claims, and read-only diagnostics.
 - Added managed Cursor coverage for the IDE, Agent CLI, and local Agents Window runs, with an explicit isolated Cursor Cloud boundary.
@@ -15,6 +19,18 @@ The format is inspired by Keep a Changelog and follows semantic versioning.
 ### Changed
 - Automatic query embeddings now remain local unless remote query embeddings are explicitly enabled; bound MCP clients cannot override their agent, source, or project authority.
 - Agent setup now uses versioned ownership manifests and preserves unrelated user configuration during update and uninstall.
+- Cursor and Gemini migration now recognizes only exact legacy/managed shapes;
+  malformed, custom, unowned, and symlink-escaped state is preserved as a
+  conflict, with force restricted to manifest-owned content.
+
+### Security
+- Gemini hook retrieval never reads transcripts or persists prompts, remote
+  automatic query embeddings require explicit opt-in and receive a redacted
+  copy, and generated MCP definitions contain no API keys.
+
+### Compatibility
+- Claude Code, Codex, and OpenCode setup commands and the unbound four-tool MCP
+  surface remain available alongside Cursor and Gemini bound integrations.
 
 ### Verification
 - Gemini integration behavior is verified deterministically without network or model credentials; authenticated Gemini model-session behavior has not been claimed.

@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="#install">Install</a> · <a href="#features">Features</a> · <a href="#how-it-works">How it works</a> · <a href="#commands">Commands</a> · <a href="CHANGELOG.md">Changelog</a> · <a href="https://github.com/mraza007/echovault/releases">Releases</a> · <a href="https://muhammadraza.me/2026/building-local-memory-for-coding-agents/">Blog post</a>
+  <a href="#install">Install</a> · <a href="#features">Features</a> · <a href="#how-it-works">How it works</a> · <a href="#commands">Commands</a> · <a href="docs/integrations/cursor.md">Cursor guide</a> · <a href="docs/integrations/gemini-cli.md">Gemini guide</a> · <a href="CHANGELOG.md">Changelog</a> · <a href="https://github.com/mraza007/echovault/releases">Releases</a> · <a href="https://muhammadraza.me/2026/building-local-memory-for-coding-agents/">Blog post</a>
 </p>
 
 ---
@@ -457,15 +457,20 @@ Keybindings:
 
 ## Supported agents
 
-| Agent | Setup command | What gets installed |
-|-------|-------------|-------------------|
-| Claude Code | `memory setup claude-code` | MCP server plus refreshed task-aware skill; `.mcp.json` (project) or `~/.claude.json` (global) |
-| Cursor | `memory setup cursor` | Managed local plugin (global), or bound MCP + versioned rule/skill in `.cursor/` with `--project` |
-| Gemini CLI | `memory setup gemini` | Managed native extension, or bound MCP + `BeforeAgent` hook + context/skill with `--direct` or `--project` |
-| Codex | `memory setup codex` | MCP server in `.codex/config.toml` + `AGENTS.md` fallback |
-| OpenCode | `memory setup opencode` | MCP server in `opencode.json` (project) or `~/.config/opencode/opencode.json` (global) |
+| Agent | Setup command | Integration behavior |
+|-------|-------------|----------------------|
+| Claude Code | `memory setup claude-code` | MCP server plus refreshed task-aware skill |
+| Cursor | `memory setup cursor` | Bound MCP plus curated rule/skill; retrieval is policy-guided |
+| Gemini CLI | `memory setup gemini` | Bound MCP plus deterministic `BeforeAgent` injection when the hook succeeds |
+| Codex | `memory setup codex` | MCP server plus `AGENTS.md` fallback |
+| OpenCode | `memory setup opencode` | MCP server in user or project configuration |
 
 All agents share the same memory vault at your effective `memory_home` path (default `~/.memory/`). A memory saved by Claude Code is searchable from Cursor, Gemini CLI, Codex, or OpenCode.
+
+Operational details and recovery steps are in the [Cursor guide](docs/integrations/cursor.md),
+[Gemini CLI guide](docs/integrations/gemini-cli.md),
+[0.6 migration guide](docs/migrations/cross-agent-v0.6.md), and
+[security and privacy guide](docs/security-and-privacy.md).
 
 For Claude Code, rerun `memory setup claude-code --project` after upgrading
 EchoVault. Setup preserves the MCP registration and installs or refreshes the
