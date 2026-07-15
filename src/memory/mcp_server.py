@@ -5,7 +5,6 @@ import json
 import logging
 import os
 from collections.abc import Awaitable, Callable, Mapping
-from datetime import datetime
 from pathlib import Path
 from typing import Optional, TypeVar
 from uuid import UUID
@@ -16,6 +15,7 @@ from mcp.server.stdio import stdio_server
 from mcp.types import CallToolResult, TextContent, Tool
 
 from memory.core import MemoryService
+from memory.context_pack import build_context_pack
 from memory.mcp_authority import (
     AuthorityConflict,
     MCPServerBinding,
@@ -201,51 +201,7 @@ def handle_memory_context(
         record_feedback=record_feedback,
     )
 
-    memories = []
-    for r in results:
-        tags_raw = r.get("tags", "[]")
-        if isinstance(tags_raw, str):
-            try:
-                tags_list = json.loads(tags_raw)
-            except (json.JSONDecodeError, TypeError):
-                tags_list = []
-        elif isinstance(tags_raw, list):
-            tags_list = tags_raw
-        else:
-            tags_list = []
-
-        date_str = r.get("created_at", "")[:10]
-        try:
-            dt = datetime.fromisoformat(date_str)
-            date_display = dt.strftime("%b %d")
-        except (ValueError, TypeError):
-            date_display = date_str
-
-        memories.append({
-            "id": r["id"],
-            "title": r.get("title", "Untitled"),
-            "what": r.get("what"),
-            "why": r.get("why"),
-            "impact": r.get("impact"),
-            "category": r.get("category", ""),
-            "tags": tags_list,
-            "date": date_display,
-            "structured": json.loads(r.get("structured_data") or "{}") if isinstance(r.get("structured_data"), str) else (r.get("structured_data") or {}),
-            "provenance": {
-                key: r.get(key) for key in (
-                    "confidence", "valid_from", "valid_until", "commit_sha",
-                    "branch", "last_verified",
-                ) if r.get(key) is not None
-            },
-            "estimated_tokens": r.get("estimated_tokens"),
-        })
-
-    return json.dumps({
-        "total": total,
-        "showing": len(memories),
-        "memories": memories,
-        "message": "Use memory_search for specific topics. IMPORTANT: You MUST call memory_save before this session ends if you make any changes, decisions, or discoveries.",
-    })
+    return json.dumps(build_context_pack(results, total=total))
 
 
 def legacy_tool_definitions() -> tuple[Tool, ...]:
