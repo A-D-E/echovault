@@ -13,6 +13,70 @@ from difflib import SequenceMatcher
 from pathlib import Path
 
 
+def _vault_metadata_diagnostics(
+    memory_home: Path,
+    project: str | None,
+) -> dict[str, object]:
+    """Inspect session schema versions without mutating vault or index state."""
+    from memory.markdown import parse_session_file
+    from memory.safe_io import digest_file
+
+    vault_root = memory_home.resolve() / "vault"
+    schema_v1_files: list[str] = []
+    schema_v2_files: list[str] = []
+    unreadable_files: list[str] = []
+    if not vault_root.exists() or not vault_root.is_dir():
+        return {
+            "schema_v1_files": schema_v1_files,
+            "schema_v2_files": schema_v2_files,
+            "unreadable_files": unreadable_files,
+            "migration_command": None,
+        }
+
+    project_dirs = (
+        [vault_root / project]
+        if project is not None
+        else sorted(vault_root.iterdir(), key=lambda path: path.name)
+    )
+    for project_dir in project_dirs:
+        if not os.path.lexists(project_dir):
+            continue
+        relative_project = project_dir.name
+        try:
+            metadata = project_dir.lstat()
+            if project_dir.is_symlink() or not stat.S_ISDIR(metadata.st_mode):
+                unreadable_files.append(relative_project)
+                continue
+            candidates = sorted(project_dir.glob("*-session.md"))
+        except OSError:
+            unreadable_files.append(relative_project)
+            continue
+        for path in candidates:
+            relative = f"{relative_project}/{path.name}"
+            try:
+                metadata = path.lstat()
+                if path.is_symlink() or not stat.S_ISREG(metadata.st_mode):
+                    raise OSError("session path is not a regular file")
+                digest_file(path)
+                document = parse_session_file(path)
+            except (OSError, UnicodeError, ValueError):
+                unreadable_files.append(relative)
+                continue
+            if document.schema_version == 1:
+                schema_v1_files.append(relative)
+            else:
+                schema_v2_files.append(relative)
+
+    return {
+        "schema_v1_files": schema_v1_files,
+        "schema_v2_files": schema_v2_files,
+        "unreadable_files": unreadable_files,
+        "migration_command": (
+            "memory migrate vault-metadata" if schema_v1_files else None
+        ),
+    }
+
+
 def _operation_journal_diagnostics(
     memory_home: Path,
     project: str | None,
@@ -69,8 +133,16 @@ def _empty_doctor_report(
     database_error: str | None = None,
 ) -> dict:
     operation_journals = _operation_journal_diagnostics(memory_home, project)
+    vault_metadata = _vault_metadata_diagnostics(memory_home, project)
+    vault_warnings = bool(
+        vault_metadata["schema_v1_files"] or vault_metadata["unreadable_files"]
+    )
     report = {
-        "status": "warning" if operation_journals or database_error else "ok",
+        "status": (
+            "warning"
+            if operation_journals or database_error or vault_warnings
+            else "ok"
+        ),
         "memories": 0,
         "active": 0,
         "missing_markdown_files": 0,
@@ -90,6 +162,7 @@ def _empty_doctor_report(
             )
         },
         "operation_journals": operation_journals,
+        "vault_metadata": vault_metadata,
     }
     if database_error is not None:
         report["database_error"] = database_error
@@ -153,8 +226,24 @@ def doctor(service, project: str | None = None) -> dict:
         Path(service.memory_home),
         project,
     )
+    vault_metadata = _vault_metadata_diagnostics(
+        Path(service.memory_home),
+        project,
+    )
+    vault_warnings = bool(
+        vault_metadata["schema_v1_files"] or vault_metadata["unreadable_files"]
+    )
     return {
-        "status": "ok" if not (orphaned_details or missing_files or operation_journals) else "warning",
+        "status": (
+            "ok"
+            if not (
+                orphaned_details
+                or missing_files
+                or operation_journals
+                or vault_warnings
+            )
+            else "warning"
+        ),
         "memories": len(memories), "active": active_count,
         "missing_markdown_files": missing_files, "orphaned_details": orphaned_details,
         "broken_absolute_related_files": broken_related,
@@ -162,6 +251,7 @@ def doctor(service, project: str | None = None) -> dict:
         "embedding_dimension": db.get_embedding_dim(),
         "lifecycle_counts": {key: len(value) for key, value in lifecycle.items()},
         "operation_journals": operation_journals,
+        "vault_metadata": vault_metadata,
     }
 
 

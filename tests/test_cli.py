@@ -249,6 +249,44 @@ def test_dashboard_passes_absolute_memory_executable_to_rust(monkeypatch):
     assert result.exit_code == 0
 
 
+def test_migrate_vault_metadata_cli_forwards_scope_and_closes(monkeypatch):
+    instances = []
+
+    class RecordingService:
+        def __init__(self, *, recover_pending=True, read_only=False):
+            self.calls = []
+            self.closed = False
+            self.recover_pending = recover_pending
+            self.read_only = read_only
+            instances.append(self)
+
+        def migrate_vault_metadata(self, *, project, dry_run):
+            self.calls.append((project, dry_run))
+            return {
+                "migrated": 0,
+                "would_migrate": 2,
+                "unresolved": [],
+                "dry_run": True,
+            }
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(cli_module, "MemoryService", RecordingService)
+
+    result = CliRunner().invoke(
+        main,
+        ["migrate", "vault-metadata", "--project", "legacy", "--dry-run"],
+    )
+
+    assert result.exit_code == 0
+    assert instances[0].calls == [("legacy", True)]
+    assert instances[0].recover_pending is False
+    assert instances[0].read_only is True
+    assert instances[0].closed is True
+    assert "would_migrate: 2" in result.output
+
+
 def test_admin_bridge_is_hidden_from_top_level_help():
     result = CliRunner().invoke(main, ["--help"])
 

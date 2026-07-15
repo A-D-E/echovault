@@ -914,6 +914,34 @@ def doctor_cmd(project):
     click.echo(yaml.safe_dump(report, sort_keys=False))
 
 
+@main.group()
+def migrate():
+    """Run explicit, lossless storage migrations."""
+    pass
+
+
+@migrate.command("vault-metadata")
+@click.option("--project", default=None, help="Migrate one project scope")
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    default=False,
+    help="Report migratable files without changing storage",
+)
+def migrate_vault_metadata_cmd(project, dry_run):
+    """Enrich schema-v1 sessions from unambiguous SQLite metadata."""
+    svc = (
+        MemoryService(recover_pending=False, read_only=True)
+        if dry_run
+        else MemoryService()
+    )
+    try:
+        report = svc.migrate_vault_metadata(project=project, dry_run=dry_run)
+    finally:
+        svc.close()
+    click.echo(yaml.safe_dump(report, sort_keys=False))
+
+
 @main.command("import")
 @click.option("--dry-run", is_flag=True, default=False, help="Show what would be imported without changing anything")
 @click.option("--reindex", "do_reindex", is_flag=True, default=False, help="Run reindex after importing")

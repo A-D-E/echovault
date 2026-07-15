@@ -57,6 +57,7 @@ class MemoryService:
         memory_home: Optional[str] = None,
         *,
         recover_pending: bool = True,
+        read_only: bool = False,
     ):
         """Initialize the memory service.
 
@@ -70,12 +71,13 @@ class MemoryService:
         self.config_path = os.path.join(self.memory_home, "config.yaml")
         self.ignore_path = os.path.join(self.memory_home, ".memoryignore")
 
-        # Ensure vault directory exists
-        os.makedirs(self.vault_dir, exist_ok=True)
+        # Read-only inspection must not initialize missing storage.
+        if not read_only:
+            os.makedirs(self.vault_dir, exist_ok=True)
 
         # Load configuration and initialize database
         self.config = load_config(self.config_path)
-        self.db = MemoryDB(self.db_path)
+        self.db = MemoryDB(self.db_path, read_only=read_only)
 
         # Lazy-load embedding provider (expensive operation)
         self._embedding_provider: Optional[EmbeddingProvider] = None
@@ -87,7 +89,7 @@ class MemoryService:
             self.ignore_patterns,
         )
         self.persistence.embed = lambda text: self.embedding_provider.embed(text)
-        if recover_pending:
+        if recover_pending and not read_only:
             self.persistence.startup_recoveries = tuple(
                 self.persistence.recover_pending_operations(())
             )
@@ -491,6 +493,17 @@ class MemoryService:
         detail = self.get_details(memory_id)
         record["details"] = detail.body if detail else ""
         return record
+
+    def migrate_vault_metadata(
+        self,
+        *,
+        project: Optional[str] = None,
+        dry_run: bool = False,
+    ) -> dict[str, object]:
+        """Explicitly enrich legacy vault files with per-memory metadata."""
+        from memory.reconcile import migrate_vault_metadata
+
+        return migrate_vault_metadata(self, project=project, dry_run=dry_run)
 
     def get_dashboard_stats(
         self,
