@@ -19,13 +19,34 @@ def _vault_metadata_diagnostics(
 ) -> dict[str, object]:
     """Inspect session schema versions without mutating vault or index state."""
     from memory.markdown import parse_session_file
+    from memory.projects import (
+        ProjectRegistry,
+        ProjectResolutionError,
+        validate_storage_key,
+    )
     from memory.safe_io import digest_file
 
-    vault_root = memory_home.resolve() / "vault"
     schema_v1_files: list[str] = []
     schema_v2_files: list[str] = []
     unreadable_files: list[str] = []
-    if not vault_root.exists() or not vault_root.is_dir():
+    vault_root = memory_home.resolve() / "vault"
+    if not os.path.lexists(vault_root):
+        return {
+            "schema_v1_files": schema_v1_files,
+            "schema_v2_files": schema_v2_files,
+            "unreadable_files": unreadable_files,
+            "migration_command": None,
+        }
+    try:
+        vault_metadata = vault_root.lstat()
+    except OSError:
+        vault_metadata = None
+    if (
+        vault_metadata is None
+        or vault_root.is_symlink()
+        or not stat.S_ISDIR(vault_metadata.st_mode)
+    ):
+        unreadable_files.append("<vault-root>")
         return {
             "schema_v1_files": schema_v1_files,
             "schema_v2_files": schema_v2_files,
@@ -33,11 +54,22 @@ def _vault_metadata_diagnostics(
             "migration_command": None,
         }
 
-    project_dirs = (
-        [vault_root / project]
-        if project is not None
-        else sorted(vault_root.iterdir(), key=lambda path: path.name)
-    )
+    if project is None:
+        project_dirs = sorted(vault_root.iterdir(), key=lambda path: path.name)
+    else:
+        try:
+            storage_key = validate_storage_key(project)
+            scope = ProjectRegistry(memory_home.resolve()).resolve(storage_key)
+            storage_keys = scope.storage_keys if scope is not None else (storage_key,)
+        except (OSError, ProjectResolutionError):
+            unreadable_files.append("<invalid-project>")
+            return {
+                "schema_v1_files": schema_v1_files,
+                "schema_v2_files": schema_v2_files,
+                "unreadable_files": unreadable_files,
+                "migration_command": None,
+            }
+        project_dirs = [vault_root / storage_key for storage_key in storage_keys]
     for project_dir in project_dirs:
         if not os.path.lexists(project_dir):
             continue

@@ -6,21 +6,30 @@ import hashlib
 import json
 import stat
 import uuid
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
 from memory.markdown import (
+    ARCHIVED_HEADING,
+    MEMORY_ID_PREFIX,
     SessionDocument,
     SessionEntry,
     _entry_from_memory,
     assign_entry_anchors,
+    normalize_markdown_content,
     parse_session_file,
+    read_markdown_text,
+    render_session_document,
 )
-from memory.models import Memory, MemoryOperation
+from memory.models import CATEGORY_HEADINGS, Memory, MemoryOperation
 from memory.persistence import JournalRecoveryConflict, content_fingerprint
 from memory.projects import ProjectResolutionError
-from memory.safe_io import digest_file, prepare_atomic_text
+from memory.safe_io import (
+    ConcurrentModificationError,
+    digest_file,
+    prepare_atomic_text,
+)
 
 if TYPE_CHECKING:
     from memory.core import MemoryService
@@ -30,6 +39,8 @@ if TYPE_CHECKING:
 class _PreparedVaultMigration:
     path: Path
     relative_path: str
+    source_digest: str
+    storage_keys: tuple[str, ...]
     document: SessionDocument
     rendered: str
     memories: tuple[tuple[Memory, str | None], ...]
@@ -46,6 +57,215 @@ class _UnresolvedLegacyMetadata(ValueError):
 class _MigrationScope(Protocol):
     canonical_key: str
     storage_keys: tuple[str, ...]
+
+
+_V1_FRONTMATTER_KEYS = frozenset(
+    {"project", "created", "tags", "sources", "schema_version"}
+)
+_V1_FIELD_PREFIXES = (
+    "**What:**",
+    "**Why:**",
+    "**Impact:**",
+    "**Source:**",
+    "**Living Memory:**",
+    "**Category:**",
+    "**Archived:**",
+    "**Archive Reason:**",
+    "**Superseded By:**",
+)
+_V1_LIVING_KEYS = frozenset(
+    {
+        "structured_data",
+        "confidence",
+        "valid_from",
+        "valid_until",
+        "commit_sha",
+        "branch",
+        "links",
+        "last_verified",
+    }
+)
+_OPERATION_KEYS = frozenset(
+    {
+        "operation_id",
+        "source",
+        "action",
+        "request_fingerprint",
+        "timestamp",
+        "branch",
+        "commit_sha",
+    }
+)
+
+
+def _strict_json_object(payload: str) -> dict[str, object]:
+    def reject_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"duplicate JSON key: {key}")
+            result[key] = value
+        return result
+
+    def reject_constant(value: str) -> None:
+        raise ValueError(f"non-finite JSON constant: {value}")
+
+    loaded = json.loads(
+        payload,
+        object_pairs_hook=reject_duplicates,
+        parse_constant=reject_constant,
+    )
+    if not isinstance(loaded, dict):
+        raise ValueError("expected a JSON object")
+    return loaded
+
+
+def _validate_v1_lossless_subset(path: Path) -> None:
+    """Refuse a rewrite when permissive v1 parsing would discard content."""
+    content = normalize_markdown_content(read_markdown_text(path))
+    lines = content.split("\n")
+    body_start = 0
+    if lines and lines[0] == "---":
+        try:
+            frontmatter_end = lines.index("---", 1)
+        except ValueError as error:
+            raise _UnresolvedLegacyMetadata(
+                None, "legacy file contains unsupported content"
+            ) from error
+        seen_frontmatter: set[str] = set()
+        for line in lines[1:frontmatter_end]:
+            if not line.strip():
+                continue
+            if ":" not in line:
+                raise _UnresolvedLegacyMetadata(
+                    None, "legacy file contains unsupported content"
+                )
+            key = line.split(":", 1)[0].strip()
+            if key not in _V1_FRONTMATTER_KEYS or key in seen_frontmatter:
+                raise _UnresolvedLegacyMetadata(
+                    None, "legacy file contains unsupported content"
+                )
+            seen_frontmatter.add(key)
+        body_start = frontmatter_end + 1
+
+    known_headings = {*(CATEGORY_HEADINGS.values()), ARCHIVED_HEADING}
+    in_details = False
+    details_lines: list[str] = []
+    entry_started = False
+    seen_entry_fields: set[str] = set()
+    seen_title = False
+    for line in lines[body_start:]:
+        stripped = line.strip()
+        if in_details:
+            if line.startswith(("# ", "## ", "### ")):
+                raise _UnresolvedLegacyMetadata(
+                    None, "legacy file contains unsupported content"
+                )
+            if stripped == "</details>":
+                in_details = False
+                details = "\n".join(details_lines)
+                if details != details.strip():
+                    raise _UnresolvedLegacyMetadata(
+                        None, "legacy file contains unsupported content"
+                    )
+            else:
+                details_lines.append(line)
+            continue
+        if not stripped:
+            continue
+        if stripped == "<details>":
+            if not entry_started or "details" in seen_entry_fields:
+                raise _UnresolvedLegacyMetadata(
+                    None, "legacy file contains unsupported content"
+                )
+            seen_entry_fields.add("details")
+            details_lines = []
+            in_details = True
+            continue
+        if stripped == "</details>":
+            raise _UnresolvedLegacyMetadata(
+                None, "legacy file contains unsupported content"
+            )
+        if line.startswith("# "):
+            if (
+                seen_title
+                or entry_started
+                or line != line.rstrip()
+                or line[2:] != line[2:].strip()
+            ):
+                raise _UnresolvedLegacyMetadata(
+                    None, "legacy file contains unsupported content"
+                )
+            seen_title = True
+            continue
+        if line.startswith("## "):
+            if (
+                line != line.rstrip()
+                or line[3:] != line[3:].strip()
+                or line[3:] not in known_headings
+            ):
+                raise _UnresolvedLegacyMetadata(
+                    None, "legacy file contains unsupported content"
+                )
+            entry_started = False
+            seen_entry_fields = set()
+            continue
+        if line.startswith("### "):
+            if line != line.rstrip() or line[4:] != line[4:].strip():
+                raise _UnresolvedLegacyMetadata(
+                    None, "legacy file contains unsupported content"
+                )
+            entry_started = True
+            seen_entry_fields = set()
+            continue
+        if not entry_started:
+            raise _UnresolvedLegacyMetadata(
+                None, "legacy file contains unsupported content"
+            )
+
+        field: str | None = None
+        if stripped.startswith(MEMORY_ID_PREFIX) and stripped.endswith("-->"):
+            field = "memory-id"
+        else:
+            for prefix in _V1_FIELD_PREFIXES:
+                if stripped.startswith(prefix):
+                    field = prefix
+                    break
+        if field is None or field in seen_entry_fields:
+            raise _UnresolvedLegacyMetadata(
+                None, "legacy file contains unsupported content"
+            )
+        if line != stripped:
+            raise _UnresolvedLegacyMetadata(
+                None, "legacy file contains unsupported content"
+            )
+        if field != "memory-id":
+            payload = stripped.removeprefix(field)
+            if payload.startswith(" "):
+                payload = payload[1:]
+            if payload != payload.strip():
+                raise _UnresolvedLegacyMetadata(
+                    None, "legacy file contains unsupported content"
+                )
+        if field == "**Living Memory:**":
+            try:
+                living = _strict_json_object(
+                    stripped.removeprefix(field).strip()
+                )
+            except (json.JSONDecodeError, ValueError) as error:
+                raise _UnresolvedLegacyMetadata(
+                    None, "legacy file contains unsupported content"
+                ) from error
+            if not set(living).issubset(_V1_LIVING_KEYS):
+                raise _UnresolvedLegacyMetadata(
+                    None, "legacy file contains unsupported content"
+                )
+        seen_entry_fields.add(field)
+
+    if in_details:
+        raise _UnresolvedLegacyMetadata(
+            None, "legacy file contains unsupported content"
+        )
 
 
 def _json_list(row: dict[str, object], field: str) -> list[str]:
@@ -74,6 +294,105 @@ def _json_object(row: dict[str, object], field: str) -> dict[str, object]:
     if not isinstance(raw, dict) or any(not isinstance(key, str) for key in raw):
         raise ValueError(f"invalid {field}")
     return dict(raw)
+
+
+def _operation_from_mapping(value: object) -> MemoryOperation:
+    if not isinstance(value, dict) or set(value) != _OPERATION_KEYS:
+        raise ValueError("invalid operation history")
+    for field in ("operation_id", "action", "request_fingerprint", "timestamp"):
+        if not isinstance(value[field], str) or not value[field]:
+            raise ValueError("invalid operation history")
+    for field in ("source", "branch", "commit_sha"):
+        if value[field] is not None and not isinstance(value[field], str):
+            raise ValueError("invalid operation history")
+    return MemoryOperation(
+        operation_id=value["operation_id"],
+        source=value["source"],
+        action=value["action"],
+        request_fingerprint=value["request_fingerprint"],
+        timestamp=value["timestamp"],
+        branch=value["branch"],
+        commit_sha=value["commit_sha"],
+    )
+
+
+def _operation_history_from_row(row: dict[str, object]) -> list[MemoryOperation]:
+    raw = row.get("operation_history")
+    if raw is None or raw == "":
+        return []
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError as error:
+            raise ValueError("invalid operation history") from error
+    if not isinstance(raw, list):
+        raise ValueError("invalid operation history")
+    operations = [_operation_from_mapping(item) for item in raw]
+    if len({operation.operation_id for operation in operations}) != len(operations):
+        raise ValueError("duplicate operation history")
+    return operations
+
+
+def _historical_operations(
+    service: MemoryService,
+    row: dict[str, object],
+    *,
+    storage_keys: tuple[str, ...],
+    anchor: str | None,
+) -> tuple[MemoryOperation, ...]:
+    memory_id = _required_string(row, "id")
+    ledger_rows = [
+        dict(item)
+        for item in service.db.conn.execute(
+            """
+            SELECT project, operation_id, source, action, request_fingerprint,
+                   timestamp, branch, commit_sha
+            FROM save_operations
+            WHERE memory_id = ?
+            ORDER BY timestamp, operation_id, project
+            """,
+            (memory_id,),
+        ).fetchall()
+    ]
+    if any(item["project"] not in storage_keys for item in ledger_rows):
+        raise _UnresolvedLegacyMetadata(
+            anchor, "operation ledger crosses project scope"
+        )
+
+    ledger_operations: list[MemoryOperation] = []
+    ledger_ids: set[str] = set()
+    for item in ledger_rows:
+        operation_id = item["operation_id"]
+        if not isinstance(operation_id, str) or operation_id in ledger_ids:
+            raise _UnresolvedLegacyMetadata(
+                anchor, "operation ledger is ambiguous"
+            )
+        ledger_ids.add(operation_id)
+        ledger_operations.append(
+            _operation_from_mapping(
+                {key: item[key] for key in _OPERATION_KEYS}
+            )
+        )
+
+    try:
+        history = _operation_history_from_row(row)
+    except ValueError as error:
+        raise _UnresolvedLegacyMetadata(
+            anchor, "indexed operation history is malformed"
+        ) from error
+    if history and ledger_operations:
+        history_by_id = {
+            operation.operation_id: asdict(operation) for operation in history
+        }
+        ledger_by_id = {
+            operation.operation_id: asdict(operation)
+            for operation in ledger_operations
+        }
+        if history_by_id != ledger_by_id:
+            raise _UnresolvedLegacyMetadata(
+                anchor, "indexed operation history conflicts with the ledger"
+            )
+    return tuple(history or ledger_operations)
 
 
 def _required_string(row: dict[str, object], field: str) -> str:
@@ -208,6 +527,7 @@ def _memory_from_legacy_entry(
     project: str,
     path: Path,
     relative_path: str,
+    historical_operations: tuple[MemoryOperation, ...],
 ) -> Memory:
     row_source = _optional_string(row, "source") or None
     entry_source = entry.source if entry.source else None
@@ -266,10 +586,39 @@ def _memory_from_legacy_entry(
     ):
         raise _UnresolvedLegacyMetadata(entry.section_anchor, "invalid confidence")
 
-    category = _optional_string(row, "category") or entry.category
-    status = _optional_string(row, "status") or entry.status or "active"
+    category = (
+        entry.category
+        if entry.category is not None
+        else _optional_string(row, "category")
+    )
+    status = entry.status or "active"
     commit_sha = living_optional_string("commit_sha")
     branch = living_optional_string("branch")
+    migration_operation = MemoryOperation(
+        operation_id=operation_id,
+        source=source,
+        action="migrated",
+        request_fingerprint="migration:" + operation_id,
+        timestamp=updated_at,
+        branch=branch,
+        commit_sha=commit_sha,
+    )
+    existing_migration = next(
+        (
+            operation
+            for operation in historical_operations
+            if operation.operation_id == operation_id
+        ),
+        None,
+    )
+    if existing_migration is not None and existing_migration != migration_operation:
+        raise _UnresolvedLegacyMetadata(
+            entry.section_anchor,
+            "migration operation conflicts with indexed history",
+        )
+    operations = list(historical_operations)
+    if existing_migration is None:
+        operations.append(migration_operation)
     memory = Memory(
         id=memory_id,
         title=entry.title,
@@ -300,17 +649,7 @@ def _memory_from_legacy_entry(
         creator_source=source,
         last_updated_by=source,
         contributors=[source] if source is not None else [],
-        operations=[
-            MemoryOperation(
-                operation_id=operation_id,
-                source=source,
-                action="migrated",
-                request_fingerprint="migration:" + operation_id,
-                timestamp=updated_at,
-                branch=branch,
-                commit_sha=commit_sha,
-            )
-        ],
+        operations=operations,
         content_fingerprint=None,
         history_complete=False,
         updated_count=updated_count,
@@ -352,12 +691,32 @@ def _prepare_file(
         raise _UnresolvedLegacyMetadata(None, "file escapes the vault") from error
     if resolved_path != path:
         raise _UnresolvedLegacyMetadata(None, "file changes identity through its path")
-    digest_file(resolved_path)
+    source_digest = digest_file(resolved_path)
+    if source_digest is None:
+        raise _UnresolvedLegacyMetadata(None, "file is not a local regular file")
     document = parse_session_file(resolved_path)
+    if digest_file(resolved_path) != source_digest:
+        raise ConcurrentModificationError(
+            f"Legacy file changed while it was parsed: {relative_path}"
+        )
     if document.schema_version == 2:
         return None
+    _validate_v1_lossless_subset(resolved_path)
+    if digest_file(resolved_path) != source_digest:
+        raise ConcurrentModificationError(
+            f"Legacy file changed while it was validated: {relative_path}"
+        )
     if document.project not in {*storage_keys, canonical_project}:
         raise _UnresolvedLegacyMetadata(None, "frontmatter project is outside the scope")
+    if (
+        not isinstance(document.tags, list)
+        or any(not isinstance(item, str) for item in document.tags)
+        or not isinstance(document.sources, list)
+        or any(not isinstance(item, str) for item in document.sources)
+    ):
+        raise _UnresolvedLegacyMetadata(
+            None, "legacy file contains unsupported content"
+        )
 
     rows = _scope_rows(service, storage_keys)
     used_ids: set[str] = set()
@@ -374,12 +733,19 @@ def _prepare_file(
             used_ids=used_ids,
         )
         try:
+            historical_operations = _historical_operations(
+                service,
+                row,
+                storage_keys=storage_keys,
+                anchor=entry.section_anchor,
+            )
             memory = _memory_from_legacy_entry(
                 entry,
                 row,
                 project=canonical_project,
                 path=resolved_path,
                 relative_path=relative_path,
+                historical_operations=historical_operations,
             )
         except _UnresolvedLegacyMetadata:
             raise
@@ -405,14 +771,24 @@ def _prepare_file(
     migrated_document = SessionDocument(
         project=canonical_project,
         created=document.created,
-        tags=[],
-        sources=[],
+        tags=list(document.tags),
+        sources=list(document.sources),
         title=document.title,
         entries=entries,
         schema_version=2,
     )
     try:
-        rendered = service.persistence._render_document(migrated_document)
+        aggregate_tags = set(document.tags)
+        aggregate_sources = set(document.sources)
+        for memory, _details in memories:
+            aggregate_tags.update(memory.tags)
+            if memory.source:
+                aggregate_sources.add(memory.source)
+        rendered = render_session_document(
+            migrated_document,
+            tags=sorted(aggregate_tags),
+            sources=sorted(aggregate_sources),
+        )
     except (TypeError, ValueError) as error:
         raise _UnresolvedLegacyMetadata(
             None,
@@ -421,6 +797,8 @@ def _prepare_file(
     return _PreparedVaultMigration(
         path=resolved_path,
         relative_path=relative_path,
+        source_digest=source_digest,
+        storage_keys=storage_keys,
         document=migrated_document,
         rendered=rendered,
         memories=tuple(memories),
@@ -433,7 +811,6 @@ def _commit_file(
     migration: _PreparedVaultMigration,
 ) -> tuple[tuple[str, str, bytes], ...]:
     persistence = service.persistence
-    before_digest = digest_file(migration.path)
     prepared = prepare_atomic_text(migration.path, migration.rendered)
     embeddings: list[tuple[str, str, bytes]] = []
     try:
@@ -441,10 +818,15 @@ def _commit_file(
         persistence.fault("after_all_temps_fsync")
         with service.db.transaction():
             memory_ids = tuple(memory.id for memory, _details in migration.memories)
-            placeholders = ", ".join("?" for _ in memory_ids)
+            memory_placeholders = ", ".join("?" for _ in memory_ids)
+            project_placeholders = ", ".join("?" for _ in migration.storage_keys)
             service.db.conn.execute(
-                f"DELETE FROM save_operations WHERE memory_id IN ({placeholders})",
-                memory_ids,
+                f"""
+                DELETE FROM save_operations
+                WHERE memory_id IN ({memory_placeholders})
+                  AND project IN ({project_placeholders})
+                """,
+                (*memory_ids, *migration.storage_keys),
             )
             for memory, details in migration.memories:
                 fingerprint = str(memory.content_fingerprint)
@@ -453,11 +835,12 @@ def _commit_file(
                 )
                 had_vector = service.db.has_vector(memory.id)
                 service.db.upsert_memory(memory, details)
-                service.db.upsert_operation(
-                    memory.project,
-                    memory.id,
-                    memory.operations[0],
-                )
+                for operation in memory.operations:
+                    service.db.upsert_operation(
+                        memory.project,
+                        memory.id,
+                        operation,
+                    )
                 if fingerprint_changed or memory.status != "active":
                     service.db.invalidate_vector(memory.id)
                     service.db.clear_vector_repair(memory.id)
@@ -471,7 +854,7 @@ def _commit_file(
                         (memory.id, fingerprint, persistence._embedding_bytes(memory))
                     )
             persistence.fault("after_db_write")
-            prepared.replace_if_digest(before_digest, prepared_digest)
+            prepared.replace_if_digest(migration.source_digest, prepared_digest)
             persistence.fault("after_target_replace:0")
     except BaseException:
         prepared.discard()
@@ -541,7 +924,6 @@ def migrate_vault_metadata(
     vault_root = Path(service.vault_dir).resolve()
 
     for scope in _discover_scopes(service, project):
-        files = _scope_files(service, scope)
         if dry_run:
             try:
                 _closure, journals = service.persistence._journal_lock_closure(
@@ -566,22 +948,97 @@ def migrate_vault_metadata(
                 )
                 continue
 
-        for path in files:
-            try:
-                relative_path = path.relative_to(vault_root).as_posix()
-            except ValueError:
-                unresolved.append(
-                    {
-                        "file": path.name,
-                        "anchor": None,
-                        "reason": "file escapes the vault",
-                    }
-                )
-                continue
+        def prepare_scope() -> list[_PreparedVaultMigration]:
+            files = _scope_files(service, scope)
+            migrations: list[_PreparedVaultMigration] = []
+            owners: dict[str, set[Path]] = {}
+            operation_owners: dict[str, set[str]] = {}
+            scanned: dict[Path, tuple[str, SessionDocument, str]] = {}
+            scan_failed = False
+            rows = _scope_rows(service, scope.storage_keys)
 
-            def inspect_current() -> _PreparedVaultMigration | None:
+            for row in rows:
+                memory_id = row.get("id")
+                if not isinstance(memory_id, str):
+                    continue
                 try:
-                    before = digest_file(path)
+                    row_operations = _operation_history_from_row(row)
+                except ValueError:
+                    continue
+                for operation in row_operations:
+                    operation_owners.setdefault(
+                        operation.operation_id, set()
+                    ).add(memory_id)
+
+            project_placeholders = ", ".join("?" for _ in scope.storage_keys)
+            for ledger_row in service.db.conn.execute(
+                f"""
+                SELECT operation_id, memory_id
+                FROM save_operations
+                WHERE project IN ({project_placeholders})
+                """,
+                scope.storage_keys,
+            ).fetchall():
+                operation_id = ledger_row["operation_id"]
+                memory_id = ledger_row["memory_id"]
+                if isinstance(operation_id, str) and isinstance(memory_id, str):
+                    operation_owners.setdefault(operation_id, set()).add(memory_id)
+
+            for path in files:
+                try:
+                    relative_path = path.relative_to(vault_root).as_posix()
+                except ValueError:
+                    unresolved.append(
+                        {
+                            "file": path.name,
+                            "anchor": None,
+                            "reason": "file escapes the vault",
+                        }
+                    )
+                    scan_failed = True
+                    continue
+                try:
+                    metadata = path.lstat()
+                    if path.is_symlink() or not stat.S_ISREG(metadata.st_mode):
+                        raise OSError("session path is not a local regular file")
+                    scanned_digest = digest_file(path)
+                    if scanned_digest is None:
+                        raise OSError("session path disappeared")
+                    document = parse_session_file(path)
+                    if digest_file(path) != scanned_digest:
+                        raise ConcurrentModificationError(
+                            f"Session file changed while it was scanned: {relative_path}"
+                        )
+                    scanned[path] = (relative_path, document, scanned_digest)
+                    used_ids: set[str] = set()
+                    for entry in document.entries:
+                        memory_id = entry.id
+                        if memory_id is None and document.schema_version == 1:
+                            try:
+                                matched = _match_row(
+                                    entry,
+                                    rows,
+                                    relative_path=relative_path,
+                                    vault_root=vault_root,
+                                    entry_count=len(document.entries),
+                                    used_ids=used_ids,
+                                )
+                            except _UnresolvedLegacyMetadata:
+                                matched = None
+                            if matched is not None:
+                                matched_id = matched.get("id")
+                                if isinstance(matched_id, str):
+                                    memory_id = matched_id
+                        if memory_id is not None:
+                            owners.setdefault(memory_id, set()).add(path)
+                        if document.schema_version == 2:
+                            canonical = entry.to_memory(str(path))
+                            for operation in canonical.operations:
+                                operation_owners.setdefault(
+                                    operation.operation_id, set()
+                                ).add(canonical.id)
+                except ConcurrentModificationError:
+                    raise
                 except OSError:
                     unresolved.append(
                         {
@@ -590,9 +1047,26 @@ def migrate_vault_metadata(
                             "reason": "file is not a local regular file",
                         }
                     )
-                    return None
+                    scan_failed = True
+                    continue
+                except (UnicodeError, ValueError):
+                    unresolved.append(
+                        {
+                            "file": relative_path,
+                            "anchor": None,
+                            "reason": "file is not a readable legacy session",
+                        }
+                    )
+                    scan_failed = True
+                    continue
+
+            if scan_failed:
+                return []
+
+            for path in files:
+                relative_path, _document, _scanned_digest = scanned[path]
                 try:
-                    prepared_migration = _prepare_file(
+                    migration = _prepare_file(
                         service,
                         path,
                         canonical_project=scope.canonical_key,
@@ -600,8 +1074,20 @@ def migrate_vault_metadata(
                     )
                 except _UnresolvedLegacyMetadata as error:
                     unresolved.append(_unresolved_item(relative_path, error))
-                    return None
-                if dry_run and digest_file(path) != before:
+                    continue
+                except (OSError, UnicodeError, ValueError):
+                    unresolved.append(
+                        {
+                            "file": relative_path,
+                            "anchor": None,
+                            "reason": "file is not a readable legacy session",
+                        }
+                    )
+                    continue
+                if migration is None:
+                    result["skipped"] = int(result["skipped"]) + 1
+                    continue
+                if dry_run and digest_file(path) != migration.source_digest:
                     unresolved.append(
                         {
                             "file": relative_path,
@@ -609,33 +1095,88 @@ def migrate_vault_metadata(
                             "reason": "file changed during dry-run inspection",
                         }
                     )
-                    return None
-                return prepared_migration
-
-            if dry_run:
-                unresolved_before = len(unresolved)
-                migration = inspect_current()
-                if migration is None:
-                    if len(unresolved) == unresolved_before:
-                        result["skipped"] = int(result["skipped"]) + 1
                     continue
-                result["would_migrate"] = int(result["would_migrate"]) + 1
-                continue
+                migrations.append(migration)
 
-            embeddings: tuple[tuple[str, str, bytes], ...] = ()
+            if set(_scope_files(service, scope)) != set(files):
+                raise ConcurrentModificationError(
+                    f"Session file set changed while project {scope.canonical_key} was scanned"
+                )
+            for path, (_relative_path, _document, expected_digest) in scanned.items():
+                if digest_file(path) != expected_digest:
+                    raise ConcurrentModificationError(
+                        f"Session file changed while project {scope.canonical_key} was scanned"
+                    )
+
+            for migration in migrations:
+                for memory, _details in migration.memories:
+                    owners.setdefault(memory.id, set()).add(migration.path)
+                    for operation in memory.operations:
+                        operation_owners.setdefault(
+                            operation.operation_id, set()
+                        ).add(memory.id)
+            duplicate_paths = {
+                path
+                for paths in owners.values()
+                if len(paths) > 1
+                for path in paths
+            }
+            conflicting_operation_ids = {
+                operation_id
+                for operation_id, memory_ids in operation_owners.items()
+                if len(memory_ids) > 1
+            }
+            retained: list[_PreparedVaultMigration] = []
+            for migration in migrations:
+                if migration.path in duplicate_paths:
+                    unresolved.append(
+                        {
+                            "file": migration.relative_path,
+                            "anchor": None,
+                            "reason": (
+                                "stable memory ID is assigned to multiple files"
+                            ),
+                        }
+                    )
+                    continue
+                if any(
+                    operation.operation_id in conflicting_operation_ids
+                    for memory, _details in migration.memories
+                    for operation in memory.operations
+                ):
+                    unresolved.append(
+                        {
+                            "file": migration.relative_path,
+                            "anchor": None,
+                            "reason": (
+                                "operation ID is assigned to multiple memories"
+                            ),
+                        }
+                    )
+                    continue
+                retained.append(migration)
+            return retained
+
+        embedding_batches: list[tuple[tuple[str, str, bytes], ...]] = []
+        if dry_run:
+            migrations = prepare_scope()
+            result["would_migrate"] = int(result["would_migrate"]) + len(
+                migrations
+            )
+        else:
             with service.persistence._locked_after_recovery((scope.canonical_key,)):
-                unresolved_before = len(unresolved)
-                migration = inspect_current()
-                if migration is None:
-                    if len(unresolved) == unresolved_before:
-                        result["skipped"] = int(result["skipped"]) + 1
-                    continue
-                result["would_migrate"] = int(result["would_migrate"]) + 1
-                embeddings = _commit_file(service, migration)
+                migrations = prepare_scope()
+                result["would_migrate"] = int(result["would_migrate"]) + len(
+                    migrations
+                )
+                for migration in migrations:
+                    embedding_batches.append(_commit_file(service, migration))
+                    result["migrated"] = int(result["migrated"]) + 1
+
+        for embeddings in embedding_batches:
             vector_result = service.persistence._finish_mutation({}, embeddings)
             warning = vector_result.get("warning")
             if isinstance(warning, str):
                 result.setdefault("warnings", []).append(warning)
-            result["migrated"] = int(result["migrated"]) + 1
 
     return result
