@@ -707,11 +707,17 @@ async def resolve_call_scope(
     capabilities = server.request_context.session.client_params.capabilities
     client_roots: tuple[Path, ...] = ()
     if capabilities.roots is not None:
-        roots_result = await server.request_context.session.list_roots()
-        client_roots = tuple(
-            file_uri_to_path(str(root.uri))
-            for root in roots_result.roots
-        )
+        try:
+            roots_result = await server.request_context.session.list_roots()
+            client_roots = tuple(
+                file_uri_to_path(str(root.uri))
+                for root in roots_result.roots
+            )
+        except Exception as error:
+            logger.warning(
+                "MCP client roots unavailable (%s); using cwd fallback",
+                type(error).__name__,
+            )
 
     raw_cwd = arguments.get("cwd")
     if raw_cwd is not None and not isinstance(raw_cwd, str):

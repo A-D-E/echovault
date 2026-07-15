@@ -1,9 +1,12 @@
 from pathlib import Path
 import threading
+from types import SimpleNamespace
+from typing import cast
 import uuid
 
 import anyio
 from mcp import ClientSession
+from mcp.server import Server
 from mcp.types import CallToolResult, ListRootsResult, Root
 import pytest
 
@@ -16,7 +19,7 @@ from memory.mcp_authority import (
     AuthorityConflict,
     MCPServerBinding,
 )
-from memory.mcp_server import project_safe_dispatch
+from memory.mcp_server import project_safe_dispatch, resolve_call_scope
 from memory.models import RawMemoryInput
 from memory.projects import (
     MultiRootError,
@@ -737,6 +740,44 @@ async def test_protocol_generic_startup_accepts_explicit_marked_cwd_without_root
             assert str(generic) not in result_text(rejected)
     finally:
         service.close()
+
+
+@pytest.mark.parametrize("roots_error", [RuntimeError, ValueError])
+@pytest.mark.anyio
+async def test_scope_uses_marked_cwd_when_advertised_roots_request_fails(
+    tmp_path: Path,
+    roots_error: type[Exception],
+) -> None:
+    generic = tmp_path / "generic-home"
+    project = make_workspace(tmp_path / "workspace")
+    cwd = project / "src"
+    generic.mkdir()
+    cwd.mkdir()
+
+    class BrokenRootsSession:
+        client_params = SimpleNamespace(
+            capabilities=SimpleNamespace(roots=SimpleNamespace())
+        )
+
+        async def list_roots(self) -> ListRootsResult:
+            raise roots_error("Cursor roots/list failed")
+
+    fake_server = cast(
+        Server,
+        SimpleNamespace(
+            request_context=SimpleNamespace(session=BrokenRootsSession())
+        ),
+    )
+    memory_home = tmp_path / "memory-home"
+    scope = await resolve_call_scope(
+        fake_server,
+        MCPServerBinding("cursor", None, generic),
+        ProjectRegistry(memory_home),
+        {"cwd": str(cwd)},
+    )
+
+    expected = build_project_identity(*discover_project_root(project))
+    assert scope.identity.key == expected.key
 
 
 @pytest.mark.anyio
