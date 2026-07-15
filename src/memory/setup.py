@@ -442,36 +442,25 @@ def setup_claude_code(claude_home: str, *, project: bool = False) -> dict[str, s
 
 
 def setup_cursor(cursor_home: str) -> dict[str, str]:
-    """Install EchoVault MCP server into Cursor mcp.json."""
-    installed = []
+    """Install the managed EchoVault local plugin for Cursor."""
+    from memory.integrations.registry import get_adapter
+    from memory.integrations.types import (
+        InstallMode,
+        InstallScope,
+        IntegrationOptions,
+    )
 
-    # Remove old hooks if present
-    old_hooks_path = os.path.join(cursor_home, "hooks.json")
-    if os.path.exists(old_hooks_path):
-        old_data = _read_json(old_hooks_path)
-        hooks = old_data.get("hooks", {})
-        for event in list(hooks.keys()):
-            event_hooks = hooks[event]
-            filtered = [h for h in event_hooks if "memory context" not in h.get("command", "")]
-            if len(filtered) != len(event_hooks):
-                installed.append(f"removed old hook: {event}")
-                if filtered:
-                    hooks[event] = filtered
-                else:
-                    del hooks[event]
-        _write_json(old_hooks_path, old_data)
-
-    # Remove old skill if present
-    _uninstall_skill(cursor_home)
-
-    # Add MCP server config
-    mcp_path = os.path.join(cursor_home, "mcp.json")
-    if _install_mcp_servers(mcp_path):
-        installed.append("mcpServers")
-
-    if installed:
-        return {"status": "ok", "message": f"Installed: {', '.join(installed)}"}
-    return {"status": "ok", "message": "Already installed"}
+    result = get_adapter("cursor").setup(
+        IntegrationOptions(
+            scope=InstallScope.USER,
+            mode=InstallMode.NATIVE,
+            config_root=Path(cursor_home),
+            project_root=None,
+            command=None,
+            config_root_explicit=True,
+        )
+    )
+    return {"status": "ok", "message": result.message}
 
 
 CODEX_AGENTS_MD_SECTION = """\

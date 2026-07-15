@@ -13,6 +13,7 @@ from tests.integration_helpers import (
     project_options,
     seed_project_with_other_mcp,
     snapshot_tree,
+    user_options,
 )
 
 
@@ -187,3 +188,104 @@ def test_registry_and_legacy_cursor_wrapper_keep_contract(tmp_path: Path) -> Non
     assert get_adapter("cursor").agent == "cursor"
     result = setup_cursor(str(tmp_path / ".cursor"))
     assert set(result) >= {"status", "message"}
+
+
+def test_user_setup_installs_valid_local_plugin_with_absolute_command(
+    tmp_path: Path,
+    fake_memory: Path,
+) -> None:
+    cursor_root = tmp_path / ".cursor"
+    result = cursor_adapter().setup(
+        user_options(cursor_root, command=str(fake_memory))
+    )
+    plugin = cursor_root / "plugins/local/echovault"
+    config = json.loads((plugin / "mcp.json").read_text())
+    configured = Path(config["mcpServers"]["echovault"]["command"])
+    assert configured.is_absolute()
+    assert configured == fake_memory
+    assert (plugin / ".cursor-plugin/plugin.json").is_file()
+    assert (plugin / ".echovault-managed.json").is_file()
+    assert "restart" in result.message.lower() or "reload" in result.message.lower()
+
+
+def test_user_setup_is_byte_stable(tmp_path: Path, fake_memory: Path) -> None:
+    cursor_root = tmp_path / ".cursor"
+    adapter = cursor_adapter()
+    options = user_options(cursor_root, command=str(fake_memory))
+    adapter.setup(options)
+    first = snapshot_tree(cursor_root)
+    result = adapter.setup(options)
+    assert result.status == "unchanged"
+    assert snapshot_tree(cursor_root) == first
+
+
+def test_unmarked_existing_plugin_directory_is_a_conflict(
+    tmp_path: Path,
+    fake_memory: Path,
+) -> None:
+    plugin = tmp_path / ".cursor/plugins/local/echovault"
+    plugin.mkdir(parents=True)
+    (plugin / "user.txt").write_text("mine")
+    before = snapshot_tree(tmp_path / ".cursor")
+    with pytest.raises(OwnershipConflict):
+        cursor_adapter().setup(
+            user_options(tmp_path / ".cursor", command=str(fake_memory))
+        )
+    assert snapshot_tree(tmp_path / ".cursor") == before
+
+
+def test_user_setup_cleans_exact_legacy_mcp_and_preserves_other_server(
+    tmp_path: Path,
+    fake_memory: Path,
+) -> None:
+    cursor_root = tmp_path / ".cursor"
+    cursor_root.mkdir()
+    (cursor_root / "mcp.json").write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "echovault": {
+                        "command": "memory",
+                        "args": ["mcp"],
+                        "type": "stdio",
+                    },
+                    "other": {"command": "other"},
+                }
+            }
+        )
+    )
+    result = cursor_adapter().setup(
+        user_options(cursor_root, command=str(fake_memory))
+    )
+    servers = json.loads((cursor_root / "mcp.json").read_text())["mcpServers"]
+    assert "echovault" not in servers
+    assert servers["other"] == {"command": "other"}
+    assert result.status == "updated"
+
+
+def test_user_setup_refuses_custom_direct_mcp_before_plugin_mutation(
+    tmp_path: Path,
+    fake_memory: Path,
+) -> None:
+    cursor_root = tmp_path / ".cursor"
+    cursor_root.mkdir()
+    (cursor_root / "mcp.json").write_text(
+        json.dumps({"mcpServers": {"echovault": {"command": "custom"}}})
+    )
+    before = snapshot_tree(cursor_root)
+    with pytest.raises(OwnershipConflict, match="custom"):
+        cursor_adapter().setup(
+            user_options(cursor_root, command=str(fake_memory))
+        )
+    assert snapshot_tree(cursor_root) == before
+
+
+def test_user_setup_rejects_non_executable_command_without_mutation(
+    tmp_path: Path,
+) -> None:
+    command = tmp_path / "memory"
+    command.write_text("not executable")
+    cursor_root = tmp_path / ".cursor"
+    with pytest.raises(ValueError, match="executable"):
+        cursor_adapter().setup(user_options(cursor_root, command=str(command)))
+    assert snapshot_tree(cursor_root) == {}

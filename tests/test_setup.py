@@ -185,7 +185,7 @@ class TestCursorSetup:
     def test_writes_mcp_config(self, cursor_home):
         from memory.setup import setup_cursor
         setup_cursor(str(cursor_home))
-        mcp_path = cursor_home / "mcp.json"
+        mcp_path = cursor_home / "plugins/local/echovault/mcp.json"
         assert mcp_path.exists()
         data = json.loads(mcp_path.read_text())
         assert "mcpServers" in data
@@ -195,7 +195,9 @@ class TestCursorSetup:
         from memory.setup import setup_cursor
         setup_cursor(str(cursor_home))
         setup_cursor(str(cursor_home))
-        data = json.loads((cursor_home / "mcp.json").read_text())
+        data = json.loads(
+            (cursor_home / "plugins/local/echovault/mcp.json").read_text()
+        )
         assert "echovault" in data["mcpServers"]
 
     def test_returns_success_result(self, cursor_home):

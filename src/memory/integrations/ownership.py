@@ -490,6 +490,14 @@ def replace_managed_tree(
     candidate = root.expanduser().absolute()
     if os.path.lexists(candidate) and candidate.is_symlink():
         raise OwnershipConflict("Managed tree target cannot be a symlink")
+    if (
+        candidate.is_dir()
+        and not (candidate / MANIFEST_NAME).is_file()
+        and any(candidate.iterdir())
+    ):
+        raise OwnershipConflict(
+            "Existing integration tree is not EchoVault-managed"
+        )
     root = candidate.resolve(strict=False)
     root.parent.mkdir(parents=True, exist_ok=True)
     filesystem = _filesystem or LocalTreeFilesystem()

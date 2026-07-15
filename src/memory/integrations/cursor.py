@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import shutil
+import stat
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any
@@ -20,6 +23,7 @@ from memory.integrations.ownership import (
     OwnershipConflict,
     OwnershipManifest,
     load_manifest,
+    replace_managed_tree,
     verify_managed_content,
     write_manifest_atomic,
 )
@@ -112,7 +116,142 @@ class CursorAdapter:
     def setup(self, options: IntegrationOptions) -> IntegrationResult:
         if options.scope is InstallScope.PROJECT:
             return self._setup_project(options)
-        raise ValueError("Cursor user setup requires the native plugin installer")
+        return self._setup_user(options)
+
+    def _resolve_user_command(self, command: str | None) -> Path:
+        selected = command or "memory"
+        candidate = Path(selected).expanduser()
+        if not candidate.is_absolute():
+            discovered = shutil.which(selected)
+            if discovered is None:
+                raise ValueError(f"EchoVault executable was not found: {selected}")
+            candidate = Path(discovered)
+        resolved = candidate.resolve()
+        try:
+            metadata = resolved.stat()
+        except OSError as error:
+            raise ValueError(
+                f"EchoVault executable cannot be inspected: {selected}"
+            ) from error
+        if not stat.S_ISREG(metadata.st_mode) or not os.access(resolved, os.X_OK):
+            raise ValueError(
+                f"EchoVault command must be an executable regular file: {selected}"
+            )
+        return resolved
+
+    def _user_root(self, options: IntegrationOptions) -> Path:
+        if options.mode is not InstallMode.NATIVE:
+            raise ValueError("Cursor user setup requires native mode")
+        if options.config_root is None:
+            return (Path.home() / ".cursor").resolve()
+        return options.config_root.expanduser().resolve()
+
+    def _setup_user(self, options: IntegrationOptions) -> IntegrationResult:
+        cursor_root = self._user_root(options)
+        command = self._resolve_user_command(options.command)
+        assets = render_cursor_assets(
+            command=str(command),
+            version=_asset_version(),
+        )
+        plugin_manifest = json.loads(assets[".cursor-plugin/plugin.json"])
+        plugin_mcp = json.loads(assets["mcp.json"])
+        if (
+            plugin_manifest.get("mcpServers") != "mcp.json"
+            or plugin_manifest.get("rules") != "./rules/"
+            or plugin_manifest.get("skills") != "./skills/"
+            or plugin_mcp.get("mcpServers", {}).get("echovault") is None
+        ):
+            raise OwnershipConflict("Packaged Cursor plugin assets are invalid")
+
+        legacy_path = cursor_root / "mcp.json"
+        legacy_document = read_json_strict(legacy_path)
+        legacy_servers = legacy_document.data.get("mcpServers")
+        if legacy_servers is None:
+            legacy_servers = {}
+        if not isinstance(legacy_servers, dict):
+            raise ConfigMalformedError("mcpServers must be a JSON object")
+        legacy_entry = legacy_servers.get("echovault")
+        recognized_direct_entries = (
+            {
+                "command": "memory",
+                "args": ["mcp"],
+                "type": "stdio",
+            },
+            {
+                "command": "memory",
+                "args": ["mcp", "--agent", "cursor"],
+            },
+        )
+        if (
+            legacy_entry is not None
+            and legacy_entry not in recognized_direct_entries
+        ):
+            raise OwnershipConflict(
+                "A custom Cursor MCP entry named echovault already exists"
+            )
+
+        plugin = cursor_root / "plugins" / "local" / "echovault"
+        plugin_existed = plugin.exists()
+        plugin_current = False
+        if (plugin / MANIFEST_NAME).is_file():
+            current_manifest = load_manifest(plugin)
+            if current_manifest.integration_id != "cursor-user":
+                raise OwnershipConflict(
+                    "Cursor plugin manifest belongs to another integration"
+                )
+            plugin_current = (
+                current_manifest.asset_version == _asset_version()
+                and not verify_managed_content(plugin, current_manifest)
+                and all(
+                    (plugin / relative).is_file()
+                    and (plugin / relative).read_bytes() == payload
+                    for relative, payload in assets.items()
+                )
+            )
+        if plugin_current and legacy_entry is None:
+            return IntegrationResult(
+                status="unchanged",
+                message="Cursor local plugin is already current; no reload needed",
+                paths=(plugin,),
+            )
+
+        replace_managed_tree(
+            plugin,
+            assets,
+            force_managed=options.force_managed,
+            integration_id="cursor-user",
+            asset_version=_asset_version(),
+        )
+
+        if legacy_entry is not None:
+            expected_legacy = legacy_entry
+
+            def remove_legacy(data: dict[str, Any]) -> dict[str, Any]:
+                servers = data.get("mcpServers")
+                if not isinstance(servers, dict):
+                    raise ConfigMalformedError("mcpServers must be a JSON object")
+                observed = servers.get("echovault")
+                if observed != expected_legacy:
+                    raise OwnershipConflict(
+                        "Cursor MCP entry changed during plugin installation"
+                    )
+                del servers["echovault"]
+                if not servers:
+                    del data["mcpServers"]
+                return data
+
+            mutate_json_atomic(
+                legacy_path,
+                remove_legacy,
+                remove_if_empty=True,
+            )
+
+        status = "updated" if plugin_existed or legacy_entry is not None else "installed"
+        return IntegrationResult(
+            status=status,
+            message=f"Cursor local plugin {status}; restart or reload Cursor",
+            paths=(plugin,),
+        )
 
     def _project_root(self, options: IntegrationOptions) -> tuple[Path, Path]:
         if options.project_root is None:
