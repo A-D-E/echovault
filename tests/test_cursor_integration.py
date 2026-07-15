@@ -1,6 +1,19 @@
 import json
+from pathlib import Path
+
+import pytest
 
 from memory.integrations.asset_io import render_cursor_assets
+from memory.integrations.config_io import ConfigBoundaryError
+from memory.integrations.ownership import OwnershipConflict
+from memory.integrations.registry import get_adapter
+from memory.setup import setup_cursor
+from tests.integration_helpers import (
+    cursor_adapter,
+    project_options,
+    seed_project_with_other_mcp,
+    snapshot_tree,
+)
 
 
 def test_cursor_assets_have_valid_manifest_and_curated_contract() -> None:
@@ -43,3 +56,134 @@ def test_cursor_assets_have_valid_manifest_and_curated_contract() -> None:
         assert forbidden not in skill
     assert "0.6.0" in rule
     assert "0.6.0" in skill
+
+
+def test_project_setup_installs_portable_mcp_rule_skill_and_manifest(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "repo"
+    project.mkdir()
+    result = cursor_adapter().setup(project_options(project))
+    config = json.loads((project / ".cursor" / "mcp.json").read_text())
+    assert config["mcpServers"]["echovault"]["command"] == "memory"
+    assert config["mcpServers"]["echovault"]["args"] == [
+        "mcp",
+        "--agent",
+        "cursor",
+    ]
+    assert (project / ".cursor/rules/echovault.mdc").is_file()
+    assert (project / ".cursor/skills/echovault/SKILL.md").is_file()
+    assert (project / ".cursor/.echovault-managed.json").is_file()
+    assert result.status == "installed"
+
+
+def test_project_setup_is_byte_stable_and_preserves_other_server(
+    tmp_path: Path,
+) -> None:
+    project = seed_project_with_other_mcp(tmp_path)
+    adapter = cursor_adapter()
+    adapter.setup(project_options(project))
+    first = snapshot_tree(project / ".cursor")
+    second = adapter.setup(project_options(project))
+    assert snapshot_tree(project / ".cursor") == first
+    assert second.status == "unchanged"
+    config = json.loads((project / ".cursor/mcp.json").read_text())
+    assert config["mcpServers"]["other"]["env"]["TOKEN"] == "unchanged"
+
+
+def test_project_setup_does_not_mutate_service_context_policy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    memory_home = tmp_path / "memory-home"
+    memory_home.mkdir()
+    config = memory_home / "config.yaml"
+    config.write_text("context:\n  mode: off\n")
+    before = config.read_bytes()
+    monkeypatch.setenv("MEMORY_HOME", str(memory_home))
+    project = tmp_path / "repo"
+    project.mkdir()
+    cursor_adapter().setup(project_options(project))
+    assert config.read_bytes() == before
+
+
+def test_project_setup_upgrades_only_exact_legacy_entry(tmp_path: Path) -> None:
+    project = tmp_path / "repo"
+    cursor = project / ".cursor"
+    cursor.mkdir(parents=True)
+    legacy = {"command": "memory", "args": ["mcp"], "type": "stdio"}
+    (cursor / "mcp.json").write_text(
+        json.dumps({"mcpServers": {"echovault": legacy}})
+    )
+    result = cursor_adapter().setup(project_options(project))
+    entry = json.loads((cursor / "mcp.json").read_text())["mcpServers"][
+        "echovault"
+    ]
+    assert entry == {
+        "command": "memory",
+        "args": ["mcp", "--agent", "cursor"],
+    }
+    assert result.status == "updated"
+
+
+def test_project_setup_rejects_custom_same_named_entry_without_mutation(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "repo"
+    cursor = project / ".cursor"
+    cursor.mkdir(parents=True)
+    (cursor / "mcp.json").write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "echovault": {
+                        "command": "wrapper",
+                        "args": ["memory", "mcp"],
+                    }
+                }
+            }
+        )
+    )
+    before = snapshot_tree(cursor)
+    with pytest.raises(OwnershipConflict, match="custom"):
+        cursor_adapter().setup(project_options(project))
+    assert snapshot_tree(cursor) == before
+
+
+def test_project_setup_rejects_implicit_cursor_symlink_escape(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "repo"
+    outside = tmp_path / "outside"
+    project.mkdir()
+    outside.mkdir()
+    (project / ".cursor").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(ConfigBoundaryError):
+        cursor_adapter().setup(project_options(project))
+    assert snapshot_tree(outside) == {}
+
+
+def test_project_setup_honors_exact_command_and_explicit_config_root(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "repo"
+    target = tmp_path / "portable-cursor"
+    project.mkdir()
+    cursor_adapter().setup(
+        project_options(
+            project,
+            command="/workspace/.venv/bin/memory",
+            config_root=target,
+            config_root_explicit=True,
+        )
+    )
+    entry = json.loads((target / "mcp.json").read_text())["mcpServers"][
+        "echovault"
+    ]
+    assert entry["command"] == "/workspace/.venv/bin/memory"
+
+
+def test_registry_and_legacy_cursor_wrapper_keep_contract(tmp_path: Path) -> None:
+    assert get_adapter("cursor").agent == "cursor"
+    result = setup_cursor(str(tmp_path / ".cursor"))
+    assert set(result) >= {"status", "message"}

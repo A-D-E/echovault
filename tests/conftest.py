@@ -80,3 +80,12 @@ def service(env_home: Path):
         yield instance
     finally:
         instance.db.close()
+
+
+@pytest.fixture
+def fake_memory(tmp_path: Path) -> Path:
+    executable = tmp_path / "bin" / "memory"
+    executable.parent.mkdir()
+    executable.write_text("#!/bin/sh\nexit 0\n")
+    executable.chmod(0o755)
+    return executable
