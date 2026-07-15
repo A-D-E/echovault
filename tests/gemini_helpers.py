@@ -49,10 +49,12 @@ class RecordingRunner:
         installed: bool = False,
         installed_version: str = "0.6.0",
         client_version: str = "0.50.0",
+        list_on_stderr: bool = False,
     ) -> None:
         self.installed = installed
         self.installed_version = installed_version
         self.client_version = client_version
+        self.list_on_stderr = list_on_stderr
         self.argv: list[list[str]] = []
         self.calls: list[dict[str, object]] = []
 
@@ -84,6 +86,8 @@ class RecordingRunner:
                 if self.installed
                 else ""
             )
+            if self.list_on_stderr:
+                return CommandResult(0, "", line)
             return CommandResult(0, line, "")
         if command[1:3] == ["extensions", "install"]:
             self.installed = True

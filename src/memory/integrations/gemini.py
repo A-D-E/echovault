@@ -32,7 +32,7 @@ from memory.integrations.ownership import (
     verify_managed_content,
     write_manifest_atomic,
 )
-from memory.integrations.process import CommandRunner, SubprocessRunner
+from memory.integrations.process import CommandResult, CommandRunner, SubprocessRunner
 from memory.integrations.gemini_state import (
     ArtifactState,
     GeminiInstallationState,
@@ -327,7 +327,7 @@ class GeminiAdapter:
             return None
         if result.returncode != 0:
             return None
-        return self._installed_version(result.stdout)
+        return self._installed_result_version(result)
 
     def _direct_artifact_state(
         self,
@@ -544,6 +544,10 @@ class GeminiAdapter:
                 return match.group(1)
         return None
 
+    @classmethod
+    def _installed_result_version(cls, result: CommandResult) -> str | None:
+        return cls._installed_version(f"{result.stdout}\n{result.stderr}")
+
     def _setup_native(self, options: IntegrationOptions) -> IntegrationResult:
         source, _gemini_root = self._native_paths(options)
         command = str(self._resolve_executable(options.command))
@@ -585,7 +589,7 @@ class GeminiAdapter:
             ["gemini", "extensions", "list"],
             cwd=manager_cwd,
         )
-        installed_version = self._installed_version(listed.stdout)
+        installed_version = self._installed_result_version(listed)
         if installed_version is None:
             self._manager(
                 ["gemini", "extensions", "install", str(source)],
@@ -605,7 +609,7 @@ class GeminiAdapter:
             ["gemini", "extensions", "list"],
             cwd=manager_cwd,
         )
-        if self._installed_version(verified.stdout) != GEMINI_ASSET_VERSION:
+        if self._installed_result_version(verified) != GEMINI_ASSET_VERSION:
             raise RuntimeError("Gemini extension manager did not activate EchoVault")
         return IntegrationResult(
             status=status,
@@ -894,7 +898,7 @@ class GeminiAdapter:
                 ["gemini", "extensions", "list"],
                 cwd=manager_cwd,
             )
-            if self._installed_version(verified.stdout) is not None:
+            if self._installed_result_version(verified) is not None:
                 raise RuntimeError(
                     "Gemini extension manager did not remove EchoVault"
                 )

@@ -289,6 +289,18 @@ def test_native_owned_upgrade_uses_update(
     assert result.status == "updated"
 
 
+def test_native_setup_reads_gemini_050_listing_from_stderr(
+    tmp_path: Path,
+    fake_memory: Path,
+) -> None:
+    runner = RecordingRunner(installed=True, list_on_stderr=True)
+
+    result = gemini_adapter(runner).setup(native_options(tmp_path, fake_memory))
+
+    assert result.status == "updated"
+    assert not any(command[1:3] == ["extensions", "install"] for command in runner.argv)
+
+
 def test_native_owned_source_symlink_escape_is_rejected(
     tmp_path: Path,
     fake_memory: Path,
