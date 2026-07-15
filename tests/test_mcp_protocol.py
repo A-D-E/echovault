@@ -76,6 +76,9 @@ async def test_tool_inventory_and_large_details(tmp_path: Path) -> None:
                 "memory_details",
                 "memory_save",
             }
+            for tool in tools.tools:
+                cwd_schema = tool.inputSchema["properties"]["cwd"]
+                assert "active project root" in cwd_schema["description"]
             body = "x" * 100_000
             saved = await save_with_details(client, body)
             detail = decode_object(

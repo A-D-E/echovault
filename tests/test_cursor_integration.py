@@ -50,6 +50,9 @@ def test_cursor_assets_have_valid_manifest_and_curated_contract() -> None:
         assert phrase in skill
     assert "transcript" in rule
     assert "context.mode=off" in rule
+    for policy in (rule, skill):
+        assert "active project root" in policy
+        assert "`cwd`" in policy
     for forbidden in (
         "source=cursor",
         "source=gemini",

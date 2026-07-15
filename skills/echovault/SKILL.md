@@ -8,6 +8,7 @@ description: Retrieve local-first project memory before substantive work and sav
 Behavior version: {{VERSION}}
 
 Before substantive planning, debugging, architecture, or implementation, call `memory_context` with the current request and use the default 1,200-token context budget.
+Pass the active project root as `cwd` on every EchoVault tool call so project scope remains reliable when the client cannot provide MCP Roots.
 Use `memory_search` and `memory_details` only when the context pack is insufficient.
 If `memory_context` reports that automatic context is off, continue without automatic search; explicit user-directed retrieval remains available.
 Before the final response, call `memory_save` only for durable decisions, fixes, patterns, project state, or clarified requirements.

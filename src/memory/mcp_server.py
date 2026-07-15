@@ -302,7 +302,9 @@ def tool_definitions(binding: MCPServerBinding) -> tuple[Tool, ...]:
         tool.inputSchema.setdefault("properties", {})["cwd"] = {
             "type": "string",
             "description": (
-                "Caller cwd; must remain inside the negotiated project root."
+                "Caller active project root; always provide this when "
+                "available. It must remain inside the negotiated project "
+                "root."
             ),
         }
         project_schema = tool.inputSchema["properties"].get("project")
