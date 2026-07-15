@@ -322,21 +322,57 @@ def _entry_from_memory(mem: Memory, details: Optional[str] = None) -> SessionEnt
     )
 
 
+def _has_strong_cyrillic_signal(content: str) -> bool:
+    words = re.findall(r"[^\W\d_]+", content, flags=re.UNICODE)
+    cyrillic_words = [
+        word
+        for word in words
+        if re.fullmatch(r"[А-Яа-яЁё]+", word) is not None
+    ]
+    return any(len(word) >= 5 for word in cyrillic_words) or sum(
+        len(word) >= 3 for word in cyrillic_words
+    ) >= 2
+
+
 def read_markdown_text(file_path: Path) -> str:
-    """Read a markdown file with encoding fallbacks."""
-    encodings = ["utf-8-sig", "utf-8", "cp1251", locale.getpreferredencoding(False)]
-    seen: set[str] = set()
-
-    for encoding in encodings:
-        if not encoding or encoding in seen:
-            continue
-        seen.add(encoding)
+    """Read a markdown file with UTF-8 and legacy encoding fallbacks."""
+    payload = file_path.read_bytes()
+    for encoding in ("utf-8-sig", "utf-8"):
         try:
-            return file_path.read_text(encoding=encoding)
+            return payload.decode(encoding)
         except UnicodeDecodeError:
-            continue
+            pass
 
-    return file_path.read_text(encoding="utf-8", errors="replace")
+    preferred = locale.getpreferredencoding(False)
+    if preferred:
+        try:
+            preferred_content = payload.decode(preferred)
+        except (LookupError, UnicodeDecodeError):
+            pass
+        else:
+            normalized = preferred.lower().replace("_", "-")
+            if normalized in {
+                "1252",
+                "cp1252",
+                "iso-8859-1",
+                "iso8859-1",
+                "latin-1",
+                "latin1",
+                "windows-1252",
+            }:
+                try:
+                    cp1251_content = payload.decode("cp1251")
+                except UnicodeDecodeError:
+                    pass
+                else:
+                    if _has_strong_cyrillic_signal(cp1251_content):
+                        return cp1251_content
+            return preferred_content
+
+    try:
+        return payload.decode("cp1251")
+    except UnicodeDecodeError:
+        return payload.decode("utf-8", errors="replace")
 
 
 def normalize_markdown_content(content: str) -> str:

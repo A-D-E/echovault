@@ -97,6 +97,22 @@ def test_cp1251_fallback_precedes_single_byte_windows_locale(
     assert markdown.read_markdown_text(path) == expected
 
 
+def test_cp1252_locale_is_not_misdecoded_as_cp1251(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "legacy.md"
+    expected = "### Café\n**What:** résumé\n"
+    path.write_bytes(expected.encode("cp1252"))
+    monkeypatch.setattr(
+        markdown.locale,
+        "getpreferredencoding",
+        lambda _setlocale=False: "cp1252",
+    )
+
+    assert markdown.read_markdown_text(path) == expected
+
+
 @pytest.fixture
 def sample_memory() -> Memory:
     """Create a sample memory for testing."""
