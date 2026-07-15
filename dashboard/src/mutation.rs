@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::io::{self, Write};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
@@ -68,8 +68,15 @@ fn bridge_error(message: impl Into<String>) -> rusqlite::Error {
     rusqlite::Error::ToSqlConversionFailure(Box::new(io::Error::other(message.into())))
 }
 
+fn terminate_and_reap(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 impl MutationClient for CliMutationClient {
     fn apply(&self, request: &MutationRequest) -> rusqlite::Result<MutationResponse> {
+        let payload = serde_json::to_vec(request)
+            .map_err(|error| bridge_error(format!("mutation serialization failed: {error}")))?;
         let mut child = Command::new(&self.executable)
             .args(["admin", "apply", "--json-stdin"])
             .env("MEMORY_HOME", &self.memory_home)
@@ -80,15 +87,20 @@ impl MutationClient for CliMutationClient {
             .map_err(|error| {
                 bridge_error(format!("canonical mutation could not start: {error}"))
             })?;
-        let payload = serde_json::to_vec(request)
-            .map_err(|error| bridge_error(format!("mutation serialization failed: {error}")))?;
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| bridge_error("canonical mutation stdin was unavailable"))?;
-        stdin
-            .write_all(&payload)
-            .map_err(|error| bridge_error(format!("canonical mutation input failed: {error}")))?;
+        let mut stdin = match child.stdin.take() {
+            Some(stdin) => stdin,
+            None => {
+                terminate_and_reap(&mut child);
+                return Err(bridge_error("canonical mutation stdin was unavailable"));
+            }
+        };
+        if let Err(error) = stdin.write_all(&payload) {
+            drop(stdin);
+            terminate_and_reap(&mut child);
+            return Err(bridge_error(format!(
+                "canonical mutation input failed: {error}"
+            )));
+        }
         drop(stdin);
 
         let output = child
@@ -107,7 +119,7 @@ impl MutationClient for CliMutationClient {
 
 #[cfg(test)]
 mod tests {
-    use super::{MutationClient, MutationRequest, MutationResponse};
+    use super::{CliMutationClient, MutationClient, MutationRequest, MutationResponse};
     use crate::db::Db;
     use rusqlite::Connection;
     use std::sync::{Arc, Mutex};
@@ -338,5 +350,66 @@ mod tests {
             "command": "ignored"
         });
         assert!(serde_json::from_value::<MutationRequest>(request).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn broken_bridge_stdin_does_not_leave_the_child_running() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::{Command, Stdio};
+
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("broken-memory");
+        let pid_file = directory.path().join("child.pid");
+        fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nprintf '%s' \"$$\" > '{}'\nexec 0<&-\nsleep 30\n",
+                pid_file.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&executable, permissions).unwrap();
+
+        let client = CliMutationClient {
+            executable: executable.to_string_lossy().into_owned(),
+            memory_home: directory.path().to_string_lossy().into_owned(),
+        };
+        let result = client.apply(&MutationRequest::Create {
+            title: "Broken bridge".to_string(),
+            what: "x".repeat(2 * 1024 * 1024),
+            why: None,
+            impact: None,
+            category: None,
+            tags: vec![],
+            source: Some("dashboard".to_string()),
+            project: "project--111111111111".to_string(),
+            details: None,
+            actor: "dashboard".to_string(),
+        });
+        assert!(result.is_err());
+
+        let pid = fs::read_to_string(pid_file).unwrap();
+        let alive = Command::new("kill")
+            .args(["-0", pid.trim()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        if alive {
+            let _ = Command::new("kill")
+                .args(["-9", pid.trim()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+        assert!(
+            !alive,
+            "bridge child must be killed and reaped on stdin failure"
+        );
     }
 }

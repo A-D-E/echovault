@@ -249,6 +249,34 @@ def test_dashboard_passes_absolute_memory_executable_to_rust(monkeypatch):
     assert result.exit_code == 0
 
 
+def test_dashboard_resolves_relative_path_executable_before_bridge_handoff(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.chdir(tmp_path)
+    relative_memory = os.path.join("relative-bin", "memory")
+    resolved = {
+        "memory-dashboard": "/opt/echovault/bin/memory-dashboard",
+        "memory": relative_memory,
+    }
+    monkeypatch.setattr(shutil, "which", lambda name: resolved.get(name))
+    monkeypatch.setattr(cli_module, "get_memory_home", lambda: "/tmp/echo-home")
+
+    def capture_exec(binary, command):
+        assert binary == resolved["memory-dashboard"]
+        assert command == [resolved["memory-dashboard"]]
+        assert os.environ["ECHOVAULT_MEMORY_EXECUTABLE"] == str(
+            (tmp_path / relative_memory).resolve()
+        )
+        raise SystemExit(0)
+
+    monkeypatch.setattr(cli_module.os, "execvp", capture_exec)
+
+    result = CliRunner().invoke(main, ["dashboard"])
+
+    assert result.exit_code == 0
+
+
 def test_migrate_vault_metadata_cli_forwards_scope_and_closes(monkeypatch):
     instances = []
 

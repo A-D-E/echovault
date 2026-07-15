@@ -1065,6 +1065,7 @@ def dashboard(project, include_archived):
     if memory_executable is None:
         click.echo("Error: memory console script not found on PATH.")
         raise SystemExit(1)
+    memory_executable = str(Path(memory_executable).resolve())
 
     cmd = [binary]
     if project:
