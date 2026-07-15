@@ -87,6 +87,41 @@ async def test_tool_inventory_and_large_details(tmp_path: Path) -> None:
 
 
 @pytest.mark.anyio
+async def test_cursor_bound_context_off_does_not_fall_back_to_search(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = make_workspace(tmp_path / "repo")
+    memory_home = tmp_path / "memory-home"
+    service = MemoryService(str(memory_home))
+    service.config.context.agent_modes["cursor"] = "off"
+    search_calls = 0
+
+    def fail_if_searched(*args, **kwargs):
+        nonlocal search_calls
+        search_calls += 1
+        raise AssertionError("disabled context must not search")
+
+    monkeypatch.setattr(service, "search", fail_if_searched)
+    try:
+        async with open_test_client(
+            service,
+            MCPServerBinding("cursor", root, root),
+            ProjectRegistry(memory_home),
+        ) as client:
+            response = decode_object(
+                await client.call_tool("memory_context", {"query": "task"})
+            )
+        assert response["disabled"] is True
+        assert response["policy"]["mode"] == "off"
+        assert response["policy"]["source"] == "agent:cursor"
+        assert response["memories"] == []
+        assert search_calls == 0
+    finally:
+        service.close()
+
+
+@pytest.mark.anyio
 async def test_cancelling_context_keeps_next_request_healthy(
     tmp_path: Path,
 ) -> None:

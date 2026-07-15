@@ -1605,6 +1605,72 @@ def test_setup_cursor_project_flag(env_home, tmp_path, monkeypatch):
     assert mcp_path.exists()
 
 
+def test_cursor_cli_option_matrix(
+    env_home,
+    tmp_path,
+    fake_memory,
+    monkeypatch,
+):
+    monkeypatch.chdir(tmp_path)
+    result = CliRunner().invoke(
+        main,
+        [
+            "setup",
+            "cursor",
+            "--project",
+            "--config-dir",
+            str(tmp_path / ".cursor-explicit"),
+            "--command",
+            str(fake_memory),
+            "--force-managed",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert (tmp_path / ".cursor-explicit/mcp.json").is_file()
+
+
+def test_cursor_uninstall_rejects_setup_only_command_option(env_home):
+    result = CliRunner().invoke(
+        main,
+        [
+            "uninstall",
+            "cursor",
+            "--project",
+            "--command",
+            "/opt/echovault/bin/memory",
+        ],
+    )
+    assert result.exit_code == 2
+    assert "No such option: --command" in result.output
+
+
+def test_doctor_cursor_accepts_project_root_and_reports_integration(
+    env_home,
+    tmp_path,
+    monkeypatch,
+):
+    from memory.integrations.process import CommandResult, SubprocessRunner
+
+    project = tmp_path / "repo"
+    project.mkdir()
+    monkeypatch.setattr(
+        SubprocessRunner,
+        "run",
+        lambda self, argv, **kwargs: CommandResult(
+            127,
+            "",
+            "agent unavailable",
+        ),
+    )
+    result = CliRunner().invoke(
+        main,
+        ["doctor", "--agent", "cursor", "--project-root", str(project)],
+    )
+    assert result.exit_code == 0, result.output
+    assert "integration_findings" in result.output
+    assert "cursor.cloud-boundary" in result.output
+
+
 def test_setup_codex_project_flag(env_home, tmp_path, monkeypatch):
     """Test that --project installs into .codex in cwd."""
     monkeypatch.chdir(tmp_path)

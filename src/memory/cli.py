@@ -906,11 +906,23 @@ def review_cmd(project):
 
 @main.command("doctor")
 @click.option("--project", default=None)
-def doctor_cmd(project):
+@click.option("--agent", default=None, help="Inspect one agent integration")
+@click.option(
+    "--project-root",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=None,
+    help="Project root for agent integration diagnostics",
+)
+def doctor_cmd(project, agent, project_root):
     """Check vault, index, vectors, references, and lifecycle health."""
     from memory.health import doctor_home
 
-    report = doctor_home(Path(get_memory_home()), project)
+    report = doctor_home(
+        Path(get_memory_home()),
+        project,
+        agent=agent,
+        project_root=project_root,
+    )
     click.echo(yaml.safe_dump(report, sort_keys=False))
 
 
@@ -1144,13 +1156,45 @@ def setup_claude_code_cmd(config_dir, project):
 @setup.command("cursor")
 @click.option("--config-dir", default=None, help="Path to .cursor directory")
 @click.option("--project", is_flag=True, default=False, help="Install in current project instead of globally")
-def setup_cursor_cmd(config_dir, project):
-    """Install hooks into Cursor hooks.json."""
-    from memory.setup import setup_cursor
+@click.option(
+    "--command",
+    default=None,
+    help="Exact EchoVault command (portable for project, executable for user)",
+)
+@click.option(
+    "--force-managed",
+    is_flag=True,
+    default=False,
+    help="Replace modified EchoVault-managed assets",
+)
+def setup_cursor_cmd(config_dir, project, command, force_managed):
+    """Install curated EchoVault memory into Cursor."""
+    from memory.integrations.registry import get_adapter
+    from memory.integrations.types import (
+        InstallMode,
+        InstallScope,
+        IntegrationOptions,
+    )
 
-    target = _resolve_config_dir(".cursor", config_dir, project)
-    result = setup_cursor(target)
-    click.echo(result["message"])
+    explicit_root = config_dir is not None
+    result = get_adapter("cursor").setup(
+        IntegrationOptions(
+            scope=(InstallScope.PROJECT if project else InstallScope.USER),
+            mode=(InstallMode.DIRECT if project else InstallMode.NATIVE),
+            config_root=(
+                Path(config_dir)
+                if config_dir is not None
+                else (None if project else Path.home() / ".cursor")
+            ),
+            project_root=Path.cwd() if project else None,
+            command=command,
+            force_managed=force_managed,
+            config_root_explicit=explicit_root,
+        )
+    )
+    click.echo(result.message)
+    for warning in result.warnings:
+        click.echo(f"Warning: {warning}")
 
 
 @setup.command("codex")
@@ -1196,13 +1240,38 @@ def uninstall_claude_code_cmd(config_dir, project):
 @uninstall.command("cursor")
 @click.option("--config-dir", default=None, help="Path to .cursor directory")
 @click.option("--project", is_flag=True, default=False, help="Uninstall from current project instead of globally")
-def uninstall_cursor_cmd(config_dir, project):
-    """Remove hooks from Cursor hooks.json."""
-    from memory.setup import uninstall_cursor
+@click.option(
+    "--force-managed",
+    is_flag=True,
+    default=False,
+    help="Remove modified EchoVault-managed assets",
+)
+def uninstall_cursor_cmd(config_dir, project, force_managed):
+    """Remove one curated EchoVault Cursor scope."""
+    from memory.integrations.registry import get_adapter
+    from memory.integrations.types import (
+        InstallMode,
+        InstallScope,
+        IntegrationOptions,
+    )
 
-    target = _resolve_config_dir(".cursor", config_dir, project)
-    result = uninstall_cursor(target)
-    click.echo(result["message"])
+    explicit_root = config_dir is not None
+    result = get_adapter("cursor").uninstall(
+        IntegrationOptions(
+            scope=(InstallScope.PROJECT if project else InstallScope.USER),
+            mode=(InstallMode.DIRECT if project else InstallMode.NATIVE),
+            config_root=(
+                Path(config_dir)
+                if config_dir is not None
+                else (None if project else Path.home() / ".cursor")
+            ),
+            project_root=Path.cwd() if project else None,
+            command=None,
+            force_managed=force_managed,
+            config_root_explicit=explicit_root,
+        )
+    )
+    click.echo(result.message)
 
 
 @uninstall.command("codex")

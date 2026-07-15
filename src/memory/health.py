@@ -271,7 +271,14 @@ def lifecycle_review(db, project: str | None = None) -> dict[str, list]:
     return report
 
 
-def doctor(service, project: str | None = None) -> dict:
+def doctor(
+    service,
+    project: str | None = None,
+    *,
+    agent: str | None = None,
+    project_root: Path | None = None,
+    runner=None,
+) -> dict:
     from memory.reconcile import canonical_findings
 
     db = service.db
@@ -305,7 +312,7 @@ def doctor(service, project: str | None = None) -> dict:
         vault_metadata["schema_v1_files"] or vault_metadata["unreadable_files"]
     )
     findings = canonical_findings(service, project)
-    return {
+    report = {
         "status": (
             "ok"
             if not (
@@ -331,9 +338,22 @@ def doctor(service, project: str | None = None) -> dict:
         "vault_metadata": vault_metadata,
         "findings": findings,
     }
+    if agent is not None:
+        from memory.integrations.diagnostics import integration_diagnostics
+
+        selected_root = (project_root or Path.cwd()).expanduser().resolve()
+        report["integration_findings"] = list(
+            integration_diagnostics(
+                service,
+                agent=agent,
+                project_root=selected_root,
+                runner=runner,
+            )
+        )
+    return report
 
 
-def doctor_home(memory_home: Path, project: str | None = None) -> dict:
+def _doctor_home_base(memory_home: Path, project: str | None = None) -> dict:
     """Inspect one memory home without creating or modifying any storage."""
     from memory.db import MemoryDB
 
@@ -470,3 +490,37 @@ def doctor_home(memory_home: Path, project: str | None = None) -> dict:
         project,
         database_error="index_snapshot_unstable",
     )
+
+
+def doctor_home(
+    memory_home: Path,
+    project: str | None = None,
+    *,
+    agent: str | None = None,
+    project_root: Path | None = None,
+    runner=None,
+) -> dict:
+    """Inspect storage and optional agent integration without writing state."""
+
+    report = _doctor_home_base(memory_home, project)
+    if agent is None:
+        return report
+    from types import SimpleNamespace
+
+    from memory.config import load_config
+    from memory.integrations.diagnostics import integration_diagnostics
+
+    service = SimpleNamespace(
+        memory_home=str(memory_home),
+        config=load_config(str(memory_home / "config.yaml")),
+    )
+    selected_root = (project_root or Path.cwd()).expanduser().resolve()
+    report["integration_findings"] = list(
+        integration_diagnostics(
+            service,
+            agent=agent,
+            project_root=selected_root,
+            runner=runner,
+        )
+    )
+    return report

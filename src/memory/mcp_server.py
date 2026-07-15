@@ -842,9 +842,12 @@ def _create_server(
     """Create and configure the MCP server with memory tools."""
     binding = binding or MCPServerBinding(None, None, Path.cwd())
     registry = registry or ProjectRegistry(Path(service.memory_home))
-    selected_worker_factory = worker_service_factory or (
-        lambda: MemoryService(str(service.memory_home))
-    )
+    def default_worker_service() -> MemoryService:
+        worker = MemoryService(str(service.memory_home))
+        worker.config = copy.deepcopy(service.config)
+        return worker
+
+    selected_worker_factory = worker_service_factory or default_worker_service
     server = Server("echovault")
 
     @server.list_tools()
