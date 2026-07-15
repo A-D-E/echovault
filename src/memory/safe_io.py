@@ -31,7 +31,7 @@ def translate_windows_lock_error(error: OSError) -> OSError:
 
 
 class ProcessFileLock:
-    def __init__(self, path: Path, timeout: float = 5.0, poll_interval: float = 0.05):
+    def __init__(self, path: Path, timeout: float = 30.0, poll_interval: float = 0.05):
         self.path = path
         self.timeout = timeout
         self.poll_interval = poll_interval
