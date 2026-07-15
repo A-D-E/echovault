@@ -3,7 +3,6 @@ from __future__ import annotations
 import os
 import re
 import shutil
-import stat
 import subprocess
 from dataclasses import asdict
 from pathlib import Path
@@ -17,7 +16,11 @@ from memory.integrations.ownership import (
     load_manifest,
     verify_managed_content,
 )
-from memory.integrations.process import CommandRunner, SubprocessRunner
+from memory.integrations.process import (
+    CommandRunner,
+    SubprocessRunner,
+    is_executable_regular_file,
+)
 from memory.integrations.types import DiagnosticFinding
 
 
@@ -167,12 +170,8 @@ def _cursor_project_findings(project_root: Path) -> list[dict[str, object]]:
         executable = None
         candidate = Path(command).expanduser()
         if candidate.is_absolute():
-            try:
-                metadata = candidate.stat()
-                if stat.S_ISREG(metadata.st_mode) and os.access(candidate, os.X_OK):
-                    executable = str(candidate)
-            except OSError:
-                pass
+            if is_executable_regular_file(candidate):
+                executable = str(candidate)
         else:
             executable = shutil.which(command)
         findings.append(

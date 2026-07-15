@@ -1,6 +1,9 @@
 import json
 from importlib.resources import files
 
+import pytest
+
+import memory.integrations.asset_io as asset_io
 from memory.integrations.asset_io import (
     render_gemini_assets,
     shell_join_command,
@@ -56,3 +59,22 @@ def test_hook_command_join_keeps_spaced_executable_as_one_argument() -> None:
     )
     assert "Echo Vault" in command
     assert command != "/opt/Echo Vault/bin/memory hook gemini before-agent"
+
+
+def test_renderers_normalize_crlf_package_assets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_read = asset_io.read_package_asset
+
+    def read_crlf_asset(relative_path: str) -> bytes:
+        return real_read(relative_path).replace(b"\n", b"\r\n")
+
+    monkeypatch.setattr(asset_io, "read_package_asset", read_crlf_asset)
+
+    assets = render_gemini_assets(
+        memory_command="memory",
+        hook_command="memory hook gemini before-agent",
+        version="0.6.0",
+    )
+
+    assert all(b"\r" not in payload for payload in assets.values())

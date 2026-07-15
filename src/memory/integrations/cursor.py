@@ -2,9 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import shutil
-import stat
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +25,7 @@ from memory.integrations.ownership import (
     verify_managed_content,
     write_manifest_atomic,
 )
+from memory.integrations.process import is_executable_regular_file
 from memory.integrations.types import (
     AdapterCapabilities,
     DiagnosticFinding,
@@ -127,13 +126,7 @@ class CursorAdapter:
                 raise ValueError(f"EchoVault executable was not found: {selected}")
             candidate = Path(discovered)
         resolved = candidate.resolve()
-        try:
-            metadata = resolved.stat()
-        except OSError as error:
-            raise ValueError(
-                f"EchoVault executable cannot be inspected: {selected}"
-            ) from error
-        if not stat.S_ISREG(metadata.st_mode) or not os.access(resolved, os.X_OK):
+        if not is_executable_regular_file(resolved):
             raise ValueError(
                 f"EchoVault command must be an executable regular file: {selected}"
             )
@@ -289,7 +282,7 @@ class CursorAdapter:
         )
 
         cursor_root.mkdir(parents=True, exist_ok=True)
-        lock = cursor_root.parent / f".{cursor_root.name}.echovault-project.lock"
+        lock = cursor_root.parent / f"{cursor_root.name}.echovault-project.lock"
         with ProcessFileLock(lock):
             return self._setup_project_locked(
                 cursor_root,

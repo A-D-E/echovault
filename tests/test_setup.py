@@ -126,6 +126,25 @@ class TestClaudeCodeSetup:
         assert skill_path.read_text() == first
         assert result["message"] == "Already installed"
 
+    def test_crlf_packaged_skill_is_byte_stable(
+        self,
+        claude_home,
+        monkeypatch,
+    ):
+        import memory.setup as setup_module
+
+        real_read = setup_module.read_package_asset
+
+        def read_crlf_asset(relative_path: str) -> bytes:
+            return real_read(relative_path).replace(b"\n", b"\r\n")
+
+        monkeypatch.setattr(setup_module, "read_package_asset", read_crlf_asset)
+        setup_module.setup_claude_code(str(claude_home), project=True)
+
+        result = setup_module.setup_claude_code(str(claude_home), project=True)
+
+        assert result["message"] == "Already installed"
+
     def test_packaged_skill_is_task_aware(self, claude_home):
         import memory.setup as setup_module
 

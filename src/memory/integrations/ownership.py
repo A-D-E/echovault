@@ -306,7 +306,8 @@ def _tree_digest(root: Path) -> str | None:
 def _fsync_tree(root: Path) -> None:
     for path in sorted(root.rglob("*")):
         if path.is_file() and not path.is_symlink():
-            descriptor = os.open(path, os.O_RDONLY)
+            flags = os.O_RDWR if os.name == "nt" else os.O_RDONLY
+            descriptor = os.open(path, flags)
             try:
                 os.fsync(descriptor)
             finally:

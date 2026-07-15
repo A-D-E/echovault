@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+import memory.markdown as markdown
 from memory.markdown import (
     SessionDocument,
     SessionEntry,
@@ -78,6 +79,22 @@ def document_with(memory: Memory) -> SessionDocument:
         ],
         schema_version=2,
     )
+
+
+def test_cp1251_fallback_precedes_single_byte_windows_locale(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "legacy.md"
+    expected = "### Старый импорт\n**What:** старый текст\n"
+    path.write_bytes(expected.encode("cp1251"))
+    monkeypatch.setattr(
+        markdown.locale,
+        "getpreferredencoding",
+        lambda _setlocale=False: "cp1252",
+    )
+
+    assert markdown.read_markdown_text(path) == expected
 
 
 @pytest.fixture

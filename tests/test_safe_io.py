@@ -86,7 +86,8 @@ def test_prepared_write_is_invisible_until_replace_and_preserves_mode(tmp_path: 
     assert target.read_text(encoding='utf-8') == 'old\n'
     prepared.replace()
     assert target.read_text(encoding='utf-8') == 'new\n'
-    assert target.stat().st_mode & 0o777 == 0o640
+    if os.name != 'nt':
+        assert target.stat().st_mode & 0o777 == 0o640
     assert digest_file(target) is not None
 
 
@@ -98,10 +99,36 @@ def test_prepared_write_replaces_read_only_target_and_preserves_mode(tmp_path: P
     try:
         prepared.replace()
         assert target.read_text(encoding='utf-8') == 'new\n'
-        assert target.stat().st_mode & 0o777 == 0o444
+        if os.name != 'nt':
+            assert target.stat().st_mode & 0o777 == 0o444
     finally:
         if prepared.temporary.exists():
             prepared.temporary.chmod(0o600)
+        prepared.discard()
+        if target.exists():
+            target.chmod(0o600)
+
+
+def test_windows_replace_makes_read_only_target_writable_before_publish(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    target = tmp_path / "session.md"
+    target.write_text("old\n", encoding="utf-8")
+    target.chmod(0o444)
+    prepared = prepare_atomic_text(target, "new\n")
+    real_replace = os.replace
+
+    def require_writable_target(source: Path, destination: Path) -> None:
+        assert destination.stat().st_mode & 0o200
+        real_replace(source, destination)
+
+    monkeypatch.setattr(safe_io.os, "name", "nt")
+    monkeypatch.setattr(safe_io, "_replace_and_sync", require_writable_target)
+    try:
+        prepared.replace()
+        assert target.read_text(encoding="utf-8") == "new\n"
+    finally:
         prepared.discard()
         if target.exists():
             target.chmod(0o600)
@@ -216,7 +243,7 @@ def test_initialization_error_closes_handle(tmp_path: Path, monkeypatch) -> None
     class SeekFailingHandle:
         closed = False
 
-        def seek(self, offset: int) -> None:
+        def seek(self, offset: int, whence: int = os.SEEK_SET) -> None:
             raise OSError(errno.EIO, 'seek failed')
 
         def close(self) -> None:
@@ -231,6 +258,37 @@ def test_initialization_error_closes_handle(tmp_path: Path, monkeypatch) -> None
 
     assert handle.closed
     assert lock._handle is None
+
+
+def test_existing_lock_is_initialized_without_reading_locked_byte(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    class ExistingLockHandle:
+        closed = False
+
+        def seek(self, offset: int, whence: int = 0) -> None:
+            _ = (offset, whence)
+
+        def tell(self) -> int:
+            return 1
+
+        def read(self, size: int) -> bytes:
+            raise PermissionError("locked byte must not be read")
+
+        def close(self) -> None:
+            self.closed = True
+
+    handle = ExistingLockHandle()
+    lock = ProcessFileLock(tmp_path / "project.lock")
+    monkeypatch.setattr(Path, "open", lambda *args, **kwargs: handle)
+    monkeypatch.setattr(lock, "_acquire_once", lambda: None)
+    monkeypatch.setattr(lock, "_release_once", lambda: None)
+
+    with lock:
+        assert lock._handle is handle
+
+    assert handle.closed
 
 
 def test_retry_sleep_error_closes_handle(tmp_path: Path, monkeypatch) -> None:

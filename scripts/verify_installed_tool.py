@@ -4,7 +4,6 @@ import argparse
 import json
 import os
 import shutil
-import stat
 import subprocess
 import sys
 import tempfile
@@ -19,6 +18,7 @@ from mcp.client.stdio import stdio_client
 from mcp.types import TextContent
 
 import memory
+from memory.integrations.process import is_executable_regular_file
 
 try:
     from scripts.validate_cursor_plugin import validate_cursor_plugin
@@ -44,10 +44,9 @@ class VerificationReport:
 def resolve_memory_executable(path: Path) -> Path:
     try:
         resolved = path.expanduser().resolve(strict=True)
-        metadata = resolved.stat()
     except OSError as error:
         raise ValueError("memory must be an executable regular file") from error
-    if not stat.S_ISREG(metadata.st_mode) or not os.access(resolved, os.X_OK):
+    if not is_executable_regular_file(resolved):
         raise ValueError("memory must be an executable regular file")
     return resolved
 

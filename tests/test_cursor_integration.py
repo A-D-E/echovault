@@ -62,6 +62,15 @@ def test_cursor_assets_have_valid_manifest_and_curated_contract() -> None:
     assert "0.6.0" in skill
 
 
+def test_cursor_assets_escape_windows_command_paths() -> None:
+    command = r"C:\Users\example\AppData\Local\echovault\memory.exe"
+
+    assets = render_cursor_assets(command=command, version="0.6.0")
+
+    mcp = json.loads(assets["mcp.json"])
+    assert mcp["mcpServers"]["echovault"]["command"] == command
+
+
 def test_project_setup_installs_portable_mcp_rule_skill_and_manifest(
     tmp_path: Path,
 ) -> None:
@@ -79,6 +88,16 @@ def test_project_setup_installs_portable_mcp_rule_skill_and_manifest(
     assert (project / ".cursor/skills/echovault/SKILL.md").is_file()
     assert (project / ".cursor/.echovault-managed.json").is_file()
     assert result.status == "installed"
+
+
+def test_project_setup_uses_single_dot_lock_name(tmp_path: Path) -> None:
+    project = tmp_path / "repo"
+    project.mkdir()
+
+    cursor_adapter().setup(project_options(project))
+
+    assert (project / ".cursor.echovault-project.lock").is_file()
+    assert not (project / "..cursor.echovault-project.lock").exists()
 
 
 def test_project_setup_is_byte_stable_and_preserves_other_server(

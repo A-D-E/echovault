@@ -152,9 +152,9 @@ def test_get_memory_home_defaults_to_home_directory():
             os.environ["MEMORY_HOME"] = old_value
 
 
-def test_get_memory_home_respects_env_var():
+def test_get_memory_home_respects_env_var(tmp_path):
     """Test that get_memory_home respects MEMORY_HOME env var."""
-    custom_path = "/custom/memory/path"
+    custom_path = str(tmp_path / "custom" / "memory" / "path")
     old_value = os.environ.get("MEMORY_HOME")
 
     try:

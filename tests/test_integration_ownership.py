@@ -1,7 +1,9 @@
+import os
 from pathlib import Path
 
 import pytest
 
+import memory.integrations.ownership as ownership
 from memory.integrations.ownership import (
     LocalTreeFilesystem,
     OwnershipConflict,
@@ -27,6 +29,30 @@ def install_fixture_tree(tmp_path: Path) -> Path:
 
 def upgraded_fixture() -> dict[str, bytes]:
     return rendered_fixture("0.6.0")
+
+
+def test_windows_tree_fsync_opens_files_with_write_access(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "managed-tree"
+    root.mkdir()
+    (root / "asset.txt").write_text("asset", encoding="utf-8")
+    observed_flags: list[int] = []
+    real_open = os.open
+
+    def record_open(path: Path, flags: int) -> int:
+        observed_flags.append(flags)
+        return real_open(path, flags)
+
+    monkeypatch.setattr(ownership.os, "name", "nt")
+    monkeypatch.setattr(ownership.os, "open", record_open)
+    monkeypatch.setattr(ownership.os, "fsync", lambda descriptor: None)
+    monkeypatch.setattr(ownership, "fsync_directory", lambda path: None)
+
+    ownership._fsync_tree(root)
+
+    assert observed_flags == [os.O_RDWR]
 
 
 class SimulatedTreeSwapCrash(RuntimeError):

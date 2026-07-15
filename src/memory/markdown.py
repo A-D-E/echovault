@@ -324,7 +324,7 @@ def _entry_from_memory(mem: Memory, details: Optional[str] = None) -> SessionEnt
 
 def read_markdown_text(file_path: Path) -> str:
     """Read a markdown file with encoding fallbacks."""
-    encodings = ["utf-8-sig", "utf-8", locale.getpreferredencoding(False), "cp1251"]
+    encodings = ["utf-8-sig", "utf-8", "cp1251", locale.getpreferredencoding(False)]
     seen: set[str] = set()
 
     for encoding in encodings:

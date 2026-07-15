@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -59,7 +60,8 @@ def test_json_mutation_preserves_unrelated_nested_values_and_mode(
     mutate_json_atomic(path, add_owned_echovault_entry)
     data = json.loads(path.read_text())
     assert data["mcpServers"]["other"]["env"]["TOKEN"] == "unchanged"
-    assert path.stat().st_mode & 0o777 == 0o640
+    if os.name != "nt":
+        assert path.stat().st_mode & 0o777 == 0o640
 
 
 def test_second_external_change_returns_conflict_without_overwrite(

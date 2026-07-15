@@ -1,3 +1,4 @@
+import os
 import random
 from pathlib import Path
 from unittest.mock import patch
@@ -84,7 +85,9 @@ def service(env_home: Path):
 
 @pytest.fixture
 def fake_memory(tmp_path: Path) -> Path:
-    executable = tmp_path / "bin" / "memory"
+    executable = tmp_path / "bin" / (
+        "memory.exe" if os.name == "nt" else "memory"
+    )
     executable.parent.mkdir()
     executable.write_text("#!/bin/sh\nexit 0\n")
     executable.chmod(0o755)

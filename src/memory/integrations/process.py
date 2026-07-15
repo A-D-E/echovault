@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from pathlib import Path
+import stat
 import subprocess
 from typing import Mapping, Protocol, Sequence
 
@@ -24,6 +26,26 @@ class CommandRunner(Protocol):
         env: Mapping[str, str] | None = None,
     ) -> CommandResult:
         raise NotImplementedError
+
+
+def is_executable_regular_file(path: Path) -> bool:
+    """Return whether a path is a runnable regular file on this platform."""
+
+    try:
+        metadata = path.stat()
+    except OSError:
+        return False
+    if not stat.S_ISREG(metadata.st_mode):
+        return False
+    if os.name == "nt":
+        configured = os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD")
+        executable_suffixes = {
+            suffix.lower()
+            for suffix in configured.split(";")
+            if suffix
+        }
+        return path.suffix.lower() in executable_suffixes
+    return os.access(path, os.X_OK)
 
 
 class SubprocessRunner:

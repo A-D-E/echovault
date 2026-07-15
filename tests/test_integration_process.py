@@ -3,7 +3,11 @@ import subprocess
 
 import pytest
 
-from memory.integrations.process import CommandResult, SubprocessRunner
+import memory.integrations.process as process
+from memory.integrations.process import (
+    CommandResult,
+    SubprocessRunner,
+)
 
 
 def test_subprocess_runner_never_uses_a_shell_and_forwards_context(
@@ -34,3 +38,20 @@ def test_subprocess_runner_never_uses_a_shell_and_forwards_context(
     assert captured["shell"] is False
     assert captured["cwd"] == tmp_path.resolve()
     assert captured["env"] == {"HOME": str(tmp_path)}
+
+
+def test_windows_executable_requires_pathext_suffix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    extensionless = tmp_path / "memory"
+    extensionless.write_text("binary", encoding="utf-8")
+    executable = tmp_path / "memory.EXE"
+    executable.write_text("binary", encoding="utf-8")
+    assert hasattr(process, "is_executable_regular_file")
+
+    monkeypatch.setattr(process.os, "name", "nt")
+    monkeypatch.setenv("PATHEXT", ".COM;.EXE;.BAT;.CMD")
+
+    assert process.is_executable_regular_file(extensionless) is False
+    assert process.is_executable_regular_file(executable) is True

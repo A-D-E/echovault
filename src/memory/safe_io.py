@@ -41,8 +41,8 @@ class ProcessFileLock:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._handle = self.path.open('a+b')
         try:
-            self._handle.seek(0)
-            if self._handle.read(1) == b'':
+            self._handle.seek(0, os.SEEK_END)
+            if self._handle.tell() == 0:
                 self._handle.write(b'0')
                 self._handle.flush()
             deadline = time.monotonic() + self.timeout
@@ -305,7 +305,20 @@ class PreparedAtomicWrite:
                 os.fsync(descriptor)
             finally:
                 os.close(descriptor)
-        _replace_and_sync(self.temporary, self.target)
+        writable_target = (
+            os.name == 'nt'
+            and self.original_mode is not None
+            and not self.original_mode & stat.S_IWRITE
+            and self.target.exists()
+        )
+        if writable_target:
+            self.target.chmod(self.original_mode | stat.S_IWRITE)
+        try:
+            _replace_and_sync(self.temporary, self.target)
+        except BaseException:
+            if writable_target and self.target.exists():
+                self.target.chmod(self.original_mode)
+            raise
 
     def replace_if_digest(
         self,

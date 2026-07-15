@@ -186,10 +186,11 @@ def test_project_root_must_exist_without_creating_registry_state(env_home, tmp_p
     )
 
     assert result.exit_code == 2
+    display_missing = str(missing).replace("\\", "\\\\")
     assert result.output == (
         "Usage: main project adopt-legacy [OPTIONS] LEGACY_KEY\n"
         "Try 'main project adopt-legacy --help' for help.\n\n"
-        f"Error: Invalid value for '--project-root': Directory '{missing}' "
+        f"Error: Invalid value for '--project-root': Directory '{display_missing}' "
         "does not exist.\n"
     )
     assert isinstance(result.exception, SystemExit)
@@ -294,20 +295,24 @@ def test_dashboard_help():
     assert "--include-archived" in result.output
 
 
-def test_dashboard_passes_absolute_memory_executable_to_rust(monkeypatch):
+def test_dashboard_passes_absolute_memory_executable_to_rust(
+    monkeypatch,
+    tmp_path,
+):
     resolved = {
-        "memory-dashboard": "/opt/echovault/bin/memory-dashboard",
-        "memory": "/opt/echovault/bin/memory",
+        "memory-dashboard": str(tmp_path / "bin" / "memory-dashboard"),
+        "memory": str(tmp_path / "bin" / "memory"),
     }
+    memory_home = str(tmp_path / "echo-home")
     monkeypatch.setattr(shutil, "which", lambda name: resolved.get(name))
-    monkeypatch.setattr(cli_module, "get_memory_home", lambda: "/tmp/echo-home")
+    monkeypatch.setattr(cli_module, "get_memory_home", lambda: memory_home)
     monkeypatch.delenv("MEMORY_HOME", raising=False)
     monkeypatch.delenv("ECHOVAULT_MEMORY_EXECUTABLE", raising=False)
 
     def capture_exec(binary, command):
         assert binary == resolved["memory-dashboard"]
         assert command == [resolved["memory-dashboard"]]
-        assert os.environ["MEMORY_HOME"] == "/tmp/echo-home"
+        assert os.environ["MEMORY_HOME"] == memory_home
         assert os.environ["ECHOVAULT_MEMORY_EXECUTABLE"] == resolved["memory"]
         raise SystemExit(0)
 

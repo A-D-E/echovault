@@ -248,7 +248,7 @@ def _install_skill(agent_home: str, agent_name: str = "agent") -> bool:
 
     content = read_package_asset(
         "common/echovault-skill.md"
-    ).decode("utf-8")
+    ).decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
     content = (
         content.replace("{{AGENT_NAME}}", agent_name)
         .replace("{{VERSION}}", "0.6.0")
