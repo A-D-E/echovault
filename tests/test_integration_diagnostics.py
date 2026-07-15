@@ -153,3 +153,41 @@ def test_cursor_doctor_home_without_database_remains_read_only(
     assert snapshot_tree(tmp_path) == before
     assert report["integration_findings"]
     assert not (memory_home / "index.db").exists()
+
+
+def test_cursor_doctor_uses_legacy_cli_alias_when_agent_command_is_absent(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    import memory.integrations.diagnostics as diagnostics
+
+    project = tmp_path / "repo"
+    project.mkdir()
+    cursor_adapter().setup(project_options(project))
+    calls: list[tuple[str, ...]] = []
+
+    def fake_which(command: str) -> str | None:
+        if command == "cursor-agent":
+            return "/opt/cursor-agent"
+        if command == "memory":
+            return "/opt/memory"
+        return None
+
+    def fake_run(self, argv, **kwargs):
+        calls.append(tuple(argv))
+        return CommandResult(0, "echovault", "")
+
+    monkeypatch.setattr(diagnostics.shutil, "which", fake_which)
+    monkeypatch.setattr(diagnostics.SubprocessRunner, "run", fake_run)
+    service = MemoryService(str(tmp_path / "memory-home"))
+    try:
+        doctor(service, agent="cursor", project_root=project)
+    finally:
+        service.close()
+    assert calls[0] == ("cursor-agent", "mcp", "list")
+    assert calls[1] == (
+        "cursor-agent",
+        "mcp",
+        "list-tools",
+        "echovault",
+    )

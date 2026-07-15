@@ -28,7 +28,7 @@ I built EchoVault to solve this: local memory persistence for coding agents that
 
 **Works with 4 agents** — Claude Code, Cursor, Codex, OpenCode. One command sets up MCP config for your agent.
 
-**MCP native** — Runs as an MCP server exposing `memory_save`, `memory_search`, and `memory_context` as tools. Agents call them directly — no shell hooks needed.
+**MCP native** — Runs as an MCP server exposing `memory_context`, `memory_search`, `memory_details`, and `memory_save` as tools. Agents call them directly — no shell hooks needed.
 
 **Local-first** — Everything stays on your machine. Memories are stored as Markdown in `~/.memory/vault/`, readable in Obsidian or any editor. No data leaves your machine unless you opt into cloud embeddings.
 
@@ -75,9 +75,70 @@ By default config is installed globally. To install for a specific project:
 ```bash
 cd ~/my-project
 memory setup claude-code --project   # writes .mcp.json in project root
+memory setup cursor --project        # writes bound MCP + rule + skill in .cursor/
 memory setup opencode --project      # writes opencode.json in project root
 memory setup codex --project         # writes .codex/config.toml + AGENTS.md
 ```
+
+### Cursor: IDE, CLI, and Agents Window
+
+EchoVault supports Cursor's local IDE agent, Cursor Agent CLI, and local runs
+from the Agents Window through one bound MCP identity. Choose one or both
+scopes:
+
+```bash
+# Global: managed local plugin, available across local Cursor projects
+memory setup cursor
+
+# Project: portable, version-controlled fallback in PROJECT/.cursor
+cd ~/my-project
+memory setup cursor --project
+
+# Optional explicit locations/commands
+memory setup cursor --config-dir /path/to/cursor-config \
+  --command /absolute/path/to/memory
+memory setup cursor --project --config-dir /path/to/project/.cursor \
+  --command memory
+```
+
+Reload or restart Cursor after changing the global plugin. Project setup
+installs `.cursor/mcp.json`, `.cursor/rules/echovault.mdc`, and
+`.cursor/skills/echovault/SKILL.md`. The MCP command is bound to
+`--agent cursor`; model calls cannot spoof another agent, source, or project.
+An exact legacy direct `mcpServers.echovault` entry is migrated automatically.
+A custom same-named entry, malformed configuration, or unowned plugin directory
+is left untouched and reported as a conflict.
+
+Inspect the effective installation without modifying it:
+
+```bash
+cd ~/my-project
+memory doctor --agent cursor
+memory doctor --agent cursor --project-root /path/to/project
+```
+
+Remove exactly one scope; installing or removing a project integration never
+removes the global plugin, and vice versa:
+
+```bash
+memory uninstall cursor
+cd ~/my-project && memory uninstall cursor --project
+```
+
+Cursor project MCP configuration is shared by the IDE and Agent CLI. Local
+Agents Window runs (including a session steered through Mobile Remote Control)
+can reach the machine's local vault. A true Cursor Cloud Agent runs in an
+isolated environment: it can use the portable project configuration only when
+EchoVault and its vault storage are provisioned there. EchoVault does not
+silently upload or mirror a local vault to Cursor Cloud.
+
+The installer and doctor deterministically verify files, ownership hashes,
+the bound MCP definition, executable resolution, and tool availability. The
+always-applied rule instructs Cursor to retrieve task context and save curated
+learnings, but Cursor ultimately decides whether a model issues an MCP call.
+End-to-end proof of actual retrieval therefore requires an authenticated Cursor
+smoke test; installed files alone are not evidence that a particular model turn
+called `memory_context`.
 
 ### Configure embeddings (optional)
 
@@ -320,7 +381,7 @@ Keybindings:
 | Agent | Setup command | What gets installed |
 |-------|-------------|-------------------|
 | Claude Code | `memory setup claude-code` | MCP server plus refreshed task-aware skill; `.mcp.json` (project) or `~/.claude.json` (global) |
-| Cursor | `memory setup cursor` | MCP server in `.cursor/mcp.json` |
+| Cursor | `memory setup cursor` | Managed local plugin (global), or bound MCP + versioned rule/skill in `.cursor/` with `--project` |
 | Codex | `memory setup codex` | MCP server in `.codex/config.toml` + `AGENTS.md` fallback |
 | OpenCode | `memory setup opencode` | MCP server in `opencode.json` (project) or `~/.config/opencode/opencode.json` (global) |
 
@@ -349,6 +410,7 @@ task-aware skill that tells Claude to pass the current request as `query` and
 | `memory feedback <referenced\|dismissed> <ids>...` | Record local aggregate retrieval feedback |
 | `memory review` | Propose lifecycle cleanup without changing memories |
 | `memory doctor` | Diagnose vault, index, vectors, references, and lifecycle health |
+| `memory doctor --agent cursor` | Read-only Cursor scope, ownership, MCP, policy, and client capability diagnostics |
 | `memory import` | Import markdown memories into the SQLite index |
 | `memory sessions` | List session files |
 | `memory dashboard` | Launch the terminal dashboard |

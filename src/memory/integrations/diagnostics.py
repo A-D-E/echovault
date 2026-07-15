@@ -237,11 +237,16 @@ def cursor_diagnostics(
     )
 
     selected_runner = runner or SubprocessRunner()
+    client_command = "agent"
+    if runner is None and shutil.which("agent") is None:
+        client_command = (
+            "cursor-agent" if shutil.which("cursor-agent") else "agent"
+        )
     checks = (
-        ("cursor.client-mcp", ("agent", "mcp", "list")),
+        ("cursor.client-mcp", (client_command, "mcp", "list")),
         (
             "cursor.client-tools",
-            ("agent", "mcp", "list-tools", "echovault"),
+            (client_command, "mcp", "list-tools", "echovault"),
         ),
     )
     for code, argv in checks:

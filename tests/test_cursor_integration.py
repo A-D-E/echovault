@@ -3,7 +3,9 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
+from click.testing import CliRunner
 
+from memory.cli import main
 from memory.integrations.asset_io import render_cursor_assets
 from memory.integrations.config_io import ConfigBoundaryError, ConfigMalformedError
 from memory.integrations.ownership import OwnershipConflict
@@ -487,3 +489,34 @@ def test_uninstall_without_artifacts_is_unchanged(tmp_path: Path) -> None:
     project.mkdir()
     result = cursor_adapter().uninstall(project_options(project))
     assert result.status == "unchanged"
+
+
+def test_cursor_project_contract_from_cli(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from memory.integrations.process import CommandResult, SubprocessRunner
+
+    home = tmp_path / "home"
+    project = tmp_path / "repo"
+    home.mkdir()
+    project.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(project)
+    monkeypatch.setattr(
+        SubprocessRunner,
+        "run",
+        lambda self, argv, **kwargs: CommandResult(
+            127,
+            "",
+            "agent unavailable",
+        ),
+    )
+    result = CliRunner().invoke(main, ["setup", "cursor", "--project"])
+    assert result.exit_code == 0, result.output
+    doctor_result = CliRunner().invoke(main, ["doctor", "--agent", "cursor"])
+    assert doctor_result.exit_code == 0, doctor_result.output
+    assert "cursor.cloud-boundary" in doctor_result.output
+    result = CliRunner().invoke(main, ["uninstall", "cursor", "--project"])
+    assert result.exit_code == 0, result.output
+    assert not (project / ".cursor/rules/echovault.mdc").exists()
