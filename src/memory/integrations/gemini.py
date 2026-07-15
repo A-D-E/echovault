@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import stat
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +28,7 @@ from memory.integrations.ownership import (
     OwnershipConflict,
     OwnershipManifest,
     load_manifest,
+    replace_managed_tree,
     verify_managed_content,
     write_manifest_atomic,
 )
@@ -214,8 +216,130 @@ class GeminiAdapter:
 
     def setup(self, options: IntegrationOptions) -> IntegrationResult:
         if options.mode is InstallMode.NATIVE:
-            raise ValueError("Gemini native extension setup is not implemented")
+            return self._setup_native(options)
         return self._setup_direct(options)
+
+    @staticmethod
+    def _platform_config(home: Path) -> Path:
+        if sys.platform == "darwin":
+            return home / "Library" / "Application Support" / "echovault"
+        if os.name == "nt":
+            return home / "AppData" / "Roaming" / "echovault"
+        return home / ".config" / "echovault"
+
+    def _native_paths(self, options: IntegrationOptions) -> tuple[Path, Path]:
+        if options.scope is not InstallScope.USER:
+            raise ValueError("Gemini native extension is user-scoped")
+        gemini_root = (options.config_root or Path.home() / ".gemini").expanduser()
+        home = gemini_root.parent.resolve()
+        platform_root = self._platform_config(home)
+        source_candidate = (
+            platform_root / "integrations/gemini-extension/echovault"
+        )
+        source = validate_target_root(
+            source_candidate,
+            platform_root,
+            explicit=False,
+        )
+        return source, gemini_root.resolve()
+
+    def _manager(
+        self,
+        argv: list[str],
+        *,
+        cwd: Path,
+        capture_output: bool = True,
+    ):
+        result = self.runner.run(
+            argv,
+            timeout=30.0,
+            capture_output=capture_output,
+            cwd=cwd.resolve(),
+            env=dict(os.environ),
+        )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout).strip()
+            raise RuntimeError(
+                f"Gemini extension manager failed: {detail or result.returncode}"
+            )
+        return result
+
+    @staticmethod
+    def _installed_version(output: str) -> str | None:
+        for line in output.splitlines():
+            match = re.match(r"^\s*echovault\s+(\S+)", line)
+            if match:
+                return match.group(1)
+        return None
+
+    def _setup_native(self, options: IntegrationOptions) -> IntegrationResult:
+        source, _gemini_root = self._native_paths(options)
+        command = str(self._resolve_executable(options.command))
+        assets = render_gemini_assets(
+            memory_command=command,
+            hook_command=shell_join_command(
+                [command, "hook", "gemini", "before-agent"]
+            ),
+            version=GEMINI_ASSET_VERSION,
+        )
+        source_current = False
+        manifest_path = source / MANIFEST_NAME
+        if manifest_path.is_file():
+            manifest = load_manifest(source)
+            source_current = (
+                manifest.integration_id == "gemini-native"
+                and manifest.asset_version == GEMINI_ASSET_VERSION
+                and not verify_managed_content(source, manifest)
+                and all(
+                    (source / relative).is_file()
+                    and (source / relative).read_bytes() == payload
+                    for relative, payload in assets.items()
+                )
+            )
+
+        replace_managed_tree(
+            source,
+            assets,
+            force_managed=options.force_managed,
+            integration_id="gemini-native",
+            asset_version=GEMINI_ASSET_VERSION,
+        )
+        manager_cwd = source.parent
+        self._manager(
+            ["gemini", "extensions", "validate", str(source)],
+            cwd=manager_cwd,
+        )
+        listed = self._manager(
+            ["gemini", "extensions", "list"],
+            cwd=manager_cwd,
+        )
+        installed_version = self._installed_version(listed.stdout)
+        if installed_version is None:
+            self._manager(
+                ["gemini", "extensions", "install", str(source)],
+                cwd=manager_cwd,
+                capture_output=False,
+            )
+            status = "installed"
+        elif installed_version != GEMINI_ASSET_VERSION or not source_current:
+            self._manager(
+                ["gemini", "extensions", "update", "echovault"],
+                cwd=manager_cwd,
+            )
+            status = "updated"
+        else:
+            status = "unchanged"
+        verified = self._manager(
+            ["gemini", "extensions", "list"],
+            cwd=manager_cwd,
+        )
+        if self._installed_version(verified.stdout) != GEMINI_ASSET_VERSION:
+            raise RuntimeError("Gemini extension manager did not activate EchoVault")
+        return IntegrationResult(
+            status=status,
+            message=f"Gemini native extension {status}",
+            paths=(source,),
+        )
 
     def _setup_direct(self, options: IntegrationOptions) -> IntegrationResult:
         config_root, context_path, command = self._direct_paths(options)
