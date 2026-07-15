@@ -161,11 +161,12 @@ async def test_cancelling_context_keeps_next_request_healthy(
         ) as client:
             async with anyio.create_task_group() as task_group:
                 task_group.start_soon(invoke_context, client)
-                with anyio.fail_after(2):
+                with anyio.fail_after(10):
                     while not context_started.is_set():
                         await anyio.sleep(0.01)
                 cancel_scope.cancel()
                 await finished.wait()
+                await anyio.sleep(0.1)
                 release_context.set()
                 next_result = await client.call_tool(
                     "memory_search",

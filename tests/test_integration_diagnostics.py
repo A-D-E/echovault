@@ -156,6 +156,7 @@ def test_cursor_doctor_reports_project_shadowing_global_plugin(
     home.mkdir()
     project.mkdir()
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
     cursor_adapter().setup(project_options(project))
     from tests.integration_helpers import user_options
 
