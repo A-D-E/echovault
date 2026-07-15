@@ -6,10 +6,12 @@ from memory.embeddings.base import EmbeddingProvider
 
 def test_ollama_is_embedding_provider():
     assert issubclass(OllamaEmbedding, EmbeddingProvider)
+    assert OllamaEmbedding.is_remote is False
 
 
 def test_openai_is_embedding_provider():
     assert issubclass(OpenAIEmbedding, EmbeddingProvider)
+    assert OpenAIEmbedding.is_remote is True
 
 
 def test_ollama_default_config():

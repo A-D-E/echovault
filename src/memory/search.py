@@ -140,6 +140,7 @@ def tiered_search(
     include_archived: bool = False,
     min_relevance: float = 0.0,
     min_vector_similarity: float = 0.0,
+    embedding_query: str | None = None,
 ) -> list[dict]:
     """FTS-first tiered search that only calls embed when FTS results are sparse.
 
@@ -192,7 +193,9 @@ def tiered_search(
 
     # FTS results are sparse — fall back to hybrid (embed + vector search + merge)
     try:
-        query_vec = embedding_provider.embed(query)
+        query_vec = embedding_provider.embed(
+            query if embedding_query is None else embedding_query
+        )
         vec_results = db.vector_search(
             query_vec,
             limit=limit * 2,
@@ -245,6 +248,7 @@ def hybrid_search(
     include_archived: bool = False,
     min_relevance: float = 0.0,
     min_vector_similarity: float = 0.0,
+    embedding_query: str | None = None,
 ) -> list[dict]:
     """Run FTS5 and optionally vector search, merge results.
 
@@ -277,7 +281,9 @@ def hybrid_search(
                 r["score"] = r["score"] / max_score if max_score > 0 else 0.0
         return [r for r in adjust_result_scores(fts_results, query) if r["score"] >= min_relevance][:limit]
 
-    query_vec = embedding_provider.embed(query)
+    query_vec = embedding_provider.embed(
+        query if embedding_query is None else embedding_query
+    )
     vec_results = db.vector_search(
         query_vec,
         limit=limit * 2,

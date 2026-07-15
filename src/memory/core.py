@@ -267,6 +267,8 @@ class MemoryService:
         use_vectors: bool = True,
         include_archived: bool = False,
         record_feedback: bool = True,
+        *,
+        embedding_query: str | None = None,
     ) -> list[dict]:
         """Search memories using hybrid FTS + vector search.
 
@@ -300,9 +302,23 @@ class MemoryService:
         # Use tiered search: FTS first, embed only if sparse results
         if self.vectors_available:
             try:
+                provider: EmbeddingProvider | None = self.embedding_provider
+                effective_embedding_query = embedding_query
+                if provider.is_remote:
+                    if not self.config.context.allow_remote_query_embeddings:
+                        provider = None
+                    else:
+                        effective_embedding_query = redact(
+                            (
+                                query
+                                if effective_embedding_query is None
+                                else effective_embedding_query
+                            ),
+                            self.ignore_patterns,
+                        )
                 results = tiered_search(
                     self.db,
-                    self.embedding_provider,
+                    provider,
                     query,
                     limit=limit,
                     project=project,
@@ -310,6 +326,7 @@ class MemoryService:
                     include_archived=include_archived,
                     min_relevance=self.config.context.min_relevance,
                     min_vector_similarity=self.config.context.min_vector_similarity,
+                    embedding_query=effective_embedding_query,
                 )
                 if record_feedback:
                     self.db.record_feedback([r["id"] for r in results])
@@ -362,6 +379,7 @@ class MemoryService:
         topup_recent: Optional[bool] = None,
         agent: Optional[str] = None,
         token_budget: Optional[int] = None,
+        record_feedback: bool = True,
     ) -> tuple[list[dict], int]:
         """Get memory pointers for context injection.
 
@@ -399,6 +417,7 @@ class MemoryService:
                 source=source,
                 use_vectors=use_vectors,
                 include_archived=False,
+                record_feedback=False,
             )
             if topup_recent and len(results) < limit:
                 # Fill unused space with operationally useful living memory before
@@ -450,7 +469,8 @@ class MemoryService:
             used += estimated
             if len(packed) >= limit:
                 break
-        self.db.record_feedback([r["id"] for r in packed])
+        if record_feedback:
+            self.db.record_feedback([r["id"] for r in packed])
         return packed, total
 
     def context_policy(self, agent: Optional[str] = None) -> dict[str, object]:

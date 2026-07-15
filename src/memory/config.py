@@ -22,6 +22,7 @@ class ContextConfig:
     min_relevance: float = 0.7
     min_vector_similarity: float = 0.05
     agent_modes: dict[str, str] = field(default_factory=dict)
+    allow_remote_query_embeddings: bool = False
 
 
 @dataclass
@@ -138,6 +139,9 @@ def load_config(path: str) -> MemoryConfig:
             min_relevance=float(cx.get("min_relevance", 0.7)),
             min_vector_similarity=float(cx.get("min_vector_similarity", 0.05)),
             agent_modes=dict(cx.get("agent_modes", {}) or {}),
+            allow_remote_query_embeddings=(
+                cx.get("allow_remote_query_embeddings", False) is True
+            ),
         )
     return config
 

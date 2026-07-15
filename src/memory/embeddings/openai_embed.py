@@ -3,6 +3,8 @@ from memory.embeddings.base import EmbeddingProvider
 
 
 class OpenAIEmbedding(EmbeddingProvider):
+    is_remote = True
+
     def __init__(
         self,
         model: str = "text-embedding-3-small",

@@ -13,6 +13,41 @@ from difflib import SequenceMatcher
 from pathlib import Path
 
 
+def _query_privacy_report(
+    memory_home: Path,
+    config: object | None = None,
+) -> dict[str, object]:
+    if config is None:
+        from memory.config import load_config
+
+        try:
+            config = load_config(str(memory_home / "config.yaml"))
+        except Exception:
+            config = None
+
+    embedding = getattr(config, "embedding", None)
+    context = getattr(config, "context", None)
+    provider_scope = (
+        "remote"
+        if getattr(embedding, "provider", None) == "openai"
+        else "local"
+    )
+    allowed = bool(
+        getattr(context, "allow_remote_query_embeddings", False)
+    )
+    if provider_scope == "local":
+        effective = "local"
+    elif allowed:
+        effective = "remote_redacted"
+    else:
+        effective = "fts_only"
+    return {
+        "provider_scope": provider_scope,
+        "allow_remote_query_embeddings": allowed,
+        "automatic_query_embedding": effective,
+    }
+
+
 def _vault_metadata_diagnostics(
     memory_home: Path,
     project: str | None,
@@ -182,6 +217,7 @@ def _empty_doctor_report(
         "broken_absolute_related_files": 0,
         "vectors": {"available": False, "rows": 0, "missing": 0},
         "embedding_dimension": None,
+        "query_privacy": _query_privacy_report(memory_home),
         "lifecycle_counts": {
             key: 0
             for key in (
@@ -286,6 +322,10 @@ def doctor(service, project: str | None = None) -> dict:
         "broken_absolute_related_files": broken_related,
         "vectors": {"available": db.has_vec_table(), "rows": vector_rows, "missing": max(0, len(memories) - vector_rows)},
         "embedding_dimension": db.get_embedding_dim(),
+        "query_privacy": _query_privacy_report(
+            Path(service.memory_home),
+            getattr(service, "config", None),
+        ),
         "lifecycle_counts": {key: len(value) for key, value in lifecycle.items()},
         "operation_journals": operation_journals,
         "vault_metadata": vault_metadata,
