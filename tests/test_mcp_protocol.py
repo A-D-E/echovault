@@ -14,6 +14,7 @@ from memory.mcp_authority import (
     MCPServerBinding,
 )
 from memory.mcp_server import project_safe_dispatch
+from memory.models import RawMemoryInput
 from memory.projects import (
     MultiRootError,
     ProjectRegistry,
@@ -24,6 +25,7 @@ from memory.projects import (
 from tests.mcp_helpers import (
     assert_public_payload,
     decode_object,
+    decode_rows,
     make_workspace,
     open_test_client,
     result_text,
@@ -57,6 +59,221 @@ async def test_unbound_protocol_does_not_request_client_roots(
             )
             assert result.isError is False
         assert calls == 0
+    finally:
+        service.close()
+
+
+@pytest.mark.anyio
+async def test_bound_server_rejects_source_agent_and_project_spoof(
+    tmp_path: Path,
+) -> None:
+    root = make_workspace(tmp_path / "repo")
+    memory_home = tmp_path / "memory-home"
+    service = MemoryService(str(memory_home))
+    try:
+        async with open_test_client(
+            service,
+            MCPServerBinding("cursor", root, root),
+            ProjectRegistry(memory_home),
+        ) as client:
+            for tool, arguments, expected, low_level in (
+                (
+                    "memory_context",
+                    {"query": "x", "agent": "gemini-cli"},
+                    AUTHORITY_ERROR,
+                    "Conflicting agent",
+                ),
+                (
+                    "memory_save",
+                    {
+                        "title": "x",
+                        "what": "x",
+                        "source": "gemini-cli",
+                        "idempotency_key": str(uuid.uuid4()),
+                    },
+                    AUTHORITY_ERROR,
+                    "Conflicting source",
+                ),
+                (
+                    "memory_search",
+                    {"query": "x", "project": "other"},
+                    PROJECT_ERROR,
+                    "outside the resolved scope",
+                ),
+            ):
+                result = await client.call_tool(tool, arguments)
+                assert result.isError is True
+                assert result_text(result) == expected
+                assert low_level not in result_text(result)
+                assert str(root) not in result_text(result)
+                assert str(memory_home) not in result_text(result)
+    finally:
+        service.close()
+
+
+@pytest.mark.anyio
+async def test_bound_details_hides_other_project_without_feedback(
+    tmp_path: Path,
+) -> None:
+    root = make_workspace(tmp_path / "repo")
+    memory_home = tmp_path / "memory-home"
+    service = MemoryService(str(memory_home))
+    seeded = service.save(
+        RawMemoryInput(
+            title="Private",
+            what="other project",
+            details="secret",
+        ),
+        project="other--111111111111",
+    )
+    before = service.get_memory_record(str(seeded["id"]))[
+        "details_opened_count"
+    ]
+    try:
+        async with open_test_client(
+            service,
+            MCPServerBinding("cursor", root, root),
+            ProjectRegistry(memory_home),
+        ) as client:
+            result = await client.call_tool(
+                "memory_details",
+                {"memory_id": str(seeded["id"])},
+            )
+            assert decode_object(result) == {"status": "not_found"}
+        after = service.get_memory_record(str(seeded["id"]))[
+            "details_opened_count"
+        ]
+        assert after == before
+    finally:
+        service.close()
+
+
+@pytest.mark.anyio
+async def test_reads_use_aliases_but_save_writes_only_hashed_key(
+    tmp_path: Path,
+) -> None:
+    root = make_workspace(tmp_path / "repo")
+    memory_home = tmp_path / "memory-home"
+    service = MemoryService(str(memory_home))
+    registry = ProjectRegistry(memory_home)
+    identity = build_project_identity(*discover_project_root(root))
+    registry.register(identity)
+    registry.adopt_legacy("legacy-repo", identity)
+    legacy = service.save(
+        RawMemoryInput(title="Legacy marker", what="ALIAS-READ-42"),
+        project="legacy-repo",
+    )
+    try:
+        async with open_test_client(
+            service,
+            MCPServerBinding("cursor", root, root),
+            registry,
+        ) as client:
+            found = decode_rows(
+                await client.call_tool(
+                    "memory_search",
+                    {"query": "ALIAS-READ-42", "project": "legacy-repo"},
+                )
+            )
+            assert str(legacy["id"]) in {
+                str(row["id"]) for row in found
+            }
+            saved = decode_object(
+                await client.call_tool(
+                    "memory_save",
+                    {
+                        "title": "Canonical marker",
+                        "what": "HASHED-WRITE-42",
+                        "project": "legacy-repo",
+                        "idempotency_key": str(uuid.uuid4()),
+                    },
+                )
+            )
+        assert service.get_memory_record(str(saved["id"]))[
+            "project"
+        ] == identity.key
+    finally:
+        service.close()
+
+
+@pytest.mark.anyio
+async def test_cursor_save_is_retrievable_by_gemini(tmp_path: Path) -> None:
+    root = make_workspace(tmp_path / "repo")
+    memory_home = tmp_path / "memory-home"
+    service = MemoryService(str(memory_home))
+    registry = ProjectRegistry(memory_home)
+    try:
+        async with open_test_client(
+            service,
+            MCPServerBinding("cursor", root, root),
+            registry,
+        ) as cursor_client:
+            async with open_test_client(
+                service,
+                MCPServerBinding("gemini-cli", root, root),
+                registry,
+            ) as gemini_client:
+                saved = decode_object(
+                    await cursor_client.call_tool(
+                        "memory_save",
+                        {
+                            "title": "Cross agent",
+                            "what": "shared marker",
+                            "idempotency_key": str(uuid.uuid4()),
+                        },
+                    )
+                )
+                found = decode_rows(
+                    await gemini_client.call_tool(
+                        "memory_search",
+                        {"query": "Cross agent"},
+                    )
+                )
+                assert saved["id"] in {row["id"] for row in found}
+    finally:
+        service.close()
+
+
+@pytest.mark.anyio
+async def test_bound_tool_results_never_expose_local_paths(
+    tmp_path: Path,
+) -> None:
+    root = make_workspace(tmp_path / "repo")
+    memory_home = tmp_path / "memory-home"
+    service = MemoryService(str(memory_home))
+    try:
+        async with open_test_client(
+            service,
+            MCPServerBinding("cursor", root, root),
+            ProjectRegistry(memory_home),
+        ) as client:
+            save_result = await client.call_tool(
+                "memory_save",
+                {
+                    "title": "Public payload marker",
+                    "what": "PUBLIC-PAYLOAD-42",
+                    "details": "full body",
+                    "idempotency_key": str(uuid.uuid4()),
+                },
+            )
+            saved = decode_object(save_result)
+            results = (
+                save_result,
+                await client.call_tool(
+                    "memory_context",
+                    {"query": "PUBLIC-PAYLOAD-42"},
+                ),
+                await client.call_tool(
+                    "memory_search",
+                    {"query": "PUBLIC-PAYLOAD-42"},
+                ),
+                await client.call_tool(
+                    "memory_details",
+                    {"memory_id": saved["id"]},
+                ),
+            )
+            for result in results:
+                assert_public_payload(result, root, memory_home)
     finally:
         service.close()
 

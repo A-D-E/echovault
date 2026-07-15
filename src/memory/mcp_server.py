@@ -8,6 +8,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+from uuid import UUID
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
@@ -19,6 +20,7 @@ from memory.mcp_authority import (
     MCPServerBinding,
     file_uri_to_path,
     public_project_error,
+    resolve_bound_identity,
     resolve_project_scope,
 )
 from memory.models import RawMemoryInput
@@ -93,6 +95,8 @@ def handle_memory_save(
     branch: Optional[str] = None,
     links: Optional[list[str]] = None,
     last_verified: Optional[str] = None,
+    authoritative_source: Optional[str] = None,
+    idempotency_key: Optional[str] = None,
 ) -> str:
     """Handle memory_save tool call. Returns JSON string."""
     project = project or os.path.basename(os.getcwd())
@@ -118,7 +122,12 @@ def handle_memory_save(
         last_verified=last_verified,
     )
 
-    result = service.save(raw, project=project)
+    result = service.save(
+        raw,
+        project=project,
+        authoritative_source=authoritative_source,
+        idempotency_key=idempotency_key,
+    )
     return json.dumps(result)
 
 
@@ -126,7 +135,7 @@ def handle_memory_search(
     service: MemoryService,
     query: str,
     limit: int = 5,
-    project: Optional[str] = None,
+    project: ProjectScope | str | None = None,
 ) -> str:
     """Handle memory_search tool call. Returns JSON string."""
     results = service.search(query, limit=limit, project=project)
@@ -162,7 +171,7 @@ def handle_memory_search(
 
 def handle_memory_context(
     service: MemoryService,
-    project: Optional[str] = None,
+    project: ProjectScope | str | None = None,
     limit: int = 10,
     query: Optional[str] = None,
     agent: Optional[str] = None,
@@ -450,6 +459,156 @@ def make_legacy_scoped_dispatch(service: MemoryService) -> ScopedDispatch:
     return dispatch
 
 
+def read_project(scope: ResolvedScope) -> ProjectScope | str:
+    if scope is None:
+        return os.path.basename(os.getcwd())
+    return scope
+
+
+def write_project(scope: ResolvedScope) -> str:
+    if isinstance(scope, ProjectScope):
+        return scope.identity.key
+    if scope is None:
+        return os.path.basename(os.getcwd())
+    return scope
+
+
+def handle_memory_details(
+    service: MemoryService,
+    memory_id: str,
+    *,
+    scope: ResolvedScope,
+) -> str:
+    detail = service.get_details(
+        memory_id,
+        project=read_project(scope),
+    )
+    if detail is None:
+        return json.dumps({"status": "not_found"})
+    return json.dumps(
+        {
+            "status": "ok",
+            "memory_id": detail.memory_id,
+            "body": detail.body,
+        }
+    )
+
+
+def make_bound_scoped_dispatch(
+    service: MemoryService,
+    binding: MCPServerBinding,
+) -> ScopedDispatch:
+    """Create the authoritative four-tool callback for a bound server."""
+    async def dispatch(
+        name: str,
+        arguments: Mapping[str, object],
+        scope: ResolvedScope,
+    ) -> CallToolResult:
+        if not isinstance(scope, ProjectScope):
+            raise ProjectResolutionError(
+                "Bound dispatch requires a canonical scope"
+            )
+
+        call_arguments = dict(arguments)
+        call_arguments.pop("cwd", None)
+        call_arguments.pop("project", None)
+
+        if name == "memory_context":
+            requested_agent = call_arguments.pop("agent", None)
+            if requested_agent is not None and not isinstance(
+                requested_agent,
+                str,
+            ):
+                raise AuthorityConflict(
+                    "authority",
+                    "agent must be a string",
+                )
+            agent = resolve_bound_identity(
+                binding.agent,
+                requested_agent,
+                field_name="agent",
+            )
+            return success_text(
+                handle_memory_context(
+                    service,
+                    project=read_project(scope),
+                    agent=agent,
+                    **call_arguments,
+                )
+            )
+
+        if name == "memory_search":
+            return success_text(
+                handle_memory_search(
+                    service,
+                    project=read_project(scope),
+                    **call_arguments,
+                )
+            )
+
+        if name == "memory_details":
+            memory_id = call_arguments.get("memory_id")
+            if not isinstance(memory_id, str) or not memory_id:
+                raise AuthorityConflict(
+                    "authority",
+                    "memory_id must be non-empty",
+                )
+            return success_text(
+                handle_memory_details(
+                    service,
+                    memory_id,
+                    scope=scope,
+                )
+            )
+
+        if name == "memory_save":
+            requested_source = call_arguments.pop("source", None)
+            if requested_source is not None and not isinstance(
+                requested_source,
+                str,
+            ):
+                raise AuthorityConflict(
+                    "authority",
+                    "source must be a string",
+                )
+            source = resolve_bound_identity(
+                binding.agent,
+                requested_source,
+                field_name="source",
+            )
+            operation_id = call_arguments.pop("idempotency_key", None)
+            if binding.agent is not None:
+                if not isinstance(operation_id, str):
+                    raise AuthorityConflict(
+                        "authority",
+                        "idempotency key is required",
+                    )
+                try:
+                    UUID(operation_id)
+                except ValueError as error:
+                    raise AuthorityConflict(
+                        "authority",
+                        "idempotency key is not a UUID",
+                    ) from error
+            return success_text(
+                handle_memory_save(
+                    service,
+                    project=write_project(scope),
+                    authoritative_source=source,
+                    idempotency_key=(
+                        operation_id
+                        if isinstance(operation_id, str)
+                        else None
+                    ),
+                    **call_arguments,
+                )
+            )
+
+        return tool_error("Unknown EchoVault tool")
+
+    return dispatch
+
+
 async def resolve_call_scope(
     server: Server,
     binding: MCPServerBinding,
@@ -539,7 +698,11 @@ def configure_task4_dispatch(
     registry: ProjectRegistry,
     scoped_dispatch: ScopedDispatch | None,
 ) -> None:
-    selected_dispatch = scoped_dispatch or make_legacy_scoped_dispatch(service)
+    selected_dispatch = scoped_dispatch or (
+        make_bound_scoped_dispatch(service, binding)
+        if binding.is_bound
+        else make_legacy_scoped_dispatch(service)
+    )
     install_scoped_call_handler(
         server,
         binding,
