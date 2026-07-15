@@ -7,9 +7,109 @@ These tests verify that all components work together correctly:
 """
 
 import os
+from pathlib import Path
+import uuid
+
+import anyio
+from mcp.types import CallToolResult
+import pytest
 
 from memory.core import MemoryService
 from memory.models import RawMemoryInput
+from tests.mcp_helpers import (
+    call_and_store,
+    decode_object,
+    decode_rows,
+    make_workspace,
+    open_stdio_client,
+)
+
+
+@pytest.mark.anyio
+async def test_two_stdio_agents_save_concurrently_and_share_only_one_project(
+    tmp_path: Path,
+) -> None:
+    root = make_workspace(tmp_path / "shared")
+    other_root = make_workspace(tmp_path / "isolated")
+    memory_home = tmp_path / "memory-home"
+    results: dict[str, CallToolResult] = {}
+
+    async with open_stdio_client(
+        memory_home,
+        "cursor",
+        root,
+    ) as (cursor, cursor_stderr):
+        async with open_stdio_client(
+            memory_home,
+            "gemini-cli",
+            root,
+        ) as (gemini, gemini_stderr):
+            async with open_stdio_client(
+                memory_home,
+                "cursor",
+                other_root,
+            ) as (isolated, isolated_stderr):
+                async with anyio.create_task_group() as task_group:
+                    task_group.start_soon(
+                        call_and_store,
+                        results,
+                        "cursor",
+                        cursor,
+                        "memory_save",
+                        {
+                            "title": "CURSOR-CONCURRENT-42",
+                            "what": "cursor marker",
+                            "idempotency_key": str(uuid.uuid4()),
+                        },
+                    )
+                    task_group.start_soon(
+                        call_and_store,
+                        results,
+                        "gemini",
+                        gemini,
+                        "memory_save",
+                        {
+                            "title": "GEMINI-CONCURRENT-42",
+                            "what": "gemini marker",
+                            "idempotency_key": str(uuid.uuid4()),
+                        },
+                    )
+
+                cursor_saved = decode_object(results["cursor"])
+                gemini_saved = decode_object(results["gemini"])
+                cursor_found = decode_rows(
+                    await cursor.call_tool(
+                        "memory_search",
+                        {"query": "GEMINI-CONCURRENT-42"},
+                    )
+                )
+                gemini_found = decode_rows(
+                    await gemini.call_tool(
+                        "memory_search",
+                        {"query": "CURSOR-CONCURRENT-42"},
+                    )
+                )
+                isolated_found = decode_rows(
+                    await isolated.call_tool(
+                        "memory_search",
+                        {"query": "CONCURRENT-42"},
+                    )
+                )
+
+                assert gemini_saved["id"] in {
+                    row["id"] for row in cursor_found
+                }
+                assert cursor_saved["id"] in {
+                    row["id"] for row in gemini_found
+                }
+                assert isolated_found == []
+                for stderr in (
+                    cursor_stderr,
+                    gemini_stderr,
+                    isolated_stderr,
+                ):
+                    assert "CURSOR-CONCURRENT-42" not in stderr.getvalue()
+                    assert "GEMINI-CONCURRENT-42" not in stderr.getvalue()
 
 
 def test_full_save_search_details_flow(env_home):

@@ -7,9 +7,10 @@ import os
 from collections.abc import Awaitable, Callable, Mapping
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Optional, TypeVar
 from uuid import UUID
 
+import anyio
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import CallToolResult, TextContent, Tool
@@ -38,6 +39,7 @@ ScopedDispatch = Callable[
     [str, Mapping[str, object], ResolvedScope],
     Awaitable[CallToolResult],
 ]
+T = TypeVar("T")
 
 VALID_CATEGORIES = (
     "decision", "bug", "pattern", "learning", "context", "playbook",
@@ -136,9 +138,15 @@ def handle_memory_search(
     query: str,
     limit: int = 5,
     project: ProjectScope | str | None = None,
+    record_feedback: bool = True,
 ) -> str:
     """Handle memory_search tool call. Returns JSON string."""
-    results = service.search(query, limit=limit, project=project)
+    results = service.search(
+        query,
+        limit=limit,
+        project=project,
+        record_feedback=record_feedback,
+    )
 
     clean = []
     for r in results:
@@ -176,6 +184,7 @@ def handle_memory_context(
     query: Optional[str] = None,
     agent: Optional[str] = None,
     token_budget: Optional[int] = None,
+    record_feedback: bool = True,
 ) -> str:
     """Handle memory_context tool call. Returns JSON string."""
     project = project or os.path.basename(os.getcwd())
@@ -189,6 +198,7 @@ def handle_memory_context(
         query=query,
         agent=agent,
         token_budget=token_budget,
+        record_feedback=record_feedback,
     )
 
     memories = []
@@ -478,10 +488,12 @@ def handle_memory_details(
     memory_id: str,
     *,
     scope: ResolvedScope,
+    record_feedback: bool = True,
 ) -> str:
     detail = service.get_details(
         memory_id,
         project=read_project(scope),
+        record_feedback=record_feedback,
     )
     if detail is None:
         return json.dumps({"status": "not_found"})
@@ -494,11 +506,72 @@ def handle_memory_details(
     )
 
 
+async def run_with_service(
+    service_factory: Callable[[], MemoryService],
+    call: Callable[[MemoryService], T],
+    *,
+    abandon_on_cancel: bool,
+) -> T:
+    def invoke() -> T:
+        service = service_factory()
+        try:
+            return call(service)
+        finally:
+            service.close()
+
+    return await anyio.to_thread.run_sync(
+        invoke,
+        abandon_on_cancel=abandon_on_cancel,
+    )
+
+
+async def run_read(
+    service_factory: Callable[[], MemoryService],
+    call: Callable[[MemoryService], T],
+) -> T:
+    return await run_with_service(
+        service_factory,
+        call,
+        abandon_on_cancel=True,
+    )
+
+
+async def run_save(
+    service_factory: Callable[[], MemoryService],
+    call: Callable[[MemoryService], dict[str, object]],
+) -> dict[str, object]:
+    return await run_with_service(
+        service_factory,
+        call,
+        abandon_on_cancel=False,
+    )
+
+
+async def _record_feedback(
+    service_factory: Callable[[], MemoryService],
+    memory_ids: list[str],
+    event: str = "retrieved",
+) -> None:
+    if not memory_ids:
+        return
+    await run_with_service(
+        service_factory,
+        lambda service: service.db.record_feedback(memory_ids, event),
+        abandon_on_cancel=False,
+    )
+
+
 def make_bound_scoped_dispatch(
     service: MemoryService,
     binding: MCPServerBinding,
+    *,
+    service_factory: Callable[[], MemoryService] | None = None,
 ) -> ScopedDispatch:
     """Create the authoritative four-tool callback for a bound server."""
+    selected_factory = service_factory or (
+        lambda: MemoryService(str(service.memory_home))
+    )
+
     async def dispatch(
         name: str,
         arguments: Mapping[str, object],
@@ -528,23 +601,43 @@ def make_bound_scoped_dispatch(
                 requested_agent,
                 field_name="agent",
             )
-            return success_text(
-                handle_memory_context(
-                    service,
+            text = await run_read(
+                selected_factory,
+                lambda worker: handle_memory_context(
+                    worker,
                     project=read_project(scope),
                     agent=agent,
+                    record_feedback=False,
                     **call_arguments,
-                )
+                ),
             )
+            payload = json.loads(text)
+            memory_ids = [
+                str(item["id"])
+                for item in payload.get("memories", [])
+                if isinstance(item, dict) and isinstance(item.get("id"), str)
+            ] if isinstance(payload, dict) else []
+            await _record_feedback(selected_factory, memory_ids)
+            return success_text(text)
 
         if name == "memory_search":
-            return success_text(
-                handle_memory_search(
-                    service,
+            text = await run_read(
+                selected_factory,
+                lambda worker: handle_memory_search(
+                    worker,
                     project=read_project(scope),
+                    record_feedback=False,
                     **call_arguments,
-                )
+                ),
             )
+            payload = json.loads(text)
+            memory_ids = [
+                str(item["id"])
+                for item in payload
+                if isinstance(item, dict) and isinstance(item.get("id"), str)
+            ] if isinstance(payload, list) else []
+            await _record_feedback(selected_factory, memory_ids)
+            return success_text(text)
 
         if name == "memory_details":
             memory_id = call_arguments.get("memory_id")
@@ -553,13 +646,31 @@ def make_bound_scoped_dispatch(
                     "authority",
                     "memory_id must be non-empty",
                 )
-            return success_text(
-                handle_memory_details(
-                    service,
+            text = await run_read(
+                selected_factory,
+                lambda worker: handle_memory_details(
+                    worker,
                     memory_id,
                     scope=scope,
-                )
+                    record_feedback=False,
+                ),
             )
+            payload = json.loads(text)
+            detail_ids = (
+                [str(payload["memory_id"])]
+                if (
+                    isinstance(payload, dict)
+                    and payload.get("status") == "ok"
+                    and isinstance(payload.get("memory_id"), str)
+                )
+                else []
+            )
+            await _record_feedback(
+                selected_factory,
+                detail_ids,
+                "details_opened",
+            )
+            return success_text(text)
 
         if name == "memory_save":
             requested_source = call_arguments.pop("source", None)
@@ -590,19 +701,23 @@ def make_bound_scoped_dispatch(
                         "authority",
                         "idempotency key is not a UUID",
                     ) from error
-            return success_text(
-                handle_memory_save(
-                    service,
-                    project=write_project(scope),
-                    authoritative_source=source,
-                    idempotency_key=(
-                        operation_id
-                        if isinstance(operation_id, str)
-                        else None
-                    ),
-                    **call_arguments,
-                )
+            result = await run_save(
+                selected_factory,
+                lambda worker: json.loads(
+                    handle_memory_save(
+                        worker,
+                        project=write_project(scope),
+                        authoritative_source=source,
+                        idempotency_key=(
+                            operation_id
+                            if isinstance(operation_id, str)
+                            else None
+                        ),
+                        **call_arguments,
+                    )
+                ),
             )
+            return success_text(json.dumps(result))
 
         return tool_error("Unknown EchoVault tool")
 
@@ -697,9 +812,14 @@ def configure_task4_dispatch(
     binding: MCPServerBinding,
     registry: ProjectRegistry,
     scoped_dispatch: ScopedDispatch | None,
+    worker_service_factory: Callable[[], MemoryService],
 ) -> None:
     selected_dispatch = scoped_dispatch or (
-        make_bound_scoped_dispatch(service, binding)
+        make_bound_scoped_dispatch(
+            service,
+            binding,
+            service_factory=worker_service_factory,
+        )
         if binding.is_bound
         else make_legacy_scoped_dispatch(service)
     )
@@ -722,7 +842,9 @@ def _create_server(
     """Create and configure the MCP server with memory tools."""
     binding = binding or MCPServerBinding(None, None, Path.cwd())
     registry = registry or ProjectRegistry(Path(service.memory_home))
-    _ = worker_service_factory
+    selected_worker_factory = worker_service_factory or (
+        lambda: MemoryService(str(service.memory_home))
+    )
     server = Server("echovault")
 
     @server.list_tools()
@@ -740,6 +862,7 @@ def _create_server(
         binding,
         registry,
         scoped_dispatch,
+        selected_worker_factory,
     )
 
     return server
@@ -760,7 +883,16 @@ async def run_server(
             startup_cwd or Path.cwd(),
         )
         registry = ProjectRegistry(Path(service.memory_home))
-        server = _create_server(service, binding, registry)
+
+        def worker_service_factory() -> MemoryService:
+            return MemoryService(str(service.memory_home))
+
+        server = _create_server(
+            service,
+            binding,
+            registry,
+            worker_service_factory=worker_service_factory,
+        )
         async with stdio_server() as (read_stream, write_stream):
             await server.run(read_stream, write_stream, server.create_initialization_options())
     finally:

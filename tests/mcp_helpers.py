@@ -2,11 +2,11 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator, Awaitable, Callable, MutableMapping
 from contextlib import asynccontextmanager
-from io import StringIO
 import json
 import os
 from pathlib import Path
 import sys
+import tempfile
 from typing import Any
 import uuid
 
@@ -24,6 +24,25 @@ from memory.projects import ProjectRegistry
 
 RootsCallback = Callable[[Any], Awaitable[ListRootsResult]]
 ServiceFactory = Callable[[], MemoryService]
+
+
+class StderrCapture:
+    def __init__(self) -> None:
+        self._file = tempfile.TemporaryFile(mode="w+", encoding="utf-8")
+
+    def fileno(self) -> int:
+        return self._file.fileno()
+
+    def getvalue(self) -> str:
+        self._file.flush()
+        position = self._file.tell()
+        self._file.seek(0)
+        value = self._file.read()
+        self._file.seek(position)
+        return value
+
+    def close(self) -> None:
+        self._file.close()
 
 
 @asynccontextmanager
@@ -129,7 +148,7 @@ async def open_stdio_client(
     memory_home: Path,
     agent: str,
     project_root: Path,
-) -> AsyncIterator[tuple[ClientSession, StringIO]]:
+) -> AsyncIterator[tuple[ClientSession, StderrCapture]]:
     environment = dict(os.environ)
     environment["MEMORY_HOME"] = str(memory_home)
     parameters = StdioServerParameters(
@@ -146,11 +165,14 @@ async def open_stdio_client(
         cwd=project_root,
         env=environment,
     )
-    stderr = StringIO()
-    async with stdio_client(parameters, errlog=stderr) as streams:
-        async with ClientSession(*streams) as client:
-            await client.initialize()
-            yield client, stderr
+    stderr = StderrCapture()
+    try:
+        async with stdio_client(parameters, errlog=stderr) as streams:
+            async with ClientSession(*streams) as client:
+                await client.initialize()
+                yield client, stderr
+    finally:
+        stderr.close()
 
 
 async def save_with_details(
