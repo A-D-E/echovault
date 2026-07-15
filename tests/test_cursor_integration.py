@@ -1,10 +1,11 @@
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from memory.integrations.asset_io import render_cursor_assets
-from memory.integrations.config_io import ConfigBoundaryError
+from memory.integrations.config_io import ConfigBoundaryError, ConfigMalformedError
 from memory.integrations.ownership import OwnershipConflict
 from memory.integrations.registry import get_adapter
 from memory.setup import setup_cursor
@@ -289,3 +290,200 @@ def test_user_setup_rejects_non_executable_command_without_mutation(
     with pytest.raises(ValueError, match="executable"):
         cursor_adapter().setup(user_options(cursor_root, command=str(command)))
     assert snapshot_tree(cursor_root) == {}
+
+
+def seed_cursor_state(tmp_path: Path, state: str):
+    project = tmp_path / state
+    project.mkdir()
+    adapter = cursor_adapter()
+    options = project_options(project)
+    cursor = project / ".cursor"
+    if state == "none":
+        return adapter, options
+    if state == "legacy_exact":
+        cursor.mkdir()
+        (cursor / "mcp.json").write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "echovault": {
+                            "command": "memory",
+                            "args": ["mcp"],
+                            "type": "stdio",
+                        }
+                    }
+                }
+            )
+        )
+        return adapter, options
+    if state == "custom_same_name":
+        cursor.mkdir()
+        (cursor / "mcp.json").write_text(
+            json.dumps(
+                {"mcpServers": {"echovault": {"command": "user-memory"}}}
+            )
+        )
+        return adapter, options
+    if state == "malformed":
+        cursor.mkdir()
+        (cursor / "mcp.json").write_text('{"mcpServers":')
+        return adapter, options
+    adapter.setup(options)
+    if state == "older_owned":
+        manifest_path = cursor / ".echovault-managed.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["asset_version"] = "0.5.0"
+        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+    elif state == "modified_owned":
+        (cursor / "rules" / "echovault.mdc").write_text("user edit\n")
+    elif state != "current_owned":
+        raise AssertionError(f"unknown fixture state: {state}")
+    return adapter, options
+
+
+def run_cursor_matrix_case(tmp_path: Path, state: str, force: bool) -> str:
+    adapter, options = seed_cursor_state(tmp_path, state)
+    try:
+        return adapter.setup(replace(options, force_managed=force)).status
+    except OwnershipConflict:
+        return "conflict"
+    except ConfigMalformedError:
+        return "parse_error"
+
+
+@pytest.mark.parametrize(
+    ("state", "force", "expected"),
+    [
+        ("none", False, "installed"),
+        ("legacy_exact", False, "updated"),
+        ("current_owned", False, "unchanged"),
+        ("older_owned", False, "updated"),
+        ("modified_owned", False, "conflict"),
+        ("modified_owned", True, "updated"),
+        ("custom_same_name", False, "conflict"),
+        ("malformed", False, "parse_error"),
+    ],
+)
+def test_cursor_setup_matrix(
+    state: str,
+    force: bool,
+    expected: str,
+    tmp_path: Path,
+) -> None:
+    assert run_cursor_matrix_case(tmp_path, state, force) == expected
+
+
+def test_project_uninstall_removes_only_managed_scope_and_preserves_user_plugin(
+    tmp_path: Path,
+    fake_memory: Path,
+) -> None:
+    project = tmp_path / "repo"
+    cursor_root = tmp_path / ".cursor"
+    project.mkdir()
+    adapter = cursor_adapter()
+    project_config = project / ".cursor"
+    (project_config / "unrelated").mkdir(parents=True)
+    (project_config / "unrelated/mine.txt").write_text("mine")
+    adapter.setup(project_options(project))
+    adapter.setup(user_options(cursor_root, command=str(fake_memory)))
+    user_before = snapshot_tree(cursor_root)
+    result = adapter.uninstall(project_options(project))
+    assert result.status == "removed"
+    assert snapshot_tree(cursor_root) == user_before
+    assert (project_config / "unrelated/mine.txt").read_text() == "mine"
+    assert not (project_config / "rules/echovault.mdc").exists()
+    assert "echovault" not in json.loads(
+        (project_config / "mcp.json").read_text()
+    ).get("mcpServers", {})
+
+
+def test_user_uninstall_removes_only_plugin_and_preserves_project(
+    tmp_path: Path,
+    fake_memory: Path,
+) -> None:
+    project = tmp_path / "repo"
+    cursor_root = tmp_path / ".cursor"
+    project.mkdir()
+    adapter = cursor_adapter()
+    adapter.setup(project_options(project))
+    project_before = snapshot_tree(project / ".cursor")
+    adapter.setup(user_options(cursor_root, command=str(fake_memory)))
+    result = adapter.uninstall(
+        user_options(cursor_root, command=str(fake_memory))
+    )
+    assert result.status == "removed"
+    assert snapshot_tree(project / ".cursor") == project_before
+    assert not (cursor_root / "plugins/local/echovault").exists()
+
+
+def test_project_uninstall_modified_owned_requires_force(tmp_path: Path) -> None:
+    project = tmp_path / "repo"
+    project.mkdir()
+    adapter = cursor_adapter()
+    options = project_options(project)
+    adapter.setup(options)
+    rule = project / ".cursor/rules/echovault.mdc"
+    rule.write_text("user edit\n")
+    before = snapshot_tree(project / ".cursor")
+    with pytest.raises(OwnershipConflict):
+        adapter.uninstall(options)
+    assert snapshot_tree(project / ".cursor") == before
+    assert adapter.uninstall(replace(options, force_managed=True)).status == "removed"
+
+
+def test_project_uninstall_never_removes_custom_entry_even_with_force(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "repo"
+    cursor = project / ".cursor"
+    cursor.mkdir(parents=True)
+    (cursor / "mcp.json").write_text(
+        json.dumps({"mcpServers": {"echovault": {"command": "custom"}}})
+    )
+    before = snapshot_tree(cursor)
+    result = cursor_adapter().uninstall(
+        project_options(project, force_managed=True)
+    )
+    assert result.status == "unchanged"
+    assert snapshot_tree(cursor) == before
+
+
+def test_project_uninstall_malformed_config_is_read_only_even_with_force(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "repo"
+    cursor = project / ".cursor"
+    cursor.mkdir(parents=True)
+    (cursor / "mcp.json").write_text('{"mcpServers":')
+    before = snapshot_tree(cursor)
+    with pytest.raises(ConfigMalformedError):
+        cursor_adapter().uninstall(
+            project_options(project, force_managed=True)
+        )
+    assert snapshot_tree(cursor) == before
+
+
+def test_user_uninstall_force_removes_modified_owned_files_but_keeps_unrelated(
+    tmp_path: Path,
+    fake_memory: Path,
+) -> None:
+    cursor_root = tmp_path / ".cursor"
+    adapter = cursor_adapter()
+    options = user_options(cursor_root, command=str(fake_memory))
+    adapter.setup(options)
+    plugin = cursor_root / "plugins/local/echovault"
+    (plugin / "rules/echovault.mdc").write_text("user edit\n")
+    (plugin / "mine.txt").write_text("mine")
+    with pytest.raises(OwnershipConflict):
+        adapter.uninstall(options)
+    result = adapter.uninstall(replace(options, force_managed=True))
+    assert result.status == "removed"
+    assert (plugin / "mine.txt").read_text() == "mine"
+    assert not (plugin / "rules/echovault.mdc").exists()
+
+
+def test_uninstall_without_artifacts_is_unchanged(tmp_path: Path) -> None:
+    project = tmp_path / "repo"
+    project.mkdir()
+    result = cursor_adapter().uninstall(project_options(project))
+    assert result.status == "unchanged"

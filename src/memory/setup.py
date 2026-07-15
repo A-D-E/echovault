@@ -603,35 +603,25 @@ def uninstall_claude_code(claude_home: str, *, project: bool = False) -> dict[st
 
 
 def uninstall_cursor(cursor_home: str) -> dict[str, str]:
-    """Remove EchoVault from Cursor (MCP config + old hooks)."""
-    removed = []
+    """Remove the managed EchoVault local plugin from Cursor."""
+    from memory.integrations.registry import get_adapter
+    from memory.integrations.types import (
+        InstallMode,
+        InstallScope,
+        IntegrationOptions,
+    )
 
-    mcp_path = os.path.join(cursor_home, "mcp.json")
-    if _uninstall_mcp_servers(mcp_path):
-        removed.append("mcpServers")
-
-    # Remove old hooks
-    old_hooks_path = os.path.join(cursor_home, "hooks.json")
-    if os.path.exists(old_hooks_path):
-        old_data = _read_json(old_hooks_path)
-        hooks = old_data.get("hooks", {})
-        for event in list(hooks.keys()):
-            event_hooks = hooks[event]
-            filtered = [h for h in event_hooks if "memory context" not in h.get("command", "")]
-            if len(filtered) != len(event_hooks):
-                removed.append(event)
-                if filtered:
-                    hooks[event] = filtered
-                else:
-                    del hooks[event]
-        _write_json(old_hooks_path, old_data)
-
-    if _uninstall_skill(cursor_home):
-        removed.append("skill")
-
-    if removed:
-        return {"status": "ok", "message": f"Removed: {', '.join(removed)}"}
-    return {"status": "ok", "message": "Nothing to remove"}
+    result = get_adapter("cursor").uninstall(
+        IntegrationOptions(
+            scope=InstallScope.USER,
+            mode=InstallMode.NATIVE,
+            config_root=Path(cursor_home),
+            project_root=None,
+            command=None,
+            config_root_explicit=True,
+        )
+    )
+    return {"status": "ok", "message": result.message}
 
 
 def uninstall_codex(codex_home: str) -> dict[str, str]:

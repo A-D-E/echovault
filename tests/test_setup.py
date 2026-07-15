@@ -437,6 +437,7 @@ class TestUninstall:
         from memory.setup import setup_cursor, uninstall_cursor
         setup_cursor(str(cursor_home))
         uninstall_cursor(str(cursor_home))
+        assert not (cursor_home / "plugins/local/echovault").exists()
         mcp_path = cursor_home / "mcp.json"
         if mcp_path.exists():
             data = json.loads(mcp_path.read_text())

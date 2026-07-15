@@ -5,7 +5,6 @@ import json
 import os
 import shutil
 import stat
-from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +21,7 @@ from memory.integrations.ownership import (
     ManagedArtifact,
     OwnershipConflict,
     OwnershipManifest,
+    artifact_digest,
     load_manifest,
     replace_managed_tree,
     verify_managed_content,
@@ -38,11 +38,11 @@ from memory.integrations.types import (
 from memory.safe_io import ProcessFileLock, prepare_atomic_text
 
 
+CURSOR_ASSET_VERSION = "0.6.0"
+
+
 def _asset_version() -> str:
-    try:
-        return version("echovault")
-    except PackageNotFoundError:  # pragma: no cover - editable installs have metadata
-        return "0.6.0"
+    return CURSOR_ASSET_VERSION
 
 
 def _sha256(payload: bytes) -> str:
@@ -434,10 +434,190 @@ class CursorAdapter:
         )
 
     def uninstall(self, options: IntegrationOptions) -> IntegrationResult:
-        _ = options
+        if options.scope is InstallScope.PROJECT:
+            return self._uninstall_project(options)
+        return self._uninstall_user(options)
+
+    @staticmethod
+    def _remove_empty_parents(path: Path, *, stop: Path) -> None:
+        parent = path.parent
+        while parent != stop and parent.is_dir():
+            try:
+                parent.rmdir()
+            except OSError:
+                return
+            parent = parent.parent
+
+    @staticmethod
+    def _recognized_project_entry(entry: object) -> bool:
+        return entry in (
+            {
+                "command": "memory",
+                "args": ["mcp"],
+                "type": "stdio",
+            },
+            {
+                "command": "memory",
+                "args": ["mcp", "--agent", "cursor"],
+            },
+        )
+
+    def _remove_mcp_entry(
+        self,
+        path: Path,
+        *,
+        expected: object,
+    ) -> None:
+        def remove(data: dict[str, Any]) -> dict[str, Any]:
+            servers = data.get("mcpServers")
+            if not isinstance(servers, dict):
+                raise ConfigMalformedError("mcpServers must be a JSON object")
+            if servers.get("echovault") != expected:
+                raise OwnershipConflict(
+                    "Cursor MCP entry changed during uninstall"
+                )
+            del servers["echovault"]
+            if not servers:
+                del data["mcpServers"]
+            return data
+
+        mutate_json_atomic(path, remove)
+
+    def _uninstall_project(self, options: IntegrationOptions) -> IntegrationResult:
+        _project_root, cursor_root = self._project_root(options)
+        mcp_path = cursor_root / "mcp.json"
+        document = read_json_strict(mcp_path)
+        servers = document.data.get("mcpServers")
+        if servers is None:
+            servers = {}
+        if not isinstance(servers, dict):
+            raise ConfigMalformedError("mcpServers must be a JSON object")
+        current_entry = servers.get("echovault")
+        manifest_path = cursor_root / MANIFEST_NAME
+
+        if not manifest_path.exists():
+            if current_entry is None or not self._recognized_project_entry(
+                current_entry
+            ):
+                return IntegrationResult(
+                    status="unchanged",
+                    message="Cursor project integration is not installed",
+                )
+            self._remove_mcp_entry(mcp_path, expected=current_entry)
+            return IntegrationResult(
+                status="removed",
+                message="Removed legacy Cursor project integration",
+                paths=(mcp_path,),
+            )
+
+        manifest = load_manifest(cursor_root)
+        if manifest.integration_id != "cursor-project":
+            raise OwnershipConflict(
+                "Cursor project manifest belongs to another integration"
+            )
+        json_artifact = next(
+            (
+                artifact
+                for artifact in manifest.managed
+                if artifact.kind == "json-entry"
+                and artifact.path == "mcp.json"
+                and artifact.locator == "/mcpServers/echovault"
+            ),
+            None,
+        )
+        if json_artifact is None:
+            raise OwnershipConflict("Cursor project manifest lacks its MCP claim")
+        if current_entry is not None and artifact_digest(
+            cursor_root,
+            json_artifact,
+        ) != json_artifact.sha256:
+            raise OwnershipConflict(
+                "Custom Cursor MCP content cannot be removed, even with force"
+            )
+        conflicts = verify_managed_content(cursor_root, manifest)
+        if conflicts and not options.force_managed:
+            raise OwnershipConflict("Managed Cursor project content was modified")
+
+        if current_entry is not None:
+            self._remove_mcp_entry(mcp_path, expected=current_entry)
+        removed_paths: list[Path] = []
+        for artifact in manifest.managed:
+            if artifact.kind != "file":
+                continue
+            path = cursor_root.joinpath(*artifact.path.split("/"))
+            path.unlink(missing_ok=True)
+            removed_paths.append(path)
+            self._remove_empty_parents(path, stop=cursor_root)
+        manifest_path.unlink()
+        removed_paths.append(manifest_path)
         return IntegrationResult(
-            status="unchanged",
-            message="Cursor integration is not installed",
+            status="removed",
+            message="Removed Cursor project integration",
+            paths=tuple(removed_paths),
+        )
+
+    def _uninstall_user(self, options: IntegrationOptions) -> IntegrationResult:
+        cursor_root = self._user_root(options)
+        direct_path = cursor_root / "mcp.json"
+        document = read_json_strict(direct_path)
+        servers = document.data.get("mcpServers")
+        if servers is None:
+            servers = {}
+        if not isinstance(servers, dict):
+            raise ConfigMalformedError("mcpServers must be a JSON object")
+        direct_entry = servers.get("echovault")
+        removable_direct = (
+            direct_entry is not None
+            and self._recognized_project_entry(direct_entry)
+        )
+
+        plugin = cursor_root / "plugins" / "local" / "echovault"
+        manifest_path = plugin / MANIFEST_NAME
+        if not manifest_path.exists():
+            if removable_direct:
+                self._remove_mcp_entry(direct_path, expected=direct_entry)
+                return IntegrationResult(
+                    status="removed",
+                    message="Removed legacy Cursor user integration",
+                    paths=(direct_path,),
+                )
+            return IntegrationResult(
+                status="unchanged",
+                message="Cursor local plugin is not installed",
+            )
+
+        manifest = load_manifest(plugin)
+        if manifest.integration_id != "cursor-user":
+            raise OwnershipConflict(
+                "Cursor plugin manifest belongs to another integration"
+            )
+        conflicts = verify_managed_content(plugin, manifest)
+        if conflicts and not options.force_managed:
+            raise OwnershipConflict("Managed Cursor plugin content was modified")
+
+        removed_paths: list[Path] = []
+        for artifact in manifest.managed:
+            if artifact.kind != "file":
+                raise OwnershipConflict(
+                    "Cursor plugin manifest contains an unsupported claim"
+                )
+            path = plugin.joinpath(*artifact.path.split("/"))
+            path.unlink(missing_ok=True)
+            removed_paths.append(path)
+            self._remove_empty_parents(path, stop=plugin)
+        manifest_path.unlink()
+        removed_paths.append(manifest_path)
+        try:
+            plugin.rmdir()
+        except OSError:
+            pass
+        if removable_direct:
+            self._remove_mcp_entry(direct_path, expected=direct_entry)
+            removed_paths.append(direct_path)
+        return IntegrationResult(
+            status="removed",
+            message="Removed Cursor local plugin; restart or reload Cursor",
+            paths=tuple(removed_paths),
         )
 
     def diagnose(
