@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 import hashlib
 import json
 import os
@@ -243,7 +244,11 @@ def lifecycle_review(db, project: str | None = None) -> dict[str, list]:
     now = datetime.now(timezone.utc)
     report: dict[str, list] = {k: [] for k in ("duplicates", "contradictions", "stale", "superseded", "completed_followups", "broad")}
     active = [m for m in memories if (m.get("status") or "active") == "active"]
-    for i, left in enumerate(active):
+    titled = [
+        (memory, memory["title"].lower(), Counter(memory["title"].lower()))
+        for memory in active
+    ]
+    for i, (left, left_title, left_counts) in enumerate(titled):
         if left.get("valid_until"):
             try:
                 if datetime.fromisoformat(left["valid_until"].replace("Z", "+00:00")) < now:
@@ -261,8 +266,23 @@ def lifecycle_review(db, project: str | None = None) -> dict[str, list]:
             report["completed_followups"].append(left["id"])
         if len(left.get("what", "")) > 800 or len(structured.get("steps", [])) > 20:
             report["broad"].append(left["id"])
-        for right in active[i + 1:]:
-            title_ratio = SequenceMatcher(None, left["title"].lower(), right["title"].lower()).ratio()
+        for right, right_title, right_counts in titled[i + 1:]:
+            combined_length = len(left_title) + len(right_title)
+            if (
+                20 * min(len(left_title), len(right_title))
+                < 9 * combined_length
+            ):
+                continue
+            shared_characters = sum(
+                (left_counts & right_counts).values()
+            )
+            if 20 * shared_characters < 9 * combined_length:
+                continue
+            title_ratio = SequenceMatcher(
+                None,
+                left_title,
+                right_title,
+            ).ratio()
             what_ratio = SequenceMatcher(None, left["what"].lower(), right["what"].lower()).ratio()
             if title_ratio >= 0.9 and what_ratio >= 0.75:
                 report["duplicates"].append([left["id"], right["id"]])
