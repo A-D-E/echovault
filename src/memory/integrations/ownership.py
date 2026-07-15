@@ -107,9 +107,24 @@ def _json_pointer(value: object, locator: str) -> object:
     current = value
     for raw_part in locator.split("/")[1:]:
         part = raw_part.replace("~1", "/").replace("~0", "~")
-        if not isinstance(current, dict) or part not in current:
+        if isinstance(current, dict) and part in current:
+            current = current[part]
+            continue
+        if isinstance(current, list):
+            try:
+                index = int(part)
+            except ValueError as error:
+                raise OwnershipConflict(
+                    f"Managed JSON entry is missing: {locator}"
+                ) from error
+            if index < 0 or index >= len(current):
+                raise OwnershipConflict(
+                    f"Managed JSON entry is missing: {locator}"
+                )
+            current = current[index]
+            continue
+        else:
             raise OwnershipConflict(f"Managed JSON entry is missing: {locator}")
-        current = current[part]
     return current
 
 
