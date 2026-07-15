@@ -1033,6 +1033,10 @@ def dashboard(project, include_archived):
         click.echo("Build it: cd dashboard && cargo build --release")
         click.echo("Install it: cp dashboard/target/release/memory-dashboard ~/.local/bin/")
         raise SystemExit(1)
+    memory_executable = shutil.which("memory")
+    if memory_executable is None:
+        click.echo("Error: memory console script not found on PATH.")
+        raise SystemExit(1)
 
     cmd = [binary]
     if project:
@@ -1042,6 +1046,7 @@ def dashboard(project, include_archived):
 
     memory_home = get_memory_home()
     os.environ["MEMORY_HOME"] = memory_home
+    os.environ["ECHOVAULT_MEMORY_EXECUTABLE"] = memory_executable
     os.execvp(binary, cmd)
 
 

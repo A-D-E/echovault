@@ -2,6 +2,7 @@
 
 import json
 import os
+import shutil
 
 import pytest
 from click.testing import CliRunner
@@ -223,6 +224,29 @@ def test_dashboard_help():
     assert "Launch the EchoVault terminal dashboard." in result.output
     assert "--project" in result.output
     assert "--include-archived" in result.output
+
+
+def test_dashboard_passes_absolute_memory_executable_to_rust(monkeypatch):
+    resolved = {
+        "memory-dashboard": "/opt/echovault/bin/memory-dashboard",
+        "memory": "/opt/echovault/bin/memory",
+    }
+    monkeypatch.setattr(shutil, "which", lambda name: resolved.get(name))
+    monkeypatch.setattr(cli_module, "get_memory_home", lambda: "/tmp/echo-home")
+    monkeypatch.delenv("MEMORY_HOME", raising=False)
+    monkeypatch.delenv("ECHOVAULT_MEMORY_EXECUTABLE", raising=False)
+
+    def capture_exec(binary, command):
+        assert binary == resolved["memory-dashboard"]
+        assert command == [resolved["memory-dashboard"]]
+        assert os.environ["MEMORY_HOME"] == "/tmp/echo-home"
+        assert os.environ["ECHOVAULT_MEMORY_EXECUTABLE"] == resolved["memory"]
+        raise SystemExit(0)
+
+    monkeypatch.setattr(cli_module.os, "execvp", capture_exec)
+    result = CliRunner().invoke(main, ["dashboard"])
+
+    assert result.exit_code == 0
 
 
 def test_admin_bridge_is_hidden_from_top_level_help():

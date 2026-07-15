@@ -10,7 +10,7 @@ title: {title}
 project: {project}
 category: {category}
 tags: [{tags}]
-source: {source}
+# creator source (read-only): {source}
 what: {what}
 why: {why}
 impact: {impact}
@@ -33,7 +33,6 @@ pub struct MemoryEdit {
     pub project: String,
     pub category: Option<String>,
     pub tags: Vec<String>,
-    pub source: Option<String>,
     pub what: String,
     pub why: Option<String>,
     pub impact: Option<String>,
@@ -127,12 +126,6 @@ fn parse_yaml(content: &str) -> Option<MemoryEdit> {
         _ => Vec::new(),
     };
 
-    let source = data
-        .get("source")
-        .and_then(|v| v.as_str())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-
     let why = data
         .get("why")
         .and_then(|v| v.as_str())
@@ -156,10 +149,42 @@ fn parse_yaml(content: &str) -> Option<MemoryEdit> {
         project,
         category,
         tags,
-        source,
         what,
         why,
         impact,
         details,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_yaml, MemoryEdit};
+
+    #[test]
+    fn parsed_edit_has_no_mutable_creator_source_field() {
+        let parsed = parse_yaml(
+            "title: Title\nproject: p--1\ncategory: decision\ntags: [one]\n\
+             source: attacker\nwhat: Body\nwhy: ''\nimpact: ''\ndetails: ''\n",
+        )
+        .unwrap();
+
+        let MemoryEdit {
+            title,
+            project,
+            category,
+            tags,
+            what,
+            why,
+            impact,
+            details,
+        } = parsed;
+        assert_eq!(title, "Title");
+        assert_eq!(project, "p--1");
+        assert_eq!(category.as_deref(), Some("decision"));
+        assert_eq!(tags, vec!["one"]);
+        assert_eq!(what, "Body");
+        assert_eq!(why, None);
+        assert_eq!(impact, None);
+        assert_eq!(details, None);
+    }
 }

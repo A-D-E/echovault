@@ -1,5 +1,4 @@
 mod app;
-mod db;
 mod duplicate;
 mod editor;
 mod ui;
@@ -11,6 +10,7 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use memory_dashboard::db;
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::io;
 use std::path::PathBuf;
@@ -42,17 +42,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cli = Cli::parse();
 
-    let memory_home = cli
-        .memory_home
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-            PathBuf::from(home).join(".memory")
-        });
+    let memory_home = cli.memory_home.map(PathBuf::from).unwrap_or_else(|| {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        PathBuf::from(home).join(".memory")
+    });
 
     let db_path = memory_home.join("index.db");
     if !db_path.exists() {
-        eprintln!("Database not found at {:?}. Run `memory init` first.", db_path);
+        eprintln!(
+            "Database not found at {:?}. Run `memory init` first.",
+            db_path
+        );
         std::process::exit(1);
     }
 
@@ -92,10 +92,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn run_app(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    app: &mut App,
-) -> io::Result<()> {
+fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> io::Result<()> {
     loop {
         terminal.draw(|f| ui::draw(f, app))?;
 
