@@ -17,6 +17,7 @@ except ImportError:
 import sqlite_vec
 
 from memory.models import Memory, MemoryDetail, MemoryOperation
+from memory.projects import ProjectScope
 from memory.safe_io import ProcessFileLock
 
 
@@ -43,6 +44,55 @@ _FTS_STOPWORDS = {
     "to",
     "with",
 }
+
+
+class AmbiguousMemoryIdError(ValueError):
+    """Raised when a memory ID prefix identifies more than one record."""
+
+
+class InvalidMemoryIdPrefix(ValueError):
+    """Raised before querying with an invalid memory ID prefix."""
+
+
+ProjectFilter = ProjectScope | str | tuple[str, ...] | None
+
+
+def _project_keys(project: ProjectFilter) -> tuple[str, ...]:
+    if project is None:
+        return ()
+    if isinstance(project, ProjectScope):
+        return tuple(dict.fromkeys(project.storage_keys))
+    if isinstance(project, str):
+        return (project,)
+    return tuple(dict.fromkeys(project))
+
+
+def _append_project_filter(
+    where_clauses: list[str],
+    params: list[object],
+    project: ProjectFilter,
+    *,
+    column: str,
+) -> None:
+    keys = _project_keys(project)
+    if not keys:
+        return
+    placeholders = ",".join("?" for _ in keys)
+    where_clauses.append(f"{column} IN ({placeholders})")
+    params.extend(keys)
+
+
+def _literal_like_prefix(memory_id: str) -> str:
+    if not memory_id:
+        raise InvalidMemoryIdPrefix(
+            "Memory ID or prefix must not be empty"
+        )
+    escaped = (
+        memory_id.replace("\\", "\\\\")
+        .replace("%", "\\%")
+        .replace("_", "\\_")
+    )
+    return escaped + "%"
 
 
 def _build_fts_query(query: str) -> str:
@@ -668,7 +718,12 @@ class MemoryDB:
             operation.commit_sha,
         ))
 
-    def get_memory(self, memory_id: str) -> Optional[dict]:
+    def get_memory(
+        self,
+        memory_id: str,
+        *,
+        projects: tuple[str, ...] | None = None,
+    ) -> Optional[dict]:
         """Get a memory by ID.
 
         Args:
@@ -678,19 +733,33 @@ class MemoryDB:
             Dictionary with memory data and has_details flag, or None if not found
         """
         cursor = self.conn.cursor()
-        cursor.execute("""
+        where_clauses = ["m.id = ?"]
+        params: list[object] = [memory_id]
+        _append_project_filter(
+            where_clauses,
+            params,
+            projects,
+            column="m.project",
+        )
+        cursor.execute(f"""
             SELECT m.*,
                    EXISTS(SELECT 1 FROM memory_details WHERE memory_id = m.id) as has_details
             FROM memories m
-            WHERE m.id = ?
-        """, (memory_id,))
+            WHERE {" AND ".join(where_clauses)}
+        """, params)
 
         row = cursor.fetchone()
         if row:
             return dict(row)
         return None
 
-    def get_details(self, memory_id: str) -> Optional[MemoryDetail]:
+    def get_details(
+        self,
+        memory_id: str,
+        *,
+        projects: tuple[str, ...] | None = None,
+        record_feedback: bool = True,
+    ) -> Optional[MemoryDetail]:
         """Get full details for a memory.
 
         Args:
@@ -699,18 +768,35 @@ class MemoryDB:
         Returns:
             MemoryDetail object or None if no details exist
         """
-        cursor = self.conn.cursor()
-        cursor.execute("""
-            SELECT memory_id, body
-            FROM memory_details
-            WHERE memory_id LIKE ?
-        """, (memory_id + "%",))
-
-        row = cursor.fetchone()
-        if row:
+        where_clauses = ["m.id LIKE ? ESCAPE '\\'"]
+        params: list[object] = [_literal_like_prefix(memory_id)]
+        _append_project_filter(
+            where_clauses,
+            params,
+            projects,
+            column="m.project",
+        )
+        rows = self.conn.execute(
+            f"""
+            SELECT m.id AS memory_id, d.body
+            FROM memories m
+            JOIN memory_details d ON d.memory_id = m.id
+            WHERE {" AND ".join(where_clauses)}
+            ORDER BY m.id
+            LIMIT 2
+            """,
+            params,
+        ).fetchall()
+        if len(rows) > 1:
+            raise AmbiguousMemoryIdError(
+                f"Ambiguous memory prefix: {memory_id}"
+            )
+        if not rows:
+            return None
+        row = rows[0]
+        if record_feedback:
             self.record_feedback([row["memory_id"]], "details_opened")
-            return MemoryDetail(memory_id=row["memory_id"], body=row["body"])
-        return None
+        return MemoryDetail(memory_id=row["memory_id"], body=row["body"])
 
     def update_memory(
         self,
@@ -873,7 +959,7 @@ class MemoryDB:
         self,
         query: str,
         limit: int = 10,
-        project: Optional[str] = None,
+        project: ProjectScope | str | None = None,
         source: Optional[str] = None,
         include_archived: bool = False,
     ) -> list[dict]:
@@ -895,9 +981,12 @@ class MemoryDB:
         where_clauses = []
         params = [fts_query]
 
-        if project:
-            where_clauses.append("m.project = ?")
-            params.append(project)
+        _append_project_filter(
+            where_clauses,
+            params,
+            project,
+            column="m.project",
+        )
 
         if source:
             where_clauses.append("m.source = ?")
@@ -958,7 +1047,7 @@ class MemoryDB:
         self,
         query_embedding: list[float],
         limit: int = 10,
-        project: Optional[str] = None,
+        project: ProjectScope | str | None = None,
         source: Optional[str] = None,
         include_archived: bool = False,
     ) -> list[dict]:
@@ -982,15 +1071,18 @@ class MemoryDB:
         # source, over-fetch candidate vectors so the final filtered set still has
         # relevant rows from the desired slice.
         fetch_k = limit
-        if project or source:
+        if project is not None or source:
             fetch_k = max(limit * 20, 100)
 
         where_clauses = ["v.embedding MATCH ?", "k = ?"]
         params: list = [vec_bytes, fetch_k]
 
-        if project:
-            where_clauses.append("m.project = ?")
-            params.append(project)
+        _append_project_filter(
+            where_clauses,
+            params,
+            project,
+            column="m.project",
+        )
 
         if source:
             where_clauses.append("m.source = ?")
@@ -1025,7 +1117,7 @@ class MemoryDB:
     def list_recent(
         self,
         limit: int = 10,
-        project: Optional[str] = None,
+        project: ProjectScope | str | None = None,
         source: Optional[str] = None,
         include_archived: bool = False,
     ) -> list[dict]:
@@ -1042,9 +1134,12 @@ class MemoryDB:
         where_clauses = []
         params: list = []
 
-        if project:
-            where_clauses.append("m.project = ?")
-            params.append(project)
+        _append_project_filter(
+            where_clauses,
+            params,
+            project,
+            column="m.project",
+        )
 
         if source:
             where_clauses.append("m.source = ?")
@@ -1086,7 +1181,7 @@ class MemoryDB:
 
     def count_memories(
         self,
-        project: Optional[str] = None,
+        project: ProjectScope | str | None = None,
         source: Optional[str] = None,
         include_archived: bool = False,
     ) -> int:
@@ -1102,9 +1197,12 @@ class MemoryDB:
         where_clauses = []
         params: list = []
 
-        if project:
-            where_clauses.append("project = ?")
-            params.append(project)
+        _append_project_filter(
+            where_clauses,
+            params,
+            project,
+            column="project",
+        )
 
         if source:
             where_clauses.append("source = ?")
@@ -1126,7 +1224,7 @@ class MemoryDB:
     def list_memories(
         self,
         limit: int = 200,
-        project: Optional[str] = None,
+        project: ProjectScope | str | None = None,
         category: Optional[str] = None,
         file_path: Optional[str] = None,
         include_archived: bool = False,
@@ -1135,9 +1233,12 @@ class MemoryDB:
         where_clauses = []
         params: list = []
 
-        if project:
-            where_clauses.append("m.project = ?")
-            params.append(project)
+        _append_project_filter(
+            where_clauses,
+            params,
+            project,
+            column="m.project",
+        )
         if category:
             where_clauses.append("m.category = ?")
             params.append(category)

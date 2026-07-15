@@ -2,12 +2,101 @@
 
 import os
 from datetime import datetime, timezone
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
 from memory.core import MemoryService
 from memory.models import RawMemoryInput
+from memory.projects import ProjectIdentity, ProjectScope
+
+
+@pytest.fixture
+def memory_service(env_home: Path):
+    instance = MemoryService(str(env_home))
+    try:
+        yield instance
+    finally:
+        instance.close()
+
+
+@pytest.fixture
+def project_scope(tmp_path: Path) -> ProjectScope:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    identity = ProjectIdentity(
+        root=root.resolve(),
+        display_name="workspace",
+        key="workspace--111111111111",
+        marker=None,
+        canonical_owner=root.resolve(),
+    )
+    return ProjectScope(identity=identity, aliases=("workspace",))
+
+
+def test_alias_scope_reads_hashed_and_adopted_legacy_rows(
+    memory_service: MemoryService,
+    project_scope: ProjectScope,
+) -> None:
+    memory_service.save(
+        RawMemoryInput(title="Hashed", what="alias hashed marker"),
+        project=project_scope.identity.key,
+    )
+    memory_service.save(
+        RawMemoryInput(title="Legacy", what="alias legacy marker"),
+        project=project_scope.aliases[0],
+    )
+    titles = {
+        row["title"]
+        for row in memory_service.search("alias marker", project=project_scope)
+    }
+    assert titles == {"Hashed", "Legacy"}
+
+
+def test_details_outside_scope_is_not_found_without_feedback(
+    memory_service: MemoryService,
+    project_scope: ProjectScope,
+) -> None:
+    saved = memory_service.save(
+        RawMemoryInput(
+            title="Private",
+            what="other project",
+            details="secret detail",
+        ),
+        project="other--1",
+    )
+    before = memory_service.get_memory_record(saved["id"])[
+        "details_opened_count"
+    ]
+    detail = memory_service.get_details(saved["id"], project=project_scope)
+    after = memory_service.get_memory_record(saved["id"])[
+        "details_opened_count"
+    ]
+    assert detail is None
+    assert after == before
+
+
+def test_memory_service_close_closes_database_exactly_once(
+    env_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = MemoryService(str(env_home))
+    original_close = service.db.close
+    close_calls = 0
+
+    def recording_close() -> None:
+        nonlocal close_calls
+        close_calls += 1
+        original_close()
+
+    monkeypatch.setattr(service.db, "close", recording_close)
+    try:
+        service.close()
+        service.close()
+        assert close_calls == 1
+    finally:
+        service.close()
 
 
 def test_save_creates_markdown_file(env_home):

@@ -40,6 +40,7 @@ from memory.persistence import (
     SaveRequest,
     _Unset,
 )
+from memory.projects import ProjectScope
 from memory.redaction import load_memoryignore, redact
 from memory.search import hybrid_search, tiered_search
 
@@ -77,6 +78,7 @@ class MemoryService:
         # Load configuration and initialize database
         self.config = load_config(self.config_path)
         self.db = MemoryDB(self.db_path, read_only=read_only)
+        self._closed = False
 
         # Lazy-load embedding provider (expensive operation)
         self._embedding_provider: Optional[EmbeddingProvider] = None
@@ -260,7 +262,7 @@ class MemoryService:
         self,
         query: str,
         limit: int = 5,
-        project: Optional[str] = None,
+        project: ProjectScope | str | None = None,
         source: Optional[str] = None,
         use_vectors: bool = True,
         include_archived: bool = False,
@@ -353,7 +355,7 @@ class MemoryService:
     def get_context(
         self,
         limit: int = 10,
-        project: Optional[str] = None,
+        project: ProjectScope | str | None = None,
         source: Optional[str] = None,
         query: Optional[str] = None,
         semantic_mode: Optional[str] = None,
@@ -459,7 +461,7 @@ class MemoryService:
         self,
         *,
         query: Optional[str] = None,
-        project: Optional[str] = None,
+        project: ProjectScope | str | None = None,
         category: Optional[str] = None,
         include_archived: bool = False,
         limit: int = 200,
@@ -489,7 +491,7 @@ class MemoryService:
         record = self._get_full_memory(memory_id)
         if not record:
             return None
-        detail = self.get_details(memory_id)
+        detail = self.get_details(memory_id, record_feedback=False)
         record["details"] = detail.body if detail else ""
         return record
 
@@ -688,7 +690,13 @@ class MemoryService:
         candidates.sort(key=lambda item: item["score"], reverse=True)
         return candidates[:limit]
 
-    def get_details(self, memory_id: str) -> Optional[MemoryDetail]:
+    def get_details(
+        self,
+        memory_id: str,
+        *,
+        project: ProjectScope | str | None = None,
+        record_feedback: bool = True,
+    ) -> Optional[MemoryDetail]:
         """Get full details for a memory by ID.
 
         Args:
@@ -697,7 +705,16 @@ class MemoryService:
         Returns:
             MemoryDetail object if details exist, None otherwise
         """
-        return self.db.get_details(memory_id)
+        projects = None
+        if isinstance(project, ProjectScope):
+            projects = project.storage_keys
+        elif isinstance(project, str):
+            projects = (project,)
+        return self.db.get_details(
+            memory_id,
+            projects=projects,
+            record_feedback=record_feedback,
+        )
 
     def delete(self, memory_id: str, *, actor: str = "cli") -> bool:
         """Delete a memory by ID or prefix.
@@ -1055,5 +1072,8 @@ class MemoryService:
         return doctor(self, project)
 
     def close(self) -> None:
-        """Close database connection and clean up resources."""
+        """Close owned resources once; safe from every cleanup path."""
+        if self._closed:
+            return
         self.db.close()
+        self._closed = True

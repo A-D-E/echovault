@@ -11,7 +11,13 @@ from pathlib import Path
 
 import pytest
 
-from memory.db import DimensionMismatchError, MemoryDB, _build_fts_query
+from memory.db import (
+    AmbiguousMemoryIdError,
+    DimensionMismatchError,
+    InvalidMemoryIdPrefix,
+    MemoryDB,
+    _build_fts_query,
+)
 from memory.models import Memory, MemoryDetail, MemoryOperation, RawMemoryInput
 
 
@@ -48,6 +54,64 @@ def sample_detail(sample_memory):
         memory_id=sample_memory.id,
         body="Detailed analysis of the authentication bug...\n\nRoot cause was..."
     )
+
+
+def insert_detail_row(
+    db: MemoryDB,
+    *,
+    memory_id: str,
+    project: str = "p",
+) -> None:
+    db.conn.execute(
+        """
+        INSERT INTO memories
+            (id, title, what, project, file_path, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            memory_id,
+            memory_id,
+            "memory",
+            project,
+            "fixture.md",
+            "2026-07-14",
+            "2026-07-14",
+        ),
+    )
+    db.conn.execute(
+        "INSERT INTO memory_details (memory_id, body) VALUES (?, ?)",
+        (memory_id, "details"),
+    )
+    db.conn.commit()
+
+
+def test_ambiguous_prefix_is_rejected(db: MemoryDB) -> None:
+    for memory_id in ("abc111", "abc222"):
+        insert_detail_row(db, memory_id=memory_id)
+    with pytest.raises(AmbiguousMemoryIdError):
+        db.get_details("abc", projects=("p",))
+
+
+@pytest.mark.parametrize(
+    "prefix, expected_id",
+    [("abc%", "abc%111"), ("abc_", "abc_111")],
+)
+def test_details_prefix_treats_like_metacharacters_literally(
+    db: MemoryDB,
+    prefix: str,
+    expected_id: str,
+) -> None:
+    for memory_id in ("abc%111", "abcx222", "abc_111", "abcy222"):
+        insert_detail_row(db, memory_id=memory_id)
+    detail = db.get_details(prefix, projects=("p",))
+    assert detail is not None
+    assert detail.memory_id == expected_id
+
+
+def test_details_rejects_empty_prefix_before_querying(db: MemoryDB) -> None:
+    insert_detail_row(db, memory_id="abc111")
+    with pytest.raises(InvalidMemoryIdPrefix, match="must not be empty"):
+        db.get_details("", projects=("p",))
 
 
 def test_db_creates_tables_without_error():
