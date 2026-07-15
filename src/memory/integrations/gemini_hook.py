@@ -1,12 +1,19 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import multiprocessing
+import os
+import queue
+import stat
 import sys
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Protocol
 
-from memory.config import resolve_context_mode
+from memory.config import get_memory_home, resolve_context_mode
 from memory.context_pack import build_context_pack, render_gemini_additional_context
 from memory.core import MemoryService
 from memory.projects import (
@@ -15,6 +22,10 @@ from memory.projects import (
     build_project_identity,
     discover_project_root,
 )
+from memory.safe_io import ProcessFileLock, fsync_directory
+
+
+INTEGRATION_VERSION = "0.6.0"
 
 
 class HookInputError(ValueError):
@@ -48,6 +59,101 @@ class _AlwaysClaim:
     ) -> bool:
         _ = event, now
         return True
+
+
+def hook_event_digest(event: GeminiBeforeAgentInput) -> str:
+    identity = {
+        "session_id": event.session_id,
+        "hook_event_name": event.hook_event_name,
+        "timestamp": event.timestamp,
+    }
+    encoded = json.dumps(
+        identity,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+class HookClaimStore:
+    def __init__(self, memory_home: Path, ttl_seconds: int = 600) -> None:
+        if ttl_seconds <= 0:
+            raise ValueError("claim TTL must be positive")
+        self.memory_home = memory_home.expanduser().resolve()
+        self.root = self.memory_home / "hook-events"
+        self.lock_path = self.root / ".lock"
+        self.ttl_seconds = ttl_seconds
+
+    @staticmethod
+    def _utc(value: datetime | None) -> datetime:
+        selected = value or datetime.now(timezone.utc)
+        if selected.tzinfo is None:
+            return selected.replace(tzinfo=timezone.utc)
+        return selected.astimezone(timezone.utc)
+
+    def _prepare_root(self) -> None:
+        if os.path.lexists(self.root) and self.root.is_symlink():
+            raise OSError("hook claim directory cannot be a symlink")
+        self.root.mkdir(parents=True, exist_ok=True)
+        metadata = self.root.lstat()
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise OSError("hook claim path must be a directory")
+
+    def _clean_expired(self, now: datetime) -> None:
+        for path in self.root.glob("*.json"):
+            try:
+                metadata = path.lstat()
+                if not stat.S_ISREG(metadata.st_mode):
+                    continue
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                expires_at = datetime.fromisoformat(payload["expires_at"])
+                if self._utc(expires_at) <= now:
+                    path.unlink()
+            except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+                continue
+
+    def try_claim(
+        self,
+        event: GeminiBeforeAgentInput,
+        *,
+        now: datetime | None = None,
+    ) -> bool:
+        selected_now = self._utc(now)
+        digest = hook_event_digest(event)
+        self._prepare_root()
+        with ProcessFileLock(self.lock_path):
+            self._clean_expired(selected_now)
+            path = self.root / f"{digest}.json"
+            payload = (
+                json.dumps(
+                    {
+                        "digest": digest,
+                        "integration_version": INTEGRATION_VERSION,
+                        "expires_at": (
+                            selected_now + timedelta(seconds=self.ttl_seconds)
+                        ).isoformat(),
+                    },
+                    sort_keys=True,
+                    indent=2,
+                )
+                + "\n"
+            ).encode("utf-8")
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            try:
+                descriptor = os.open(path, flags, 0o600)
+            except FileExistsError:
+                return False
+            try:
+                view = memoryview(payload)
+                while view:
+                    written = os.write(descriptor, view)
+                    view = view[written:]
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            fsync_directory(self.root)
+            return True
 
 
 def parse_before_agent(payload: Mapping[str, object]) -> GeminiBeforeAgentInput:
@@ -166,3 +272,102 @@ def process_before_agent(
     finally:
         if owns_service:
             service.close()
+
+
+def _spawn_before_agent_worker(
+    request: dict[str, object],
+    result_queue,
+) -> None:
+    response: dict[str, object] = {}
+    error_code: str | None = None
+    service: MemoryService | None = None
+    try:
+        memory_home = request.get("memory_home")
+        payload = request.get("event")
+        if not isinstance(memory_home, str) or not isinstance(payload, dict):
+            raise HookInputError("Invalid worker request")
+        service = MemoryService(memory_home)
+        response = process_before_agent(
+            payload,
+            service_factory=lambda: service,
+            claim_store=HookClaimStore(Path(memory_home)),
+        )
+    except Exception:
+        error_code = "worker_failed"
+    finally:
+        if service is not None:
+            service.close()
+    result_queue.put(
+        {
+            "ok": error_code is None,
+            "response": response,
+            "error_code": error_code,
+        }
+    )
+
+
+def handle_before_agent(
+    payload: Mapping[str, object],
+    *,
+    memory_home: Path | None = None,
+    timeout_seconds: float = 4.0,
+    worker_target: Callable[[dict[str, object], object], None] = (
+        _spawn_before_agent_worker
+    ),
+    multiprocessing_context=None,
+) -> dict[str, object]:
+    """Run the hook in a spawn worker bounded below Gemini's outer timeout."""
+
+    if timeout_seconds <= 0:
+        return {}
+    try:
+        event = parse_before_agent(payload)
+    except HookInputError:
+        _error("invalid_input")
+        return {}
+    selected_home = (memory_home or Path(get_memory_home())).expanduser().resolve()
+    request: dict[str, object] = {
+        "event": {
+            "session_id": event.session_id,
+            "cwd": str(event.cwd),
+            "hook_event_name": event.hook_event_name,
+            "timestamp": event.timestamp,
+            "prompt": event.prompt,
+        },
+        "memory_home": str(selected_home),
+        "integration_version": INTEGRATION_VERSION,
+        "timeout_seconds": timeout_seconds,
+    }
+    context = multiprocessing_context or multiprocessing.get_context("spawn")
+    result_queue = context.Queue(maxsize=1)
+    process = context.Process(
+        target=worker_target,
+        args=(request, result_queue),
+    )
+    try:
+        process.start()
+        process.join(timeout_seconds)
+        if process.is_alive():
+            process.terminate()
+            process.join()
+            _error("deadline")
+            return {}
+        try:
+            result = result_queue.get(timeout=0.2)
+        except queue.Empty:
+            _error("missing_result")
+            return {}
+        if not isinstance(result, dict) or result.get("ok") is not True:
+            _error("worker_failed")
+            return {}
+        response = result.get("response")
+        return response if isinstance(response, dict) else {}
+    except Exception:
+        if process.is_alive():
+            process.terminate()
+            process.join()
+        _error("spawn_failed")
+        return {}
+    finally:
+        result_queue.close()
+        result_queue.join_thread()
