@@ -4,6 +4,7 @@ import os
 import re
 import shutil
 import stat
+import subprocess
 from dataclasses import asdict
 from pathlib import Path
 from typing import Literal
@@ -259,7 +260,10 @@ def cursor_diagnostics(
             )
             healthy = result.returncode == 0
             detail = (result.stdout if healthy else result.stderr).strip()
-        except (OSError, TimeoutError) as error:
+        except (TimeoutError, subprocess.TimeoutExpired):
+            healthy = False
+            detail = "Cursor Agent CLI capability timed out"
+        except OSError as error:
             healthy = False
             detail = str(error)
         metadata: dict[str, object] = {}

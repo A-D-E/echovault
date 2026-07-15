@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from pathlib import Path
+import subprocess
 
 from memory.core import MemoryService
 from memory.health import doctor, doctor_home
@@ -35,6 +36,20 @@ class RecordingRunner:
             (tuple(argv), cwd, None if env is None else dict(env))
         )
         return self.result
+
+
+class TimeoutRunner:
+    def run(
+        self,
+        argv: Sequence[str],
+        *,
+        timeout: float,
+        capture_output: bool = True,
+        cwd: Path | None = None,
+        env: Mapping[str, str] | None = None,
+    ) -> CommandResult:
+        _ = capture_output, cwd, env
+        raise subprocess.TimeoutExpired(list(argv), timeout)
 
 
 def install_cursor_fixture(tmp_path: Path) -> tuple[MemoryService, Path]:
@@ -82,6 +97,32 @@ def test_cursor_doctor_is_read_only(tmp_path: Path) -> None:
         "list-tools",
         "echovault",
     )
+
+
+def test_cursor_doctor_reports_client_timeout_as_degraded(
+    tmp_path: Path,
+) -> None:
+    service, project = install_cursor_fixture(tmp_path)
+    try:
+        report = doctor(
+            service,
+            agent="cursor",
+            project_root=project,
+            runner=TimeoutRunner(),
+        )
+    finally:
+        service.close()
+
+    findings = {
+        item["code"]: item
+        for item in report["integration_findings"]
+        if item["code"] in {"cursor.client-mcp", "cursor.client-tools"}
+    }
+    assert set(findings) == {"cursor.client-mcp", "cursor.client-tools"}
+    assert all(item["status"] == "degraded" for item in findings.values())
+    assert {
+        item["message"] for item in findings.values()
+    } == {"Cursor Agent CLI capability timed out"}
 
 
 def test_cursor_doctor_reports_effective_disabled_policy(tmp_path: Path) -> None:
