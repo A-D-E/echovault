@@ -10,11 +10,21 @@ from memory.integrations.config_io import ConfigBoundaryError
 from memory.integrations.gemini import GeminiAdapter
 from memory.integrations.gemini_state import ArtifactState, GeminiStateConflict
 from memory.integrations.config_io import ConfigMalformedError
+from memory.core import MemoryService
+from memory.integrations.gemini_hook import HookClaimStore, process_before_agent
+from memory.models import RawMemoryInput
+from memory.projects import (
+    ProjectRegistry,
+    build_project_identity,
+    discover_project_root,
+)
 from memory.integrations.ownership import OwnershipConflict
 from memory.integrations.registry import get_adapter
 from memory.integrations.types import AdapterCapabilities
 from tests.gemini_helpers import (
     RecordingRunner,
+    SeededServiceFactory,
+    VALID_EVENT,
     gemini_050_runner,
     gemini_adapter,
     named_hook,
@@ -558,3 +568,52 @@ def test_native_force_uninstall_removes_only_manifest_claims(
     assert runner.installed is False
     assert (source / "mine.txt").read_text() == "mine\n"
     assert not managed.exists()
+
+
+def test_project_hook_remains_standalone_after_native_uninstall(
+    tmp_path: Path,
+    fake_memory: Path,
+) -> None:
+    home = tmp_path / "home"
+    memory_home = tmp_path / "memory-home"
+    project = tmp_path / "repo"
+    home.mkdir()
+    project.mkdir()
+    (project / "package.json").write_text("{}")
+    root, marker = discover_project_root(project)
+    scope = ProjectRegistry(memory_home).register(
+        build_project_identity(root, marker)
+    )
+    service = MemoryService(str(memory_home))
+    service.save(
+        RawMemoryInput(
+            title="Marker ALPHA-42",
+            what="Durable marker ALPHA-42",
+            category="context",
+            source="cursor",
+        ),
+        project=scope.identity.key,
+    )
+    runner = RecordingRunner()
+    adapter = gemini_adapter(runner)
+    native = native_options(home, fake_memory)
+    project_options = project_direct_options(project)
+    adapter.setup(native)
+    adapter.setup(project_options)
+    adapter.uninstall(native)
+
+    try:
+        response = process_before_agent(
+            {**VALID_EVENT, "cwd": str(project)},
+            service_factory=SeededServiceFactory(service),
+            claim_store=HookClaimStore(memory_home),
+        )
+    finally:
+        service.close()
+
+    output = response["hookSpecificOutput"]
+    assert output["hookEventName"] == "BeforeAgent"
+    assert "ALPHA-42" in output["additionalContext"]
+    settings = json.loads((project / ".gemini/settings.json").read_text())
+    assert "echovault" in settings["mcpServers"]
+    assert named_hook(settings, "BeforeAgent", "echovault-context") is not None
