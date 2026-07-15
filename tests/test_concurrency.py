@@ -4,6 +4,9 @@ from multiprocessing import get_context
 from pathlib import Path
 from threading import Event, Thread
 
+import pytest
+
+from memory import persistence
 from memory.core import MemoryService
 from memory.health import doctor_home
 from memory.models import RawMemoryInput
@@ -50,6 +53,40 @@ def test_project_locks_are_acquired_sorted_and_released_reverse(
         "exit:m-project",
         "exit:a-project",
     ]
+
+
+def test_journal_scan_tolerates_concurrent_completed_removal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    memory_home = tmp_path / ".memory"
+    service = configured_service(str(memory_home))
+    journal_path = memory_home / "transactions" / "vanishing.json"
+    journal_path.parent.mkdir(parents=True, exist_ok=True)
+    journal_path.write_text("{}", encoding="utf-8")
+    real_load = persistence.load_operation_journal
+
+    def remove_then_load(
+        home: Path,
+        path: Path,
+    ) -> persistence.OperationJournal:
+        path.unlink()
+        return real_load(home, path)
+
+    monkeypatch.setattr(
+        persistence,
+        "load_operation_journal",
+        remove_then_load,
+    )
+    try:
+        closure, journals = service.persistence._journal_lock_closure(
+            (PROJECT,)
+        )
+    finally:
+        service.close()
+
+    assert closure == (PROJECT,)
+    assert journals == []
 
 
 def test_lock_timeout_is_typed_and_released_lock_can_be_reacquired(

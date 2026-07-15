@@ -1551,11 +1551,24 @@ class CanonicalPersistence:
         journals: list[tuple[Path, OperationJournal]] = []
         if transactions.is_dir():
             for journal_path in sorted(transactions.glob("*.json")):
-                journals.append(
-                    (
+                try:
+                    operation = load_operation_journal(
+                        self.memory_home,
                         journal_path,
-                        load_operation_journal(self.memory_home, journal_path),
                     )
+                except JournalRecoveryConflict as error:
+                    # A cooperating process may finish recovery and unlink the
+                    # journal after this process enumerated it. Ignore only
+                    # that confirmed disappearance; malformed, unreadable,
+                    # replaced, and broken-symlink entries remain fail-closed.
+                    if (
+                        isinstance(error.__cause__, FileNotFoundError)
+                        and not os.path.lexists(journal_path)
+                    ):
+                        continue
+                    raise
+                journals.append(
+                    (journal_path, operation)
                 )
         if not requested:
             requested.update(
