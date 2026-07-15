@@ -91,6 +91,9 @@ class MemoryService:
             self.persistence.startup_recoveries = tuple(
                 self.persistence.recover_pending_operations(())
             )
+            self.persistence.startup_vector_repairs = (
+                self.persistence.repair_pending_vectors()
+            )
 
     @property
     def embedding_provider(self) -> EmbeddingProvider:
@@ -688,6 +691,10 @@ class MemoryService:
             True if deleted, False if not found
         """
         return self.persistence.delete(memory_id, actor=actor)
+
+    def resolve_memory_id(self, memory_id: str) -> str:
+        """Resolve one exact memory ID or unique literal prefix."""
+        return self.persistence.resolve_memory_id(memory_id)
 
     def _normalize_duplicate_text(self, value: str) -> str:
         return re.sub(r"\W+", " ", (value or "").lower()).strip()

@@ -385,6 +385,9 @@ def test_admin_bridge_routes_canonical_mutations(
             self.calls.append(("delete", memory_id, actor))
             return True
 
+        def resolve_memory_id(self, memory_id):
+            return memory_id
+
         def close(self):
             self.closed = True
 

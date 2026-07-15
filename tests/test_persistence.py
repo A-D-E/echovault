@@ -317,13 +317,21 @@ def test_operation_existing_only_in_sqlite_is_canonical_drift(
 
 
 @pytest.mark.parametrize(
-    ("phase", "markdown_expected", "db_expected"),
+    (
+        "phase",
+        "markdown_expected",
+        "db_expected",
+        "journal_expected",
+        "temporary_expected",
+    ),
     [
-        ("after_temp_fsync", False, False),
-        ("after_db_write", False, False),
-        ("after_markdown_replace", True, False),
-        ("after_db_commit", True, True),
-        ("before_vector_write", True, True),
+        ("after_all_temps_fsync", False, False, False, True),
+        ("after_journal_fsync", False, False, True, True),
+        ("after_db_write", False, False, True, True),
+        ("after_target_replace:0", True, False, True, False),
+        ("after_db_commit", True, True, True, False),
+        ("after_journal_remove", True, True, False, False),
+        ("before_vector_write", True, True, False, False),
     ],
 )
 def test_fault_boundaries_leave_recoverable_state(
@@ -331,6 +339,8 @@ def test_fault_boundaries_leave_recoverable_state(
     phase: str,
     markdown_expected: bool,
     db_expected: bool,
+    journal_expected: bool,
+    temporary_expected: bool,
 ) -> None:
     operation_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"fault:{phase}"))
 
@@ -347,11 +357,18 @@ def test_fault_boundaries_leave_recoverable_state(
     assert bool(files) is markdown_expected
     operation = service.db.get_operation("fault-project", operation_id)
     assert (operation is not None) is db_expected
-    assert list((Path(service.vault_dir) / "fault-project").glob("*.tmp")) == []
+    temporaries = list(
+        (Path(service.vault_dir) / "fault-project").glob(".*.tmp")
+    )
+    assert bool(temporaries) is temporary_expected
+    journals = list((Path(service.memory_home) / "transactions").glob("*.json"))
+    assert bool(journals) is journal_expected
 
     service.persistence.fault = lambda _phase: None
     recovered = service.save(raw, project="fault-project", idempotency_key=operation_id)
-    assert recovered["action"] == ("replayed" if markdown_expected else "created")
+    assert recovered["action"] == (
+        "created" if phase == "after_all_temps_fsync" else "replayed"
+    )
     assert service.db.get_operation("fault-project", operation_id) is not None
 
 

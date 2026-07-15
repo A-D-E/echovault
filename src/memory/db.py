@@ -3,6 +3,7 @@
 from contextlib import contextmanager
 from dataclasses import asdict
 import json
+from pathlib import Path
 import re
 import struct
 from typing import Callable, Iterator, Optional
@@ -70,18 +71,32 @@ def _build_fts_query(query: str) -> str:
 class MemoryDB:
     """SQLite database for storing and searching memories."""
 
-    def __init__(self, db_path: str) -> None:
+    def __init__(
+        self,
+        db_path: str,
+        *,
+        read_only: bool = False,
+        immutable: bool = False,
+    ) -> None:
         """Initialize database connection and create schema.
 
         Args:
             db_path: Path to SQLite database file
         """
         self.db_path = db_path
-        self.conn = sqlite3.connect(db_path)
+        if read_only:
+            query = "mode=ro&immutable=1" if immutable else "mode=ro"
+            database_uri = Path(db_path).resolve().as_uri() + "?" + query
+            self.conn = sqlite3.connect(database_uri, uri=True)
+        else:
+            self.conn = sqlite3.connect(db_path)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA busy_timeout = 5000")
         self.conn.execute("PRAGMA foreign_keys = ON")
-        self.conn.execute("PRAGMA journal_mode = WAL")
+        if read_only:
+            self.conn.execute("PRAGMA query_only = ON")
+        else:
+            self.conn.execute("PRAGMA journal_mode = WAL")
         self._vector_cas_test_barrier: Optional[Callable[[], object]] = None
 
         # Enable extension loading and load sqlite-vec extension
@@ -90,7 +105,8 @@ class MemoryDB:
         self.conn.enable_load_extension(False)
 
         # Create schema (vec table is deferred until dimension is known)
-        self._create_schema()
+        if not read_only:
+            self._create_schema()
 
     def _create_schema(self) -> None:
         """Create database tables and indexes (excluding vec table)."""
@@ -155,6 +171,14 @@ class MemoryDB:
         cursor.execute("""
             CREATE INDEX IF NOT EXISTS save_operations_memory_id
             ON save_operations(memory_id)
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS pending_vector_repairs (
+                memory_id TEXT PRIMARY KEY,
+                content_fingerprint TEXT NOT NULL,
+                queued_at TEXT NOT NULL
+            )
         """)
 
         # FTS5 virtual table
@@ -522,6 +546,59 @@ class MemoryDB:
             self._invalidate_vector(memory_id)
             self._insert_vector(int(memory_row["rowid"]), embedding)
             return True
+
+    def queue_vector_repair(
+        self,
+        memory_id: str,
+        content_fingerprint: str,
+        queued_at: str,
+    ) -> None:
+        """Durably queue vector work in the caller's projection transaction."""
+        with self._write_scope():
+            self.conn.execute(
+                """
+                INSERT INTO pending_vector_repairs (
+                    memory_id, content_fingerprint, queued_at
+                ) VALUES (?, ?, ?)
+                ON CONFLICT(memory_id) DO UPDATE SET
+                    content_fingerprint = excluded.content_fingerprint,
+                    queued_at = excluded.queued_at
+                """,
+                (memory_id, content_fingerprint, queued_at),
+            )
+
+    def clear_vector_repair(
+        self,
+        memory_id: str,
+        expected_fingerprint: str | None = None,
+    ) -> bool:
+        """Clear only the repair generation the caller actually completed."""
+        with self._write_scope():
+            if expected_fingerprint is None:
+                cursor = self.conn.execute(
+                    "DELETE FROM pending_vector_repairs WHERE memory_id = ?",
+                    (memory_id,),
+                )
+            else:
+                cursor = self.conn.execute(
+                    """
+                    DELETE FROM pending_vector_repairs
+                    WHERE memory_id = ? AND content_fingerprint = ?
+                    """,
+                    (memory_id, expected_fingerprint),
+                )
+            return cursor.rowcount > 0
+
+    def list_vector_repairs(self) -> list[dict]:
+        """List queued vector work deterministically without mutating it."""
+        cursor = self.conn.execute(
+            """
+            SELECT memory_id, content_fingerprint, queued_at
+            FROM pending_vector_repairs
+            ORDER BY queued_at, memory_id
+            """
+        )
+        return [dict(row) for row in cursor.fetchall()]
 
     def get_operation(self, project: str, operation_id: str) -> Optional[dict]:
         """Get one project-scoped idempotency ledger record."""

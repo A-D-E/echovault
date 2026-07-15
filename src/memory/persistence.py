@@ -9,6 +9,7 @@ from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 import hashlib
 import json
+import os
 from pathlib import Path, PurePosixPath
 import stat
 from typing import Optional
@@ -29,11 +30,14 @@ from memory.models import Memory, MemoryOperation, RawMemoryInput
 from memory.projects import ProjectRegistry, ProjectResolutionError, validate_storage_key
 from memory.redaction import redact, redact_memory_input
 from memory.safe_io import (
+    ConcurrentModificationError,
     PreparedAtomicWrite,
     ProcessFileLock,
     digest_file,
     fsync_directory,
+    publish_text_exclusive,
     prepare_atomic_text,
+    read_regular_text_bounded,
 )
 
 
@@ -102,6 +106,7 @@ class OperationJournal:
     canonical_memory_id: str | None
     targets: tuple[JournalTarget, ...]
     created_at: str
+    actor: str | None = None
 
 
 class JournalRecoveryConflict(RuntimeError):
@@ -121,6 +126,7 @@ _JOURNAL_FIELDS = frozenset(
         "canonical_memory_id",
         "targets",
         "created_at",
+        "actor",
     }
 )
 _JOURNAL_TARGET_FIELDS = frozenset(
@@ -202,7 +208,9 @@ def _operation_from_payload(
     journal_path: Path,
     payload: dict[str, object],
 ) -> OperationJournal:
-    if set(payload) != _JOURNAL_FIELDS:
+    unknown_fields = set(payload) - _JOURNAL_FIELDS
+    missing_fields = (_JOURNAL_FIELDS - {"actor"}) - set(payload)
+    if unknown_fields or missing_fields:
         raise JournalRecoveryConflict("Operation journal has unknown or missing fields")
     if type(payload["schema_version"]) is not int or payload["schema_version"] != 1:
         raise JournalRecoveryConflict("Unsupported operation journal schema")
@@ -340,6 +348,11 @@ def _operation_from_payload(
         raise JournalRecoveryConflict(
             "Operation journal created_at must be ISO 8601"
         ) from error
+    actor = payload.get("actor")
+    if actor is not None and (not isinstance(actor, str) or not actor.strip()):
+        raise JournalRecoveryConflict("Operation journal actor is invalid")
+    if action == "delete" and actor is None:
+        raise JournalRecoveryConflict("Delete journals require actor provenance")
     return OperationJournal(
         schema_version=1,
         operation_id=operation_id,
@@ -349,13 +362,12 @@ def _operation_from_payload(
         canonical_memory_id=canonical_memory_id,
         targets=tuple(targets),
         created_at=created_at,
+        actor=actor,
     )
 
 
 def load_operation_journal(memory_home: Path, journal_path: Path) -> OperationJournal:
     """Strictly load a metadata-only operation journal without changing state."""
-    if journal_path.is_symlink():
-        raise JournalRecoveryConflict("Operation journal must not be a symlink")
     root = memory_home.resolve()
     transactions = root / "transactions"
     resolved_path = journal_path.resolve(strict=False)
@@ -363,10 +375,10 @@ def load_operation_journal(memory_home: Path, journal_path: Path) -> OperationJo
         raise JournalRecoveryConflict("Operation journal is outside transactions")
     try:
         payload = _strict_json_object(
-            journal_path.read_text(encoding="utf-8"),
+            read_regular_text_bounded(journal_path),
             "operation journal",
         )
-    except OSError as error:
+    except (OSError, UnicodeError) as error:
         raise JournalRecoveryConflict("Operation journal cannot be read") from error
     return _operation_from_payload(memory_home, journal_path, payload)
 
@@ -379,10 +391,6 @@ def persist_operation_journal(
     root = memory_home.resolve()
     transactions = root / "transactions"
     journal_path = transactions / f"{operation.operation_id}.json"
-    if journal_path.exists():
-        raise JournalRecoveryConflict(
-            f"Pending operation journal already exists: {operation.operation_id}"
-        )
     payload = json.loads(json.dumps(asdict(operation)))
     validated = _operation_from_payload(memory_home, journal_path, payload)
     serialized = (
@@ -395,13 +403,102 @@ def persist_operation_journal(
         )
         + "\n"
     )
-    prepared = prepare_atomic_text(journal_path, serialized)
     try:
-        prepared.replace()
-        fsync_directory(transactions)
-    finally:
-        prepared.discard()
+        publish_text_exclusive(transactions, journal_path.name, serialized)
+    except (FileExistsError, OSError, ValueError) as error:
+        raise JournalRecoveryConflict(
+            f"Unable to publish operation journal: {operation.operation_id}"
+        ) from error
     return journal_path
+
+
+def inspect_operation_journal_state(
+    memory_home: Path,
+    operation: OperationJournal,
+) -> None:
+    """Validate whether a journal can roll forward without changing state."""
+    final_ids: set[str] = set()
+    for target_info in sorted(operation.targets, key=lambda item: item.target):
+        _target_name, target = _journal_relative_path(
+            memory_home,
+            target_info.target,
+            "journal target",
+        )
+        _temporary_name, temporary = _journal_relative_path(
+            memory_home,
+            target_info.temporary,
+            "journal temporary",
+        )
+        current_digest = digest_file(target)
+        if current_digest == target_info.after_sha256:
+            final_source = target
+        elif current_digest == target_info.before_sha256:
+            if digest_file(temporary) != target_info.after_sha256:
+                raise JournalRecoveryConflict(
+                    f"Required prepared temporary is missing or corrupt: {target_info.target}"
+                )
+            final_source = temporary
+        else:
+            raise JournalRecoveryConflict(
+                f"Canonical target digest is neither before nor after: {target_info.target}"
+            )
+        try:
+            document = parse_session_file(final_source)
+        except Exception as error:
+            raise JournalRecoveryConflict(
+                f"Prepared canonical document is invalid: {target_info.target}"
+            ) from error
+        if document.schema_version != 2:
+            raise JournalRecoveryConflict("Recovery requires schema-v2 documents")
+        storage_key = PurePosixPath(target_info.target).parts[1]
+        try:
+            registered = ProjectRegistry(memory_home).resolve(storage_key)
+        except ProjectResolutionError as error:
+            raise JournalRecoveryConflict(
+                "Journal target project cannot be resolved"
+            ) from error
+        canonical_key = (
+            registered.identity.key if registered is not None else storage_key
+        )
+        storage_keys = (
+            registered.storage_keys if registered is not None else (storage_key,)
+        )
+        if canonical_key not in operation.project_keys:
+            raise JournalRecoveryConflict(
+                "Journal target belongs to a different project scope"
+            )
+        if document.project not in storage_keys and document.project != canonical_key:
+            raise JournalRecoveryConflict(
+                "Recovered document has a wrong project scope"
+            )
+        for entry in document.entries:
+            memory = entry.to_memory(str(target))
+            if memory.project not in storage_keys and memory.project != canonical_key:
+                raise JournalRecoveryConflict(
+                    f"Memory {memory.id} has a wrong project in recovered Markdown"
+                )
+            if memory.content_fingerprint != content_fingerprint(memory):
+                raise JournalRecoveryConflict(
+                    f"Memory {memory.id} has an invalid recovered fingerprint"
+                )
+            if memory.id in final_ids:
+                raise JournalRecoveryConflict(
+                    f"Memory {memory.id} appears in multiple recovered documents"
+                )
+            final_ids.add(memory.id)
+
+    affected = set(operation.affected_memory_ids)
+    present = affected.intersection(final_ids)
+    if operation.action == "delete" and present:
+        raise JournalRecoveryConflict(
+            "Deleted memories remain in recovered Markdown: "
+            + ", ".join(sorted(present))
+        )
+    if operation.action != "delete" and present != affected:
+        raise JournalRecoveryConflict(
+            "Affected memories are missing from recovered Markdown: "
+            + ", ".join(sorted(affected - present))
+        )
 
 
 @contextmanager
@@ -475,6 +572,7 @@ class _PersistenceScope:
 @dataclass
 class _MutationPlan:
     action: str
+    actor: str | None
     project_key: str
     documents: dict[Path, SessionDocument]
     affected_memory_ids: tuple[str, ...]
@@ -483,6 +581,7 @@ class _MutationPlan:
     deleted_operations: tuple[tuple[str, MemoryOperation], ...]
     invalidate_memory_ids: tuple[str, ...]
     embed_memories: tuple[Memory, ...]
+    operation_alias_keys: tuple[str, ...]
     result: dict[str, object]
 
 
@@ -550,6 +649,7 @@ class CanonicalPersistence:
         self.fault = fault or (lambda phase: None)
         self.embed: EmbedCallback | None = None
         self.startup_recoveries: tuple[str, ...] = ()
+        self.startup_vector_repairs: tuple[str, ...] = ()
 
     def save(self, request: SaveRequest) -> dict[str, object]:
         """Persist one operation with Markdown as the canonical source."""
@@ -610,54 +710,38 @@ class CanonicalPersistence:
                     projection is not None
                     and projection.get("content_fingerprint")
                     == memory.content_fingerprint
-                )
-                requires_rewrite = (
-                    memory.project != scope.canonical_key
-                    or canonical.document.project != scope.canonical_key
+                    and self.db.has_vector(memory.id)
                 )
                 memory.project = scope.canonical_key
-                prepared = None
-                if requires_rewrite:
-                    canonical.document.project = scope.canonical_key
-                    upsert_session_memory_entry(canonical.document, memory, details)
-                    rendered = self._render_document(canonical.document)
-                    prepared = prepare_atomic_text(canonical.path, rendered)
-                try:
-                    if prepared is not None:
-                        self.fault("after_temp_fsync")
-                    with self.db.transaction():
-                        self.db.upsert_memory(memory, details)
-                        self.db.upsert_operation(
-                            scope.canonical_key,
-                            memory.id,
-                            operation,
-                        )
-                        alias_keys = tuple(
-                            key for key in scope.storage_keys if key != scope.canonical_key
-                        )
-                        if alias_keys:
-                            placeholders = ", ".join("?" for _ in alias_keys)
-                            self.db.conn.execute(
-                                f"DELETE FROM save_operations WHERE operation_id = ? "
-                                f"AND project IN ({placeholders})",
-                                (operation_id, *alias_keys),
-                            )
-                        if not vector_is_current:
-                            self.db.invalidate_vector(memory.id)
-                        if prepared is not None:
-                            self.fault("after_db_write")
-                            prepared.replace()
-                            self.fault("after_markdown_replace")
-                    if prepared is not None:
-                        self.fault("after_db_commit")
-                finally:
-                    if prepared is not None:
-                        prepared.discard()
-                result = {
-                    "id": memory.id,
-                    "file_path": str(canonical.path),
-                    "action": "replayed",
-                }
+                canonical.document.project = scope.canonical_key
+                upsert_session_memory_entry(canonical.document, memory, details)
+                plan = _MutationPlan(
+                    action=(
+                        "create" if operation.action == "created" else "update"
+                    ),
+                    actor=operation.source,
+                    project_key=scope.canonical_key,
+                    documents={canonical.path: canonical.document},
+                    affected_memory_ids=(memory.id,),
+                    canonical_memory_id=memory.id,
+                    deleted_memory_ids=(),
+                    deleted_operations=(),
+                    invalidate_memory_ids=(memory.id,) if not vector_is_current else (),
+                    embed_memories=(copy.deepcopy(memory),),
+                    operation_alias_keys=tuple(
+                        key for key in scope.storage_keys if key != scope.canonical_key
+                    ),
+                    result={
+                        "id": memory.id,
+                        "file_path": str(canonical.path),
+                        "action": "replayed",
+                    },
+                )
+                result, embeddings = self._commit_mutation_locked(
+                    plan,
+                    operation_id,
+                    validated_request.timestamp,
+                )
             else:
                 ledgers = [
                     self.db.get_operation(storage_key, operation_id)
@@ -676,40 +760,41 @@ class CanonicalPersistence:
                 embedding_bytes = self._embedding_bytes(memory)
                 memory.content_fingerprint = self._fingerprint_bytes(embedding_bytes)
                 upsert_session_memory_entry(document, memory, details)
-                rendered = self._render_document(document)
-                prepared = prepare_atomic_text(target, rendered)
-                try:
-                    self.fault("after_temp_fsync")
-                    with self.db.transaction():
-                        self.db.upsert_memory(memory, details)
-                        self.db.upsert_operation(
-                            scope.canonical_key,
-                            memory.id,
-                            memory.operations[-1],
-                        )
-                        self.db.invalidate_vector(memory.id)
-                        self.fault("after_db_write")
-                        prepared.replace()
-                        self.fault("after_markdown_replace")
-                    self.fault("after_db_commit")
-                finally:
-                    prepared.discard()
-                result = {
-                    "id": memory.id,
-                    "file_path": str(target),
-                    "action": action,
-                }
+                projection = self.db.get_memory(memory.id)
+                requires_vector = (
+                    projection is None
+                    or projection.get("content_fingerprint")
+                    != memory.content_fingerprint
+                    or not self.db.has_vector(memory.id)
+                )
+                plan = _MutationPlan(
+                    action="create" if action == "created" else "update",
+                    actor=source,
+                    project_key=scope.canonical_key,
+                    documents={target: document},
+                    affected_memory_ids=(memory.id,),
+                    canonical_memory_id=memory.id,
+                    deleted_memory_ids=(),
+                    deleted_operations=(),
+                    invalidate_memory_ids=(memory.id,) if requires_vector else (),
+                    embed_memories=(copy.deepcopy(memory),) if requires_vector else (),
+                    operation_alias_keys=tuple(
+                        key for key in scope.storage_keys if key != scope.canonical_key
+                    ),
+                    result={
+                        "id": memory.id,
+                        "file_path": str(target),
+                        "action": action,
+                    },
+                )
+                result, embeddings = self._commit_mutation_locked(
+                    plan,
+                    operation_id,
+                    validated_request.timestamp,
+                )
 
         self.fault("before_vector_write")
-        vector_status, warning = self._write_vector(
-            memory.id,
-            memory.content_fingerprint,
-            embedding_bytes,
-        )
-        result["vector_status"] = vector_status
-        if warning is not None:
-            result["warning"] = warning
-        return result
+        return self._finish_mutation(result, embeddings)
 
     def update(
         self,
@@ -782,6 +867,7 @@ class CanonicalPersistence:
             changed_content = memory.content_fingerprint != previous_fingerprint
             plan = _MutationPlan(
                 action="update",
+                actor=actor,
                 project_key=scope.canonical_key,
                 documents={canonical.path: canonical.document},
                 affected_memory_ids=(memory.id,),
@@ -790,6 +876,7 @@ class CanonicalPersistence:
                 deleted_operations=(),
                 invalidate_memory_ids=(memory.id,) if changed_content else (),
                 embed_memories=(copy.deepcopy(memory),) if changed_content else (),
+                operation_alias_keys=(),
                 result={
                     "id": memory.id,
                     "file_path": str(canonical.path),
@@ -844,6 +931,7 @@ class CanonicalPersistence:
             upsert_session_memory_entry(canonical.document, memory, canonical.entry.details)
             plan = _MutationPlan(
                 action="archive",
+                actor=actor,
                 project_key=scope.canonical_key,
                 documents={canonical.path: canonical.document},
                 affected_memory_ids=(memory.id,),
@@ -852,6 +940,7 @@ class CanonicalPersistence:
                 deleted_operations=(),
                 invalidate_memory_ids=(memory.id,),
                 embed_memories=(),
+                operation_alias_keys=(),
                 result={"id": memory.id, "file_path": str(canonical.path), "action": "archived"},
             )
             result, embeddings = self._commit_mutation_locked(plan, operation_id, timestamp)
@@ -884,6 +973,7 @@ class CanonicalPersistence:
             upsert_session_memory_entry(canonical.document, memory, canonical.entry.details)
             plan = _MutationPlan(
                 action="restore",
+                actor=actor,
                 project_key=scope.canonical_key,
                 documents={canonical.path: canonical.document},
                 affected_memory_ids=(memory.id,),
@@ -892,6 +982,7 @@ class CanonicalPersistence:
                 deleted_operations=(),
                 invalidate_memory_ids=(memory.id,),
                 embed_memories=(copy.deepcopy(memory),),
+                operation_alias_keys=(),
                 result={"id": memory.id, "file_path": str(canonical.path), "action": "restored"},
             )
             result, embeddings = self._commit_mutation_locked(plan, operation_id, timestamp)
@@ -1013,6 +1104,7 @@ class CanonicalPersistence:
             )
             plan = _MutationPlan(
                 action="merge",
+                actor=actor,
                 project_key=scope.canonical_key,
                 documents=changed_documents,
                 affected_memory_ids=affected,
@@ -1021,6 +1113,7 @@ class CanonicalPersistence:
                 deleted_operations=(),
                 invalidate_memory_ids=invalidated,
                 embed_memories=(copy.deepcopy(canonical_memory),) if canonical_changed else (),
+                operation_alias_keys=(),
                 result={"id": canonical_memory.id, "merged": len(source_memories), "action": "merged"},
             )
             result, embeddings = self._commit_mutation_locked(plan, operation_id, timestamp)
@@ -1055,6 +1148,7 @@ class CanonicalPersistence:
             assign_entry_anchors(canonical.document.entries)
             plan = _MutationPlan(
                 action="delete",
+                actor=actor,
                 project_key=scope.canonical_key,
                 documents={canonical.path: canonical.document},
                 affected_memory_ids=(memory.id,),
@@ -1063,16 +1157,21 @@ class CanonicalPersistence:
                 deleted_operations=((memory.id, delete_operation),),
                 invalidate_memory_ids=(memory.id,),
                 embed_memories=(),
+                operation_alias_keys=(),
                 result={"id": memory.id, "action": "deleted"},
             )
             self._commit_mutation_locked(plan, operation_id, timestamp)
         return True
 
-    @staticmethod
-    def _validate_actor(actor: object) -> str:
+    def resolve_memory_id(self, memory_id: str) -> str:
+        """Resolve an exact ID or one unique literal prefix to its full ID."""
+        full_id, _scope = self._scope_for_memory(memory_id)
+        return full_id
+
+    def _validate_actor(self, actor: object) -> str:
         if not isinstance(actor, str) or not actor.strip():
             raise ValueError("actor must be a non-empty string")
-        return actor
+        return redact(actor, self.patterns)
 
     def _scope_for_memory(self, memory_id: str) -> tuple[str, _PersistenceScope]:
         if not isinstance(memory_id, str) or not memory_id:
@@ -1083,8 +1182,9 @@ class CanonicalPersistence:
         ).fetchall()
         if not rows:
             rows = self.db.conn.execute(
-                "SELECT id, project FROM memories WHERE id LIKE ? ORDER BY id",
-                (memory_id + "%",),
+                "SELECT id, project FROM memories "
+                "WHERE substr(id, 1, length(?)) = ? ORDER BY id",
+                (memory_id, memory_id),
             ).fetchall()
         if len(rows) != 1:
             if not rows:
@@ -1108,22 +1208,30 @@ class CanonicalPersistence:
         self,
         project_keys: Sequence[str],
     ) -> Iterator[None]:
-        closure, journals = self._journal_lock_closure(project_keys)
+        closure, _journals = self._journal_lock_closure(project_keys)
         recovered_embeddings: list[tuple[str, str, bytes]] = []
-        with acquire_project_locks(self.memory_home, closure):
-            current_closure, current_journals = self._journal_lock_closure(project_keys)
-            if tuple(current_closure) != tuple(closure):
-                raise JournalRecoveryConflict(
-                    "Pending operation lock closure changed during acquisition"
-                )
-            for journal_path, operation in current_journals:
-                if set(operation.project_keys).intersection(closure):
-                    recovered_embeddings.extend(
-                        self._recover_journal_locked(journal_path, operation)
+        try:
+            with acquire_project_locks(self.memory_home, closure):
+                current_closure, current_journals = self._journal_lock_closure(project_keys)
+                if tuple(current_closure) != tuple(closure):
+                    raise JournalRecoveryConflict(
+                        "Pending operation lock closure changed during acquisition"
                     )
-            yield
-        for memory_id, fingerprint, payload in recovered_embeddings:
-            self._write_vector(memory_id, fingerprint, payload)
+                for journal_path, operation in current_journals:
+                    if set(operation.project_keys).intersection(closure):
+                        recovered_embeddings.extend(
+                            self._recover_journal_locked(journal_path, operation)
+                        )
+                yield
+        finally:
+            for memory_id, fingerprint, payload in recovered_embeddings:
+                status, _warning = self._write_vector(
+                    memory_id,
+                    fingerprint,
+                    payload,
+                )
+                if status == "ready":
+                    self.db.clear_vector_repair(memory_id, fingerprint)
 
     def _append_operation(
         self,
@@ -1191,6 +1299,7 @@ class CanonicalPersistence:
                 for _, prepared in prepared_by_path
             ),
             created_at=timestamp,
+            actor=plan.actor,
         )
         journal_path = persist_operation_journal(self.memory_home, journal)
         self.fault("after_journal_fsync")
@@ -1218,12 +1327,33 @@ class CanonicalPersistence:
                             memory.id,
                             memory.operations[-1],
                         )
+                        if plan.operation_alias_keys:
+                            placeholders = ", ".join(
+                                "?" for _ in plan.operation_alias_keys
+                            )
+                            self.db.conn.execute(
+                                f"DELETE FROM save_operations "
+                                f"WHERE operation_id = ? "
+                                f"AND project IN ({placeholders})",
+                                (
+                                    memory.operations[-1].operation_id,
+                                    *plan.operation_alias_keys,
+                                ),
+                            )
             for memory_id, operation in plan.deleted_operations:
                 self.db.upsert_operation(plan.project_key, memory_id, operation)
             for memory_id in plan.deleted_memory_ids:
                 self.db.delete_memory(memory_id)
             for memory_id in plan.invalidate_memory_ids:
                 self.db.invalidate_vector(memory_id)
+                self.db.clear_vector_repair(memory_id)
+            for memory in plan.embed_memories:
+                if memory.status == "active" and memory.content_fingerprint is not None:
+                    self.db.queue_vector_repair(
+                        memory.id,
+                        memory.content_fingerprint,
+                        timestamp,
+                    )
             self.fault("after_db_write")
             for index, (_path, prepared) in enumerate(
                 sorted(prepared_by_path, key=lambda item: str(item[0]))
@@ -1259,6 +1389,8 @@ class CanonicalPersistence:
                 fingerprint,
                 payload,
             )
+            if status == "ready":
+                self.db.clear_vector_repair(memory_id, fingerprint)
             statuses.append(status)
             warning = warning or current_warning
         result["vector_status"] = (
@@ -1291,8 +1423,46 @@ class CanonicalPersistence:
                 embeddings.extend(self._recover_journal_locked(journal_path, operation))
                 recovered.append(operation.operation_id)
         for memory_id, fingerprint, payload in embeddings:
-            self._write_vector(memory_id, fingerprint, payload)
+            status, _warning = self._write_vector(memory_id, fingerprint, payload)
+            if status == "ready":
+                self.db.clear_vector_repair(memory_id, fingerprint)
         return recovered
+
+    def repair_pending_vectors(self) -> tuple[str, ...]:
+        """Drain durable vector work with fingerprint compare-and-swap safety."""
+        repaired: list[str] = []
+        for queued in self.db.list_vector_repairs():
+            memory_id = str(queued["memory_id"])
+            fingerprint = str(queued["content_fingerprint"])
+            row = self.db.get_memory(memory_id)
+            if (
+                row is None
+                or (row.get("status") or "active") != "active"
+                or row.get("content_fingerprint") != fingerprint
+            ):
+                self.db.clear_vector_repair(memory_id, fingerprint)
+                continue
+            try:
+                raw_tags = json.loads(row.get("tags") or "[]")
+            except (TypeError, json.JSONDecodeError):
+                raw_tags = []
+            tags = [item for item in raw_tags if isinstance(item, str)]
+            payload = embedding_text(
+                title=str(row.get("title") or ""),
+                what=str(row.get("what") or ""),
+                why=row.get("why") if isinstance(row.get("why"), str) else None,
+                impact=(
+                    row.get("impact")
+                    if isinstance(row.get("impact"), str)
+                    else None
+                ),
+                tags=tags,
+            ).encode("utf-8")
+            status, _warning = self._write_vector(memory_id, fingerprint, payload)
+            if status == "ready":
+                self.db.clear_vector_repair(memory_id, fingerprint)
+                repaired.append(memory_id)
+        return tuple(repaired)
 
     def _journal_lock_closure(
         self,
@@ -1300,10 +1470,19 @@ class CanonicalPersistence:
     ) -> tuple[tuple[str, ...], list[tuple[Path, OperationJournal]]]:
         requested = {validate_storage_key(key) for key in project_keys}
         transactions = self.memory_home.resolve() / "transactions"
-        if transactions.exists() and (
-            transactions.is_symlink() or not transactions.is_dir()
-        ):
-            raise JournalRecoveryConflict("transactions must be a local directory")
+        if os.path.lexists(transactions):
+            try:
+                transactions_metadata = transactions.lstat()
+            except OSError as error:
+                raise JournalRecoveryConflict(
+                    "transactions cannot be inspected"
+                ) from error
+            if transactions.is_symlink() or not stat.S_ISDIR(
+                transactions_metadata.st_mode
+            ):
+                raise JournalRecoveryConflict(
+                    "transactions must be a local directory"
+                )
         journals: list[tuple[Path, OperationJournal]] = []
         if transactions.is_dir():
             for journal_path in sorted(transactions.glob("*.json")):
@@ -1415,6 +1594,11 @@ class CanonicalPersistence:
 
         affected = set(operation.affected_memory_ids)
         present = affected.intersection(final_ids)
+        if operation.action == "delete" and present:
+            raise JournalRecoveryConflict(
+                "Deleted memories remain in recovered Markdown: "
+                + ", ".join(sorted(present))
+            )
         if operation.action != "delete" and present != affected:
             missing = sorted(affected - present)
             raise JournalRecoveryConflict(
@@ -1428,7 +1612,16 @@ class CanonicalPersistence:
             original_mode = (
                 stat.S_IMODE(target.stat().st_mode) if target.exists() else None
             )
-            PreparedAtomicWrite(target, temporary, original_mode).replace()
+            try:
+                PreparedAtomicWrite(
+                    target,
+                    temporary,
+                    original_mode,
+                ).replace_if_digest(target_info.before_sha256)
+            except ConcurrentModificationError as error:
+                raise JournalRecoveryConflict(
+                    f"Canonical target changed during recovery: {target_info.target}"
+                ) from error
             if digest_file(target) != target_info.after_sha256:
                 raise JournalRecoveryConflict(
                     f"Recovered target digest is invalid: {target_info.target}"
@@ -1451,7 +1644,7 @@ class CanonicalPersistence:
                     if existing is not None:
                         delete_operation = MemoryOperation(
                             operation_id=operation.operation_id,
-                            source=None,
+                            source=operation.actor,
                             action="deleted",
                             request_fingerprint="mutation:" + operation.operation_id,
                             timestamp=operation.created_at,
@@ -1463,6 +1656,19 @@ class CanonicalPersistence:
                         )
                     self.db.delete_memory(memory_id)
                 self.db.invalidate_vector(memory_id)
+                projected_after = final_ids.get(memory_id)
+                if (
+                    projected_after is not None
+                    and projected_after[0].status == "active"
+                    and projected_after[0].content_fingerprint is not None
+                ):
+                    self.db.queue_vector_repair(
+                        memory_id,
+                        projected_after[0].content_fingerprint,
+                        operation.created_at,
+                    )
+                else:
+                    self.db.clear_vector_repair(memory_id)
 
         for target_info, _target, temporary, _needs_replace, _document in preflight:
             if temporary.exists() and digest_file(temporary) == target_info.after_sha256:

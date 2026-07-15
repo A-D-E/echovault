@@ -4,9 +4,95 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import stat
+import tempfile
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
+
+
+def _operation_journal_diagnostics(
+    memory_home: Path,
+    project: str | None,
+) -> list[dict[str, str]]:
+    from memory.persistence import (
+        JournalRecoveryConflict,
+        inspect_operation_journal_state,
+        load_operation_journal,
+    )
+
+    transactions = memory_home.resolve() / "transactions"
+    if not os.path.lexists(transactions):
+        return []
+    try:
+        metadata = transactions.lstat()
+    except OSError:
+        return [{"type": "journal_recovery_conflict", "operation_id": "transactions"}]
+    if transactions.is_symlink() or not stat.S_ISDIR(metadata.st_mode):
+        return [{"type": "journal_recovery_conflict", "operation_id": "transactions"}]
+
+    diagnostics: list[dict[str, str]] = []
+    try:
+        journal_paths = sorted(
+            path for path in transactions.iterdir() if path.suffix == ".json"
+        )
+    except OSError:
+        return [{"type": "journal_recovery_conflict", "operation_id": "transactions"}]
+    for journal_path in journal_paths:
+        try:
+            operation = load_operation_journal(memory_home, journal_path)
+            inspect_operation_journal_state(memory_home, operation)
+        except JournalRecoveryConflict:
+            diagnostics.append(
+                {
+                    "type": "journal_recovery_conflict",
+                    "operation_id": journal_path.stem,
+                }
+            )
+            continue
+        if project is None or project in operation.project_keys:
+            diagnostics.append(
+                {
+                    "type": "pending_operation_journal",
+                    "operation_id": operation.operation_id,
+                }
+            )
+    return diagnostics
+
+
+def _empty_doctor_report(
+    memory_home: Path,
+    project: str | None,
+    *,
+    database_error: str | None = None,
+) -> dict:
+    operation_journals = _operation_journal_diagnostics(memory_home, project)
+    report = {
+        "status": "warning" if operation_journals or database_error else "ok",
+        "memories": 0,
+        "active": 0,
+        "missing_markdown_files": 0,
+        "orphaned_details": 0,
+        "broken_absolute_related_files": 0,
+        "vectors": {"available": False, "rows": 0, "missing": 0},
+        "embedding_dimension": None,
+        "lifecycle_counts": {
+            key: 0
+            for key in (
+                "duplicates",
+                "contradictions",
+                "stale",
+                "superseded",
+                "completed_followups",
+                "broad",
+            )
+        },
+        "operation_journals": operation_journals,
+    }
+    if database_error is not None:
+        report["database_error"] = database_error
+    return report
 
 
 def lifecycle_review(db, project: str | None = None) -> dict[str, list]:
@@ -43,8 +129,6 @@ def lifecycle_review(db, project: str | None = None) -> dict[str, list]:
 
 
 def doctor(service, project: str | None = None) -> dict:
-    from memory.persistence import JournalRecoveryConflict, load_operation_journal
-
     db = service.db
     memories = db.list_memories(limit=100000, project=project, include_archived=True)
     cursor = db.conn.cursor()
@@ -64,30 +148,10 @@ def doctor(service, project: str | None = None) -> dict:
         vector_rows = cursor.fetchone()[0]
     active_count = sum(1 for m in memories if (m.get("status") or "active") == "active")
     lifecycle = lifecycle_review(db, project)
-    operation_journals: list[dict[str, str]] = []
-    transactions = Path(service.memory_home).resolve() / "transactions"
-    if transactions.is_dir() and not transactions.is_symlink():
-        for journal_path in sorted(transactions.glob("*.json")):
-            try:
-                operation = load_operation_journal(
-                    Path(service.memory_home),
-                    journal_path,
-                )
-            except JournalRecoveryConflict:
-                operation_journals.append(
-                    {
-                        "type": "journal_recovery_conflict",
-                        "operation_id": journal_path.stem,
-                    }
-                )
-                continue
-            if project is None or project in operation.project_keys:
-                operation_journals.append(
-                    {
-                        "type": "pending_operation_journal",
-                        "operation_id": operation.operation_id,
-                    }
-                )
+    operation_journals = _operation_journal_diagnostics(
+        Path(service.memory_home),
+        project,
+    )
     return {
         "status": "ok" if not (orphaned_details or missing_files or operation_journals) else "warning",
         "memories": len(memories), "active": active_count,
@@ -98,3 +162,88 @@ def doctor(service, project: str | None = None) -> dict:
         "lifecycle_counts": {key: len(value) for key, value in lifecycle.items()},
         "operation_journals": operation_journals,
     }
+
+
+def doctor_home(memory_home: Path, project: str | None = None) -> dict:
+    """Inspect one memory home without creating or modifying any storage."""
+    from memory.db import MemoryDB
+
+    database_path = memory_home / "index.db"
+    if not os.path.lexists(database_path):
+        return _empty_doctor_report(memory_home, project)
+    try:
+        metadata = database_path.lstat()
+    except OSError:
+        return _empty_doctor_report(
+            memory_home,
+            project,
+            database_error="index_unreadable",
+        )
+    if database_path.is_symlink() or not stat.S_ISREG(metadata.st_mode):
+        return _empty_doctor_report(
+            memory_home,
+            project,
+            database_error="index_not_regular",
+        )
+
+    def inspect_database(path: Path, *, immutable: bool) -> dict:
+        try:
+            database = MemoryDB(
+                str(path),
+                read_only=True,
+                immutable=immutable,
+            )
+        except Exception:
+            return _empty_doctor_report(
+                memory_home,
+                project,
+                database_error="index_read_failed",
+            )
+        service = type(
+            "ReadOnlyDoctorService",
+            (),
+            {"db": database, "memory_home": str(memory_home)},
+        )()
+        try:
+            return doctor(service, project)
+        except Exception:
+            return _empty_doctor_report(
+                memory_home,
+                project,
+                database_error="index_schema_unreadable",
+            )
+        finally:
+            database.close()
+
+    for suffix in ("-wal", "-shm"):
+        sidecar = Path(str(database_path) + suffix)
+        if os.path.lexists(sidecar):
+            try:
+                sidecar_metadata = sidecar.lstat()
+            except OSError:
+                return _empty_doctor_report(
+                    memory_home,
+                    project,
+                    database_error="index_sidecar_unreadable",
+                )
+            if sidecar.is_symlink() or not stat.S_ISREG(sidecar_metadata.st_mode):
+                return _empty_doctor_report(
+                    memory_home,
+                    project,
+                    database_error="index_sidecar_not_regular",
+                )
+
+    wal_path = Path(str(database_path) + "-wal")
+    if not wal_path.exists() or wal_path.stat().st_size == 0:
+        return inspect_database(database_path, immutable=True)
+
+    # A live WAL must not be ignored.  Inspect a private point-in-time copy so
+    # SQLite may create lock sidecars without touching the canonical home.
+    with tempfile.TemporaryDirectory(prefix="echovault-doctor-") as temp_dir:
+        copied_database = Path(temp_dir) / database_path.name
+        shutil.copy2(database_path, copied_database)
+        for suffix in ("-wal", "-shm"):
+            source = Path(str(database_path) + suffix)
+            if source.exists() and source.is_file():
+                shutil.copy2(source, Path(str(copied_database) + suffix))
+        return inspect_database(copied_database, immutable=False)

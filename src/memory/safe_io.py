@@ -3,6 +3,7 @@ from __future__ import annotations
 import errno
 import hashlib
 import os
+import secrets
 import stat
 import tempfile
 import time
@@ -120,6 +121,169 @@ def fsync_directory(path: Path) -> None:
     descriptor = os.open(path, os.O_RDONLY)
     try:
         os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def publish_text_exclusive(
+    directory: Path,
+    filename: str,
+    content: str,
+    encoding: str = 'utf-8',
+) -> Path:
+    """Durably publish a complete text file without replacing any entry.
+
+    On POSIX the directory is pinned with a no-follow descriptor and the fully
+    fsynced temporary is published with a hard link.  Linking is atomic and
+    fails for regular, symlink, and dangling-symlink collisions.  The Windows
+    fallback performs the same no-overwrite publication with a same-directory
+    hard link after rejecting a reparse-like directory identity change.
+    """
+    if not filename or Path(filename).name != filename or filename in {'.', '..'}:
+        raise ValueError('filename must be one safe path component')
+
+    parent = directory.parent.resolve()
+    if directory.parent.resolve(strict=False) != parent:
+        raise OSError('publication parent changed identity')
+
+    if os.name == 'nt':
+        if directory.exists():
+            metadata = directory.lstat()
+            is_junction = bool(
+                hasattr(directory, 'is_junction') and directory.is_junction()
+            )
+            if (
+                directory.is_symlink()
+                or is_junction
+                or not stat.S_ISDIR(metadata.st_mode)
+            ):
+                raise OSError('publication directory must be a local directory')
+        else:
+            directory.mkdir(parents=False)
+        if directory.resolve(strict=False) != directory:
+            raise OSError('publication directory changed identity')
+        prepared = prepare_atomic_text(directory / filename, content, encoding)
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            move_file_ex = ctypes.WinDLL('kernel32', use_last_error=True).MoveFileExW
+            move_file_ex.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD]
+            move_file_ex.restype = wintypes.BOOL
+            movefile_write_through = 0x00000008
+            if not move_file_ex(
+                str(prepared.temporary),
+                str(prepared.target),
+                movefile_write_through,
+            ):
+                raise ctypes.WinError(ctypes.get_last_error())
+        finally:
+            prepared.discard()
+        return directory / filename
+
+    root_flags = os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_NOFOLLOW', 0)
+    root_fd = os.open(parent, root_flags)
+    directory_fd: int | None = None
+    temporary_name: str | None = None
+    try:
+        try:
+            os.mkdir(directory.name, mode=0o700, dir_fd=root_fd)
+        except FileExistsError:
+            pass
+        directory_fd = os.open(directory.name, root_flags, dir_fd=root_fd)
+        directory_metadata = os.fstat(directory_fd)
+        if not stat.S_ISDIR(directory_metadata.st_mode):
+            raise OSError('publication directory must be a directory')
+
+        payload = content.encode(encoding)
+        for _attempt in range(128):
+            candidate = f'.{filename}.{secrets.token_hex(12)}.tmp'
+            flags = (
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, 'O_NOFOLLOW', 0)
+            )
+            try:
+                descriptor = os.open(candidate, flags, 0o600, dir_fd=directory_fd)
+            except FileExistsError:
+                continue
+            temporary_name = candidate
+            break
+        else:  # pragma: no cover - cryptographically improbable exhaustion
+            raise FileExistsError('unable to reserve publication temporary')
+
+        try:
+            view = memoryview(payload)
+            while view:
+                written = os.write(descriptor, view)
+                view = view[written:]
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+        os.link(
+            temporary_name,
+            filename,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
+        os.fsync(directory_fd)
+        os.unlink(temporary_name, dir_fd=directory_fd)
+        temporary_name = None
+        os.fsync(directory_fd)
+        return directory / filename
+    finally:
+        if temporary_name is not None and directory_fd is not None:
+            try:
+                os.unlink(temporary_name, dir_fd=directory_fd)
+            except FileNotFoundError:
+                pass
+        if directory_fd is not None:
+            os.close(directory_fd)
+        os.close(root_fd)
+
+
+def read_regular_text_bounded(
+    path: Path,
+    *,
+    max_bytes: int = 1_048_576,
+    encoding: str = 'utf-8',
+) -> str:
+    """Read one bounded regular file without following symlinks or FIFOs."""
+    initial = path.lstat()
+    if not stat.S_ISREG(initial.st_mode):
+        raise OSError('path is not a regular file')
+    if initial.st_size > max_bytes:
+        raise OSError('file exceeds the bounded read limit')
+    flags = os.O_RDONLY | getattr(os, 'O_NONBLOCK', 0) | getattr(os, 'O_NOFOLLOW', 0)
+    if os.name == 'nt':
+        flags |= getattr(os, 'O_BINARY', 0)
+    descriptor = os.open(path, flags)
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise OSError('path is not a regular file')
+        if (metadata.st_dev, metadata.st_ino) != (initial.st_dev, initial.st_ino):
+            raise OSError('path changed identity before it was opened')
+        if metadata.st_size > max_bytes:
+            raise OSError('file exceeds the bounded read limit')
+        chunks: list[bytes] = []
+        remaining = max_bytes + 1
+        while remaining:
+            chunk = os.read(descriptor, min(65_536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        payload = b''.join(chunks)
+        if len(payload) > max_bytes:
+            raise OSError('file exceeds the bounded read limit')
+        final = path.lstat()
+        if (final.st_dev, final.st_ino) != (metadata.st_dev, metadata.st_ino):
+            raise OSError('path changed identity while it was read')
+        return payload.decode(encoding, errors='strict')
     finally:
         os.close(descriptor)
 

@@ -341,10 +341,11 @@ def _apply_admin_request(
         )
 
     memory_id = cast(str, payload["memory_id"])
-    result = service.delete(memory_id, actor=actor)
+    canonical_id = service.resolve_memory_id(memory_id)
+    result = service.delete(canonical_id, actor=actor)
     return _admin_result(
         result,
-        fallback_id=memory_id,
+        fallback_id=canonical_id,
         default_status="deleted",
     )
 
@@ -907,10 +908,9 @@ def review_cmd(project):
 @click.option("--project", default=None)
 def doctor_cmd(project):
     """Check vault, index, vectors, references, and lifecycle health."""
-    from memory.health import doctor
-    svc = MemoryService(recover_pending=False)
-    report = doctor(svc, project)
-    svc.close()
+    from memory.health import doctor_home
+
+    report = doctor_home(Path(get_memory_home()), project)
     click.echo(yaml.safe_dump(report, sort_keys=False))
 
 

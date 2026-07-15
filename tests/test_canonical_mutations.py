@@ -466,7 +466,7 @@ def test_journal_loader_rejects_non_project_targets(
         persistence.load_operation_journal(memory_home, journal_path)
 
 
-def test_doctor_reports_pending_journal_without_recovery_or_writes(
+def test_doctor_reports_unrecoverable_journal_without_recovery_or_writes(
     tmp_path: Path,
 ) -> None:
     memory_home = tmp_path / ".memory"
@@ -493,7 +493,7 @@ def test_doctor_reports_pending_journal_without_recovery_or_writes(
         report = doctor(service)
         assert report["operation_journals"] == [
             {
-                "type": "pending_operation_journal",
+                "type": "journal_recovery_conflict",
                 "operation_id": operation.operation_id,
             }
         ]
