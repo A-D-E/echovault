@@ -16,6 +16,21 @@ from memory.integrations.ownership import (
 )
 
 _VERSION_PATTERN = re.compile(r"^[0-9A-Za-z][0-9A-Za-z.+-]*$")
+_UNBOUND_COMPATIBILITY = re.compile(
+    r"\n?<!-- echovault:unbound-compatibility:start -->.*?"
+    r"<!-- echovault:unbound-compatibility:end -->\n?",
+    re.DOTALL,
+)
+REQUIRED_PACKAGE_ASSETS = (
+    "common/echovault-skill.md",
+    "cursor/plugin.json",
+    "cursor/mcp.json",
+    "cursor/echovault.mdc",
+    "gemini/gemini-extension.json",
+    "gemini/GEMINI.md",
+    "gemini/hooks.json",
+    "schemas/ownership-manifest.schema.json",
+)
 _CURSOR_RESOURCES = {
     ".cursor-plugin/plugin.json": "cursor/plugin.json",
     "mcp.json": "cursor/mcp.json",
@@ -28,6 +43,36 @@ _GEMINI_RESOURCES = {
     "hooks/hooks.json": "gemini/hooks.json",
     "skills/echovault/SKILL.md": "common/echovault-skill.md",
 }
+
+
+class IntegrationAssetError(RuntimeError):
+    """Raised when one declared runtime package asset cannot be loaded."""
+
+
+def read_package_asset(relative_path: str) -> bytes:
+    """Read one allowlisted runtime asset from the installed memory package."""
+
+    if relative_path not in REQUIRED_PACKAGE_ASSETS:
+        raise ValueError(
+            f"{relative_path!r} is not a required package asset"
+        )
+    try:
+        return (
+            files("memory")
+            .joinpath("integrations", "assets", relative_path)
+            .read_bytes()
+        )
+    except (FileNotFoundError, OSError, TypeError) as error:
+        raise IntegrationAssetError(
+            f"Missing packaged integration asset: {relative_path}"
+        ) from error
+
+
+def _client_skill(template: str, version: str) -> str:
+    return _UNBOUND_COMPATIBILITY.sub("\n", template).replace(
+        "{{VERSION}}",
+        version,
+    )
 
 
 def _validated_placeholder(value: str, *, name: str) -> str:
@@ -44,10 +89,11 @@ def render_cursor_assets(command: str, version: str) -> dict[str, bytes]:
     if _VERSION_PATTERN.fullmatch(rendered_version) is None:
         raise ValueError("version contains unsupported characters")
 
-    root = files("memory.integrations.assets")
     assets: dict[str, bytes] = {}
     for destination, resource in _CURSOR_RESOURCES.items():
-        template = root.joinpath(resource).read_text(encoding="utf-8")
+        template = read_package_asset(resource).decode("utf-8")
+        if resource == "common/echovault-skill.md":
+            template = _client_skill(template, rendered_version)
         rendered = template.replace("{{MEMORY_COMMAND}}", rendered_command).replace(
             "{{VERSION}}", rendered_version
         )
@@ -90,10 +136,11 @@ def render_gemini_assets(
     if _VERSION_PATTERN.fullmatch(rendered_version) is None:
         raise ValueError("version contains unsupported characters")
 
-    root = files("memory.integrations.assets")
     assets: dict[str, bytes] = {}
     for destination, resource in _GEMINI_RESOURCES.items():
-        template = root.joinpath(resource).read_text(encoding="utf-8")
+        template = read_package_asset(resource).decode("utf-8")
+        if resource == "common/echovault-skill.md":
+            template = _client_skill(template, rendered_version)
         is_json = destination.endswith(".json")
         replacements = {
             "{{MEMORY_COMMAND}}": (
@@ -122,6 +169,9 @@ def render_gemini_assets(
 
 
 __all__ = [
+    "IntegrationAssetError",
+    "REQUIRED_PACKAGE_ASSETS",
+    "read_package_asset",
     "render_cursor_assets",
     "render_gemini_assets",
     "replace_managed_tree",

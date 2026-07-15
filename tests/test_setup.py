@@ -126,10 +126,9 @@ class TestClaudeCodeSetup:
         assert skill_path.read_text() == first
         assert result["message"] == "Already installed"
 
-    def test_packaged_fallback_skill_is_task_aware(self, claude_home, monkeypatch):
+    def test_packaged_skill_is_task_aware(self, claude_home):
         import memory.setup as setup_module
 
-        monkeypatch.setattr(setup_module, "_get_skill_md_path", lambda: "")
         setup_module.setup_claude_code(str(claude_home), project=True)
 
         content = (claude_home / "skills" / "echovault" / "SKILL.md").read_text()

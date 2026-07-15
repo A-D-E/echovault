@@ -14,6 +14,7 @@ from memory.integrations.config_io import (
     read_json_strict,
     read_toml_strict,
 )
+from memory.integrations.asset_io import read_package_asset
 
 
 # ---------------------------------------------------------------------------
@@ -233,26 +234,6 @@ def _remove_old_hooks(settings: dict) -> list[str]:
     return removed
 
 
-def _get_skill_md_path() -> str:
-    """Get the path to the bundled SKILL.md file."""
-    # Walk up from this file to find skills/echovault/SKILL.md in the package root.
-    # In an installed package, use importlib.resources; for dev, use relative path.
-    this_dir = os.path.dirname(os.path.abspath(__file__))
-    # Try dev layout: src/memory/setup.py -> ../../skills/echovault/SKILL.md
-    dev_path = os.path.join(this_dir, "..", "..", "skills", "echovault", "SKILL.md")
-    if os.path.exists(dev_path):
-        return os.path.abspath(dev_path)
-    # Try installed layout: check package data
-    try:
-        from importlib.resources import files
-        pkg_path = str(files("memory").joinpath("skill", "SKILL.md"))
-        if os.path.exists(pkg_path):
-            return pkg_path
-    except (ImportError, TypeError):
-        pass
-    return ""
-
-
 def _install_skill(agent_home: str, agent_name: str = "agent") -> bool:
     """Install the echovault SKILL.md into an agent's skills directory.
 
@@ -265,13 +246,15 @@ def _install_skill(agent_home: str, agent_name: str = "agent") -> bool:
     skill_dir = os.path.join(agent_home, "skills", "echovault")
     skill_path = os.path.join(skill_dir, "SKILL.md")
 
-    source = _get_skill_md_path()
-    if source:
-        with open(source) as f:
-            content = f.read()
-    else:
-        content = _FALLBACK_SKILL_MD
-    content = content.replace("{{AGENT_NAME}}", agent_name)
+    content = read_package_asset(
+        "common/echovault-skill.md"
+    ).decode("utf-8")
+    content = (
+        content.replace("{{AGENT_NAME}}", agent_name)
+        .replace("{{VERSION}}", "0.6.0")
+        .replace("<!-- echovault:unbound-compatibility:start -->\n", "")
+        .replace("<!-- echovault:unbound-compatibility:end -->\n", "")
+    )
 
     try:
         with open(skill_path) as f:
@@ -301,98 +284,6 @@ def _uninstall_skill(agent_home: str) -> bool:
         shutil.rmtree(skill_dir)
         return True
     return False
-
-
-_FALLBACK_SKILL_MD = """\
----
-name: echovault
-description: Local-first memory for coding agents. You MUST retrieve task-aware context before substantive work and save durable learnings before session end.
----
-
-# EchoVault — Agent Memory System
-
-You have persistent memory across sessions. USE IT.
-
-## Task-aware context — MANDATORY
-
-Before feature, planning, debugging, or architecture work, use `memory_context`
-with `agent="{{AGENT_NAME}}"` and `query` set to the current user request.
-
-CLI fallback:
-
-```bash
-memory context --project --agent {{AGENT_NAME}} --query "<current user request>"
-```
-
-If policy reports disabled, continue normally. Use explicit search when the
-context pack is insufficient.
-
-## Session end — MANDATORY
-
-Before ending your response to ANY task that involved making changes, debugging, deciding, or learning something, you MUST save a memory. This is not optional. If you did meaningful work, save it.
-
-```bash
-memory save \\
-  --title "Short descriptive title" \\
-  --what "What happened or was decided" \\
-  --why "Reasoning behind it" \\
-  --impact "What changed as a result" \\
-  --tags "tag1,tag2,tag3" \\
-  --category "<category>" \\
-  --related-files "path/to/file1,path/to/file2" \\
-  --source "{{AGENT_NAME}}" \\
-  --details "Context:
-
-             Options considered:
-             - Option A
-             - Option B
-
-             Decision:
-             Tradeoffs:
-             Follow-up:"
-```
-
-Categories: `decision`, `bug`, `pattern`, `learning`, `context`, `playbook`,
-`known_fix`, `constraint`, `project_state`, `active_work`.
-
-Use `--source {{AGENT_NAME}}` to identify the agent.
-
-### What to save
-
-You MUST save when any of these happen:
-
-- You made an architectural or design decision
-- You fixed a bug (include root cause and solution)
-- You discovered a non-obvious pattern or gotcha
-- You set up infrastructure, tooling, or configuration
-- You chose one approach over alternatives
-- You learned something about the codebase that isn't in the code
-- The user corrected you or clarified a requirement
-
-### What NOT to save
-
-- Trivial changes (typo fixes, formatting)
-- Information that's already obvious from reading the code
-- Duplicate of an existing memory (search first)
-
-## Other commands
-
-```bash
-memory config       # show current configuration
-memory sessions     # list session files
-memory reindex      # rebuild search index
-memory delete <id>  # remove a memory
-```
-
-## Rules
-
-- Retrieve before working. Save before finishing. No exceptions.
-- Always capture thorough details — write for a future agent with no context.
-- Never include API keys, secrets, or credentials.
-- Wrap sensitive values in `<redacted>` tags.
-- Search before saving to avoid duplicates.
-- One memory per distinct decision or event. Don't bundle unrelated things.
-"""
 
 
 def _get_claude_mcp_path(claude_home: str, project: bool) -> str:

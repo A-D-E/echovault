@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://echovault.local/schemas/ownership-manifest.schema.json",
+  "title": "EchoVault managed artifact ownership manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "integration_id", "asset_version", "managed"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "integration_id": {"type": "string", "minLength": 1},
+    "asset_version": {"type": "string", "minLength": 1},
+    "managed": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "kind", "sha256"],
+        "properties": {
+          "path": {"type": "string", "minLength": 1},
+          "kind": {"enum": ["file", "json-entry", "marked-block"]},
+          "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "locator": {"type": ["string", "null"]},
+          "marker": {"type": ["string", "null"]}
+        }
+      }
+    }
+  }
+}
