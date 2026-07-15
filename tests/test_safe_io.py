@@ -148,6 +148,39 @@ def test_digest_compare_rejects_a_change_after_prepare(tmp_path: Path) -> None:
     prepared.discard()
 
 
+def test_digest_compare_rejects_changed_prepared_payload(tmp_path: Path) -> None:
+    target = tmp_path / 'projects.json'
+    target.write_text('{"version":1}\n', encoding='utf-8')
+    expected_target = digest_file(target)
+    prepared = prepare_atomic_text(target, '{"version":2}\n')
+    expected_temporary = digest_file(prepared.temporary)
+    prepared.temporary.write_text('{"unexpected":true}\n', encoding='utf-8')
+
+    with pytest.raises(ConcurrentModificationError):
+        prepared.replace_if_digest(expected_target, expected_temporary)
+
+    assert target.read_text(encoding='utf-8') == '{"version":1}\n'
+    prepared.discard()
+
+
+def test_digest_rejects_oversized_sparse_file(tmp_path: Path) -> None:
+    path = tmp_path / 'oversized.md'
+    with path.open('wb') as handle:
+        handle.truncate(safe_io.MAX_DIGEST_FILE_BYTES + 1)
+
+    with pytest.raises(OSError, match='size limit'):
+        digest_file(path)
+
+
+@pytest.mark.skipif(not hasattr(os, 'mkfifo'), reason='FIFO is POSIX-specific')
+def test_digest_rejects_fifo_without_opening_it(tmp_path: Path) -> None:
+    path = tmp_path / 'prepared.fifo'
+    os.mkfifo(path)
+
+    with pytest.raises(OSError, match='regular file'):
+        digest_file(path)
+
+
 @pytest.mark.parametrize('code', [errno.EACCES, errno.EAGAIN, errno.EDEADLK])
 def test_windows_contention_errors_become_retryable(code: int) -> None:
     translated = translate_windows_lock_error(OSError(code, 'locked'))

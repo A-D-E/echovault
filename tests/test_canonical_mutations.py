@@ -11,6 +11,7 @@ from memory.core import MemoryService
 from memory.health import doctor
 from memory.markdown import parse_session_file
 from memory.models import RawMemoryInput
+from memory.persistence import SaveRequest
 from memory.projects import ProjectIdentity, ProjectRegistry
 from memory.safe_io import prepare_atomic_text
 
@@ -136,8 +137,12 @@ def test_operation_journal_is_durable_and_contains_no_memory_text(
         operation_id="55555555-5555-4555-8555-555555555555",
         action="merge",
         project_keys=("p--1",),
-        affected_memory_ids=("canonical-id", "source-1", "source-2"),
-        canonical_memory_id="canonical-id",
+        affected_memory_ids=(
+            "11111111-1111-4111-8111-111111111111",
+            "22222222-2222-4222-8222-222222222222",
+            "33333333-3333-4333-8333-333333333333",
+        ),
+        canonical_memory_id="11111111-1111-4111-8111-111111111111",
         targets=tuple(targets),
         created_at="2026-07-14T10:00:00+00:00",
     )
@@ -146,9 +151,9 @@ def test_operation_journal_is_durable_and_contains_no_memory_text(
     journal = json.loads(journal_path.read_text(encoding="utf-8"))
     assert journal["action"] == "merge"
     assert journal["affected_memory_ids"] == [
-        "canonical-id",
-        "source-1",
-        "source-2",
+        "11111111-1111-4111-8111-111111111111",
+        "22222222-2222-4222-8222-222222222222",
+        "33333333-3333-4333-8333-333333333333",
     ]
     assert len(journal["targets"]) == 3
     assert all(
@@ -359,39 +364,52 @@ def test_recovery_preflights_all_targets_before_replacing_any(
     tmp_path: Path,
 ) -> None:
     memory_home = tmp_path / ".memory"
-    operation_id = str(uuid.uuid4())
-    prepared_writes = []
-    targets = []
-    for day in ("2026-07-10", "2026-07-11"):
-        target = memory_home / "vault" / "p--1" / f"{day}-session.md"
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text("old\n", encoding="utf-8")
-        prepared = prepare_atomic_text(target, "new\n")
-        prepared_writes.append(prepared)
-        targets.append(persistence.JournalTarget.from_prepared(memory_home, prepared))
-    operation = persistence.OperationJournal(
-        schema_version=1,
-        operation_id=operation_id,
-        action="merge",
-        project_keys=("p--1",),
-        affected_memory_ids=("one", "two"),
-        canonical_memory_id="one",
-        targets=tuple(targets),
-        created_at="2026-07-14T10:00:00+00:00",
-    )
-    journal_path = persistence.persist_operation_journal(memory_home, operation)
-    prepared_writes[1].temporary.write_text("corrupt\n", encoding="utf-8")
-    db_service = MemoryService(str(memory_home), recover_pending=False)
+    db_service = MemoryService(str(memory_home))
     try:
+        first = db_service.persistence.save(
+            SaveRequest(
+                raw=RawMemoryInput(title="First target", what="canonical"),
+                project="p--1",
+                source="codex",
+                operation_id="11111111-1111-4111-8111-111111111111",
+                timestamp="2026-07-10T10:00:00+00:00",
+            )
+        )
+        second = db_service.persistence.save(
+            SaveRequest(
+                raw=RawMemoryInput(title="Second target", what="source"),
+                project="p--1",
+                source="cursor",
+                operation_id="22222222-2222-4222-8222-222222222222",
+                timestamp="2026-07-11T10:00:00+00:00",
+            )
+        )
+        targets = (Path(str(first["file_path"])), Path(str(second["file_path"])))
+        before = {path: path.read_bytes() for path in targets}
+
+        def inject(phase: str) -> None:
+            if phase == "after_journal_fsync":
+                raise RuntimeError("leave multi-target journal")
+
+        db_service.persistence.fault = inject
+        with pytest.raises(RuntimeError, match="leave multi-target journal"):
+            db_service.merge_memories(
+                str(first["id"]),
+                [str(second["id"])],
+                actor="dashboard",
+            )
+        db_service.persistence.fault = lambda _phase: None
+        journal_path = next((memory_home / "transactions").glob("*.json"))
+        journal = json.loads(journal_path.read_text(encoding="utf-8"))
+        corrupt = memory_home / journal["targets"][1]["temporary"]
+        corrupt.write_text("corrupt\n", encoding="utf-8")
+
         with pytest.raises(persistence.JournalRecoveryConflict):
             db_service.persistence.recover_pending_operations(("p--1",))
+        assert journal_path.exists()
+        assert {path: path.read_bytes() for path in targets} == before
     finally:
         db_service.close()
-    assert journal_path.exists()
-    assert [prepared.target.read_text(encoding="utf-8") for prepared in prepared_writes] == [
-        "old\n",
-        "old\n",
-    ]
 
 
 def test_acquire_project_locks_sorts_deduplicates_and_releases_reverse(
@@ -479,8 +497,8 @@ def test_doctor_reports_unrecoverable_journal_without_recovery_or_writes(
         operation_id=str(uuid.uuid4()),
         action="update",
         project_keys=("p--1",),
-        affected_memory_ids=("memory-id",),
-        canonical_memory_id="memory-id",
+        affected_memory_ids=("44444444-4444-4444-8444-444444444444",),
+        canonical_memory_id="44444444-4444-4444-8444-444444444444",
         targets=(persistence.JournalTarget.from_prepared(memory_home, prepared),),
         created_at="2026-07-14T10:00:00+00:00",
     )

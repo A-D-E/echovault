@@ -737,6 +737,64 @@ def test_old_embedding_cannot_replace_new_fingerprint(
     assert db.has_vector(sample_memory.id) is True
 
 
+def test_delayed_embedding_cannot_insert_vector_after_memory_is_archived(
+    db: MemoryDB, sample_memory: Memory
+) -> None:
+    sample_memory.content_fingerprint = "unchanged"
+    db.upsert_memory(sample_memory, None)
+    captured_fingerprint = sample_memory.content_fingerprint
+
+    sample_memory.status = "archived"
+    with db.transaction():
+        db.upsert_memory(sample_memory, None)
+        db.invalidate_vector(sample_memory.id)
+
+    assert db.upsert_vector_if_current(
+        sample_memory.id,
+        captured_fingerprint,
+        [0.1, 0.2],
+    ) is False
+    assert db.has_vector(sample_memory.id) is False
+
+
+def test_vector_cas_treats_legacy_null_status_as_active(
+    db: MemoryDB, sample_memory: Memory
+) -> None:
+    sample_memory.status = None
+    sample_memory.content_fingerprint = "legacy-active"
+    db.upsert_memory(sample_memory, None)
+
+    assert db.upsert_vector_if_current(
+        sample_memory.id,
+        "legacy-active",
+        [0.1, 0.2],
+    ) is True
+    assert db.has_vector(sample_memory.id) is True
+
+
+def test_exact_projection_delete_rejects_memory_id_prefix(
+    db: MemoryDB, sample_memory: Memory
+) -> None:
+    db.upsert_memory(sample_memory, None)
+
+    assert db.delete_memory_exact(sample_memory.id[:12]) is False
+    assert db.get_memory(sample_memory.id) is not None
+    assert db.delete_memory_exact(sample_memory.id) is True
+    assert db.get_memory(sample_memory.id) is None
+
+
+@pytest.mark.parametrize("literal_prefix", ["%", "_"])
+def test_projection_delete_treats_sql_wildcards_literally(
+    db: MemoryDB,
+    sample_memory: Memory,
+    literal_prefix: str,
+) -> None:
+    db.upsert_memory(sample_memory, None)
+
+    assert db.delete_memory(literal_prefix) is False
+    assert db.get_memory(sample_memory.id) is not None
+
+
 def test_vector_cas_rejects_missing_memory_and_fingerprint_mismatch(
     db: MemoryDB, sample_memory: Memory
 ) -> None:

@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
+import re
 import stat
 from typing import Optional
 import uuid
@@ -132,6 +133,32 @@ _JOURNAL_FIELDS = frozenset(
 _JOURNAL_TARGET_FIELDS = frozenset(
     {"target", "temporary", "before_sha256", "after_sha256"}
 )
+_ACTOR_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@/+\-]{0,127}\Z")
+_LEGACY_RECOVERY_ACTOR = "legacy-recovery"
+
+
+def _validate_actor_token(
+    actor: object,
+    *,
+    allow_none: bool,
+    error_type: type[Exception],
+) -> str | None:
+    if actor is None and allow_none:
+        return None
+    if not isinstance(actor, str) or _ACTOR_TOKEN.fullmatch(actor) is None:
+        raise error_type(
+            "actor must be a 1-128 character identity token"
+        )
+    return actor
+
+
+def _journal_digest(path: Path, label: str) -> str | None:
+    try:
+        return digest_file(path)
+    except (OSError, UnicodeError) as error:
+        raise JournalRecoveryConflict(
+            f"{label} must be one bounded regular file"
+        ) from error
 
 
 def _canonical_journal_uuid(value: object, label: str) -> str:
@@ -245,12 +272,17 @@ def _operation_from_payload(
         raise JournalRecoveryConflict(
             "Operation journal affected_memory_ids must be unique strings"
         )
+    affected_memory_ids = tuple(
+        _canonical_journal_uuid(memory_id, "Affected memory ID")
+        for memory_id in raw_ids
+    )
     canonical_memory_id = payload["canonical_memory_id"]
-    if canonical_memory_id is not None and not (
-        isinstance(canonical_memory_id, str) and canonical_memory_id
-    ):
-        raise JournalRecoveryConflict("Operation journal canonical_memory_id is invalid")
-    if canonical_memory_id is not None and canonical_memory_id not in raw_ids:
+    if canonical_memory_id is not None:
+        canonical_memory_id = _canonical_journal_uuid(
+            canonical_memory_id,
+            "Canonical memory ID",
+        )
+    if canonical_memory_id is not None and canonical_memory_id not in affected_memory_ids:
         raise JournalRecoveryConflict(
             "Operation journal canonical_memory_id must be affected"
         )
@@ -348,17 +380,21 @@ def _operation_from_payload(
         raise JournalRecoveryConflict(
             "Operation journal created_at must be ISO 8601"
         ) from error
+    actor_was_present = "actor" in payload
     actor = payload.get("actor")
-    if actor is not None and (not isinstance(actor, str) or not actor.strip()):
-        raise JournalRecoveryConflict("Operation journal actor is invalid")
-    if action == "delete" and actor is None:
-        raise JournalRecoveryConflict("Delete journals require actor provenance")
+    if action == "delete" and not actor_was_present:
+        actor = _LEGACY_RECOVERY_ACTOR
+    actor = _validate_actor_token(
+        actor,
+        allow_none=action != "delete",
+        error_type=JournalRecoveryConflict,
+    )
     return OperationJournal(
         schema_version=1,
         operation_id=operation_id,
         action=action,
         project_keys=project_keys,
-        affected_memory_ids=tuple(raw_ids),
+        affected_memory_ids=affected_memory_ids,
         canonical_memory_id=canonical_memory_id,
         targets=tuple(targets),
         created_at=created_at,
@@ -429,11 +465,14 @@ def inspect_operation_journal_state(
             target_info.temporary,
             "journal temporary",
         )
-        current_digest = digest_file(target)
+        current_digest = _journal_digest(target, "Journal target")
         if current_digest == target_info.after_sha256:
             final_source = target
         elif current_digest == target_info.before_sha256:
-            if digest_file(temporary) != target_info.after_sha256:
+            if _journal_digest(
+                temporary,
+                "Journal temporary",
+            ) != target_info.after_sha256:
                 raise JournalRecoveryConflict(
                     f"Required prepared temporary is missing or corrupt: {target_info.target}"
                 )
@@ -662,7 +701,7 @@ class CanonicalPersistence:
         )
         redacted = redact_memory_input(validated_request.raw, self.patterns)
         source = (
-            redact(validated_request.source, self.patterns)
+            self._validate_actor(validated_request.source)
             if validated_request.source is not None
             else None
         )
@@ -727,7 +766,11 @@ class CanonicalPersistence:
                     deleted_memory_ids=(),
                     deleted_operations=(),
                     invalidate_memory_ids=(memory.id,) if not vector_is_current else (),
-                    embed_memories=(copy.deepcopy(memory),),
+                    embed_memories=(
+                        (copy.deepcopy(memory),)
+                        if not vector_is_current
+                        else ()
+                    ),
                     operation_alias_keys=tuple(
                         key for key in scope.storage_keys if key != scope.canonical_key
                     ),
@@ -1169,9 +1212,14 @@ class CanonicalPersistence:
         return full_id
 
     def _validate_actor(self, actor: object) -> str:
-        if not isinstance(actor, str) or not actor.strip():
-            raise ValueError("actor must be a non-empty string")
-        return redact(actor, self.patterns)
+        redacted = redact(actor, self.patterns) if isinstance(actor, str) else actor
+        validated = _validate_actor_token(
+            redacted,
+            allow_none=False,
+            error_type=ValueError,
+        )
+        assert validated is not None
+        return validated
 
     def _scope_for_memory(self, memory_id: str) -> tuple[str, _PersistenceScope]:
         if not isinstance(memory_id, str) or not memory_id:
@@ -1321,29 +1369,29 @@ class CanonicalPersistence:
             for memory_id in plan.affected_memory_ids:
                 if memory_id in projected:
                     memory = projected[memory_id][0]
-                    if memory.operations:
+                    for memory_operation in memory.operations:
                         self.db.upsert_operation(
                             plan.project_key,
                             memory.id,
-                            memory.operations[-1],
+                            memory_operation,
                         )
-                        if plan.operation_alias_keys:
-                            placeholders = ", ".join(
-                                "?" for _ in plan.operation_alias_keys
-                            )
-                            self.db.conn.execute(
-                                f"DELETE FROM save_operations "
-                                f"WHERE operation_id = ? "
-                                f"AND project IN ({placeholders})",
-                                (
-                                    memory.operations[-1].operation_id,
-                                    *plan.operation_alias_keys,
-                                ),
-                            )
+                    if plan.operation_alias_keys:
+                        placeholders = ", ".join(
+                            "?" for _ in plan.operation_alias_keys
+                        )
+                        self.db.conn.execute(
+                            f"DELETE FROM save_operations "
+                            f"WHERE operation_id = ? "
+                            f"AND project IN ({placeholders})",
+                            (
+                                operation_id,
+                                *plan.operation_alias_keys,
+                            ),
+                        )
             for memory_id, operation in plan.deleted_operations:
                 self.db.upsert_operation(plan.project_key, memory_id, operation)
             for memory_id in plan.deleted_memory_ids:
-                self.db.delete_memory(memory_id)
+                self.db.delete_memory_exact(memory_id)
             for memory_id in plan.invalidate_memory_ids:
                 self.db.invalidate_vector(memory_id)
                 self.db.clear_vector_repair(memory_id)
@@ -1358,7 +1406,10 @@ class CanonicalPersistence:
             for index, (_path, prepared) in enumerate(
                 sorted(prepared_by_path, key=lambda item: str(item[0]))
             ):
-                prepared.replace()
+                prepared.replace_if_digest(
+                    journal.targets[index].before_sha256,
+                    journal.targets[index].after_sha256,
+                )
                 self.fault(f"after_target_replace:{index}")
         self.fault("after_db_commit")
         journal_path.unlink()
@@ -1535,12 +1586,15 @@ class CanonicalPersistence:
             )
             if target.resolve(strict=False) != target or temporary.resolve(strict=False) != temporary:
                 raise JournalRecoveryConflict("Journal target path changed identity")
-            current_digest = digest_file(target)
+            current_digest = _journal_digest(target, "Journal target")
             if current_digest == target_info.after_sha256:
                 final_source = target
                 needs_replace = False
             elif current_digest == target_info.before_sha256:
-                if digest_file(temporary) != target_info.after_sha256:
+                if _journal_digest(
+                    temporary,
+                    "Journal temporary",
+                ) != target_info.after_sha256:
                     raise JournalRecoveryConflict(
                         f"Required prepared temporary is missing or corrupt: {target_info.target}"
                     )
@@ -1617,12 +1671,15 @@ class CanonicalPersistence:
                     target,
                     temporary,
                     original_mode,
-                ).replace_if_digest(target_info.before_sha256)
-            except ConcurrentModificationError as error:
+                ).replace_if_digest(
+                    target_info.before_sha256,
+                    target_info.after_sha256,
+                )
+            except (ConcurrentModificationError, OSError) as error:
                 raise JournalRecoveryConflict(
                     f"Canonical target changed during recovery: {target_info.target}"
                 ) from error
-            if digest_file(target) != target_info.after_sha256:
+            if _journal_digest(target, "Recovered target") != target_info.after_sha256:
                 raise JournalRecoveryConflict(
                     f"Recovered target digest is invalid: {target_info.target}"
                 )
@@ -1654,7 +1711,7 @@ class CanonicalPersistence:
                             memory_id,
                             delete_operation,
                         )
-                    self.db.delete_memory(memory_id)
+                    self.db.delete_memory_exact(memory_id)
                 self.db.invalidate_vector(memory_id)
                 projected_after = final_ids.get(memory_id)
                 if (
@@ -1671,8 +1728,12 @@ class CanonicalPersistence:
                     self.db.clear_vector_repair(memory_id)
 
         for target_info, _target, temporary, _needs_replace, _document in preflight:
-            if temporary.exists() and digest_file(temporary) == target_info.after_sha256:
-                temporary.unlink()
+            if os.path.lexists(temporary):
+                if _journal_digest(
+                    temporary,
+                    "Recovered temporary",
+                ) == target_info.after_sha256:
+                    temporary.unlink()
                 fsync_directory(temporary.parent)
         journal_path.unlink()
         fsync_directory(journal_path.parent)

@@ -19,6 +19,9 @@ class ConcurrentModificationError(RuntimeError):
     pass
 
 
+MAX_DIGEST_FILE_BYTES = 64 * 1024 * 1024
+
+
 def translate_windows_lock_error(error: OSError) -> OSError:
     retryable_errno = {errno.EACCES, errno.EAGAIN, errno.EDEADLK}
     retryable_winerror = {32, 33}  # sharing and lock violations
@@ -304,7 +307,25 @@ class PreparedAtomicWrite:
                 os.close(descriptor)
         _replace_and_sync(self.temporary, self.target)
 
-    def replace_if_digest(self, expected_digest: str | None) -> None:
+    def replace_if_digest(
+        self,
+        expected_digest: str | None,
+        expected_temporary_digest: str | None = None,
+    ) -> None:
+        """Publish only from the expected prepared file onto expected content.
+
+        This is an optimistic guard used while EchoVault's project lock is
+        held.  Portable filesystems do not expose an atomic content-digest
+        compare-and-swap for writers that deliberately ignore that lock, so
+        both digests are checked immediately before the atomic replacement.
+        """
+        if expected_temporary_digest is not None:
+            temporary_digest = digest_file(self.temporary)
+            if temporary_digest != expected_temporary_digest:
+                raise ConcurrentModificationError(
+                    f'Concurrent modification of {self.temporary}: '
+                    f'expected {expected_temporary_digest!r}, got {temporary_digest!r}'
+                )
         current_digest = digest_file(self.target)
         if current_digest != expected_digest:
             raise ConcurrentModificationError(
@@ -333,7 +354,56 @@ def prepare_atomic_text(path: Path, content: str, encoding: str = 'utf-8') -> Pr
     return PreparedAtomicWrite(path, temporary, original_mode)
 
 
-def digest_file(path: Path) -> str | None:
-    if not path.exists():
+def digest_file(
+    path: Path,
+    *,
+    max_bytes: int = MAX_DIGEST_FILE_BYTES,
+) -> str | None:
+    """Digest one bounded regular file without following links or FIFOs."""
+    try:
+        initial = path.lstat()
+    except FileNotFoundError:
         return None
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    if not stat.S_ISREG(initial.st_mode):
+        raise OSError('path is not a regular file')
+    if initial.st_size > max_bytes:
+        raise OSError('file exceeds the digest size limit')
+
+    flags = os.O_RDONLY | getattr(os, 'O_NONBLOCK', 0) | getattr(os, 'O_NOFOLLOW', 0)
+    if os.name == 'nt':
+        flags |= getattr(os, 'O_BINARY', 0)
+    descriptor = os.open(path, flags)
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            raise OSError('path is not a regular file')
+        if (opened.st_dev, opened.st_ino) != (initial.st_dev, initial.st_ino):
+            raise OSError('path changed identity before it was opened')
+        if opened.st_size > max_bytes:
+            raise OSError('file exceeds the digest size limit')
+
+        digest = hashlib.sha256()
+        consumed = 0
+        while True:
+            chunk = os.read(descriptor, 65_536)
+            if not chunk:
+                break
+            consumed += len(chunk)
+            if consumed > max_bytes:
+                raise OSError('file exceeds the digest size limit')
+            digest.update(chunk)
+
+        final_descriptor = os.fstat(descriptor)
+        final_path = path.lstat()
+        identity = (opened.st_dev, opened.st_ino)
+        if (
+            (final_descriptor.st_dev, final_descriptor.st_ino) != identity
+            or (final_path.st_dev, final_path.st_ino) != identity
+            or final_descriptor.st_size != consumed
+            or final_descriptor.st_mtime_ns != opened.st_mtime_ns
+            or final_descriptor.st_ctime_ns != opened.st_ctime_ns
+        ):
+            raise OSError('path changed while it was digested')
+        return digest.hexdigest()
+    finally:
+        os.close(descriptor)

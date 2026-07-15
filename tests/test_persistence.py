@@ -737,7 +737,7 @@ def test_embedding_failure_returns_redacted_degraded_status(
     assert service.db.has_vector(str(saved["id"])) is False
 
 
-def test_failed_replay_embedding_preserves_existing_current_vector(
+def test_current_replay_skips_embedding_and_preserves_existing_vector(
     service: MemoryService,
 ) -> None:
     operation_id = "70000000-0000-4000-8000-000000000011"
@@ -747,12 +747,12 @@ def test_failed_replay_embedding_preserves_existing_current_vector(
     assert service.db.has_vector(str(created["id"])) is True
 
     service.persistence.embed = lambda _text: (_ for _ in ()).throw(
-        RuntimeError("provider unavailable")
+        AssertionError("current replay must not call the embedding provider")
     )
     replayed = service.save(raw, project="safe-project", idempotency_key=operation_id)
 
     assert replayed["action"] == "replayed"
-    assert replayed["vector_status"] == "degraded"
+    assert replayed["vector_status"] == "ready"
     assert service.db.has_vector(str(created["id"])) is True
 
 

@@ -527,7 +527,7 @@ class MemoryDB:
         with self._write_scope():
             cursor = self.conn.cursor()
             cursor.execute(
-                "SELECT rowid, content_fingerprint FROM memories WHERE id = ?",
+                "SELECT rowid, content_fingerprint, status FROM memories WHERE id = ?",
                 (memory_id,),
             )
             memory_row = cursor.fetchone()
@@ -539,6 +539,7 @@ class MemoryDB:
             if (
                 memory_row is None
                 or memory_row["content_fingerprint"] != expected_fingerprint
+                or (memory_row["status"] or "active") != "active"
             ):
                 return False
 
@@ -814,23 +815,47 @@ class MemoryDB:
         with self._write_scope():
             return self._delete_memory(memory_id)
 
+    def delete_memory_exact(self, memory_id: str) -> bool:
+        """Delete exactly one projected canonical UUID, never a prefix."""
+        with self._write_scope():
+            cursor = self.conn.cursor()
+            row = cursor.execute(
+                "SELECT id FROM memories WHERE id = ?",
+                (memory_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            self._delete_full_memory(str(row["id"]))
+            return True
+
     def _delete_memory(self, memory_id: str) -> bool:
         """Delete a projected memory without committing."""
+        if not memory_id:
+            return False
         cursor = self.conn.cursor()
 
-        # Resolve the full ID from prefix
-        cursor.execute(
-            "SELECT id FROM memories WHERE id LIKE ?", (memory_id + "%",)
-        )
-        row = cursor.fetchone()
-        if not row:
+        rows = cursor.execute(
+            "SELECT id FROM memories WHERE id = ?",
+            (memory_id,),
+        ).fetchall()
+        if not rows:
+            rows = cursor.execute(
+                "SELECT id FROM memories "
+                "WHERE substr(id, 1, length(?)) = ? ORDER BY id",
+                (memory_id, memory_id),
+            ).fetchall()
+        if len(rows) != 1:
             return False
 
-        full_id = row["id"]
+        self._delete_full_memory(str(rows[0]["id"]))
+        return True
+
+    def _delete_full_memory(self, full_id: str) -> None:
+        """Delete a previously resolved full projection ID."""
+        cursor = self.conn.cursor()
         cursor.execute("DELETE FROM memory_details WHERE memory_id = ?", (full_id,))
         self._invalidate_vector(full_id)
         cursor.execute("DELETE FROM memories WHERE id = ?", (full_id,))
-        return True
 
     def fts_search(
         self,

@@ -14,11 +14,16 @@ import pytest
 
 from memory.cli import main
 from memory.core import MemoryService
+import memory.health as health
 from memory.health import doctor
 from memory.markdown import parse_session_file
 from memory.models import RawMemoryInput
 import memory.persistence as persistence
-from memory.safe_io import PreparedAtomicWrite, prepare_atomic_text
+from memory.safe_io import (
+    ConcurrentModificationError,
+    PreparedAtomicWrite,
+    prepare_atomic_text,
+)
 
 
 def test_create_uses_durable_journal_and_recovers_after_publication(
@@ -71,8 +76,8 @@ def test_journal_publication_rejects_symlinked_transactions(
         operation_id="82000000-0000-4000-8000-000000000001",
         action="update",
         project_keys=("p--1",),
-        affected_memory_ids=("memory-id",),
-        canonical_memory_id="memory-id",
+        affected_memory_ids=("44444444-4444-4444-8444-444444444444",),
+        canonical_memory_id="44444444-4444-4444-8444-444444444444",
         targets=(
             persistence.JournalTarget(
                 target="vault/p--1/2026-07-14-session.md",
@@ -107,8 +112,8 @@ def test_journal_publication_rejects_dangling_destination_symlink(
         operation_id=operation_id,
         action="update",
         project_keys=("p--1",),
-        affected_memory_ids=("memory-id",),
-        canonical_memory_id="memory-id",
+        affected_memory_ids=("55555555-5555-4555-8555-555555555555",),
+        canonical_memory_id="55555555-5555-4555-8555-555555555555",
         targets=(
             persistence.JournalTarget(
                 target="vault/p--1/2026-07-14-session.md",
@@ -153,9 +158,14 @@ def test_recovery_rechecks_digest_immediately_before_replace(
     def concurrent_edit(
         prepared: PreparedAtomicWrite,
         expected_digest: str | None,
+        expected_temporary_digest: str | None = None,
     ) -> None:
         target.write_text("external edit\n", encoding="utf-8")
-        original_replace_if_digest(prepared, expected_digest)
+        original_replace_if_digest(
+            prepared,
+            expected_digest,
+            expected_temporary_digest,
+        )
 
     monkeypatch.setattr(
         PreparedAtomicWrite,
@@ -166,6 +176,276 @@ def test_recovery_rechecks_digest_immediately_before_replace(
         service.persistence.recover_pending_operations(("p--1",))
     assert target.read_text(encoding="utf-8") == "external edit\n"
     assert journal.exists()
+
+
+def test_forward_mutation_rechecks_digest_immediately_before_replace(
+    service: MemoryService,
+) -> None:
+    saved = service.save(
+        RawMemoryInput(title="Forward CAS", what="before"),
+        project="p--1",
+    )
+    target = Path(str(saved["file_path"]))
+
+    def inject(phase: str) -> None:
+        if phase == "after_db_write":
+            target.write_text("external edit\n", encoding="utf-8")
+
+    service.persistence.fault = inject
+    with pytest.raises(ConcurrentModificationError):
+        service.update_memory_record(
+            str(saved["id"]),
+            patch=persistence.MemoryPatch(what="after"),
+            actor="dashboard",
+        )
+
+    assert target.read_text(encoding="utf-8") == "external edit\n"
+    assert service.get_memory_record(str(saved["id"]))["what"] == "before"
+    assert len(list((Path(service.memory_home) / "transactions").glob("*.json"))) == 1
+
+
+def test_replay_reprojects_the_requested_historical_operation(
+    service: MemoryService,
+) -> None:
+    first_operation = "87000000-0000-4000-8000-000000000001"
+    second_operation = "87000000-0000-4000-8000-000000000002"
+    original = RawMemoryInput(title="Ledger replay", what="first value")
+    created = service.save(
+        original,
+        project="p--1",
+        authoritative_source="cursor",
+        idempotency_key=first_operation,
+    )
+    service.save(
+        RawMemoryInput(title="Ledger replay", what="second value"),
+        project="p--1",
+        authoritative_source="cursor",
+        idempotency_key=second_operation,
+    )
+    with service.db.transaction():
+        service.db.conn.execute(
+            "DELETE FROM save_operations WHERE project = ? AND operation_id = ?",
+            ("p--1", first_operation),
+        )
+    assert service.db.get_operation("p--1", first_operation) is None
+
+    replayed = service.save(
+        original,
+        project="p--1",
+        authoritative_source="cursor",
+        idempotency_key=first_operation,
+    )
+
+    assert replayed["id"] == created["id"]
+    repaired = service.db.get_operation("p--1", first_operation)
+    assert repaired is not None
+    assert repaired["memory_id"] == created["id"]
+
+
+@pytest.mark.parametrize(
+    "actor",
+    ["prompt body with spaces", "line\nbreak", "a" * 129],
+)
+def test_mutation_actor_is_a_bounded_identity_token(
+    service: MemoryService,
+    actor: str,
+) -> None:
+    saved = service.save(
+        RawMemoryInput(title="Actor token", what="unchanged"),
+        project="p--1",
+    )
+    target = Path(str(saved["file_path"]))
+    before = target.read_bytes()
+
+    with pytest.raises(ValueError, match="actor"):
+        service.update_memory_record(
+            str(saved["id"]),
+            patch=persistence.MemoryPatch(what="must not persist"),
+            actor=actor,
+        )
+
+    assert target.read_bytes() == before
+    assert list((Path(service.memory_home) / "transactions").glob("*.json")) == []
+
+
+def test_save_source_is_a_bounded_identity_token(service: MemoryService) -> None:
+    with pytest.raises(ValueError, match="actor"):
+        service.save(
+            RawMemoryInput(title="Source token", what="must not persist"),
+            project="p--1",
+            authoritative_source="a source containing prompt text",
+        )
+    assert service.list_memories(project="p--1") == []
+
+
+def test_legacy_delete_journal_without_actor_recovers_explicitly(
+    service: MemoryService,
+) -> None:
+    saved = service.save(
+        RawMemoryInput(title="Legacy delete", what="recover old journal"),
+        project="p--1",
+    )
+
+    def inject(phase: str) -> None:
+        if phase == "after_journal_fsync":
+            raise RuntimeError("leave legacy delete")
+
+    service.persistence.fault = inject
+    with pytest.raises(RuntimeError, match="leave legacy delete"):
+        service.delete(str(saved["id"]), actor="dashboard")
+    journal = next((Path(service.memory_home) / "transactions").glob("*.json"))
+    operation_id = journal.stem
+    payload = json.loads(journal.read_text(encoding="utf-8"))
+    del payload["actor"]
+    journal.write_text(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    service.close()
+
+    recovered = MemoryService(service.memory_home)
+    try:
+        assert recovered.get_memory_record(str(saved["id"])) is None
+        operation = recovered.db.get_operation("p--1", operation_id)
+        assert operation is not None
+        assert operation["source"] == "legacy-recovery"
+    finally:
+        recovered.close()
+
+
+def test_journal_loader_rejects_noncanonical_affected_memory_id(
+    service: MemoryService,
+) -> None:
+    saved = service.save(
+        RawMemoryInput(title="Strict journal ID", what="reject prefix"),
+        project="p--1",
+    )
+
+    def inject(phase: str) -> None:
+        if phase == "after_journal_fsync":
+            raise RuntimeError("leave delete journal")
+
+    service.persistence.fault = inject
+    with pytest.raises(RuntimeError, match="leave delete journal"):
+        service.delete(str(saved["id"]), actor="dashboard")
+    journal = next((Path(service.memory_home) / "transactions").glob("*.json"))
+    payload = json.loads(journal.read_text(encoding="utf-8"))
+    payload["affected_memory_ids"] = [str(saved["id"])[:12]]
+    journal.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(persistence.JournalRecoveryConflict, match="UUID"):
+        persistence.load_operation_journal(Path(service.memory_home), journal)
+
+
+def test_delete_journal_rejects_explicit_null_actor(service: MemoryService) -> None:
+    saved = service.save(
+        RawMemoryInput(title="Null delete actor", what="reject corruption"),
+        project="p--1",
+    )
+
+    def inject(phase: str) -> None:
+        if phase == "after_journal_fsync":
+            raise RuntimeError("leave delete journal")
+
+    service.persistence.fault = inject
+    with pytest.raises(RuntimeError, match="leave delete journal"):
+        service.delete(str(saved["id"]), actor="dashboard")
+    journal = next((Path(service.memory_home) / "transactions").glob("*.json"))
+    payload = json.loads(journal.read_text(encoding="utf-8"))
+    payload["actor"] = None
+    journal.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(persistence.JournalRecoveryConflict, match="actor"):
+        persistence.load_operation_journal(Path(service.memory_home), journal)
+
+
+def test_recovery_rejects_symlinked_prepared_target(
+    service: MemoryService,
+    tmp_path: Path,
+) -> None:
+    saved = service.save(
+        RawMemoryInput(title="Prepared identity", what="before"),
+        project="p--1",
+    )
+
+    def inject(phase: str) -> None:
+        if phase == "after_journal_fsync":
+            raise RuntimeError("leave prepared target")
+
+    service.persistence.fault = inject
+    with pytest.raises(RuntimeError, match="leave prepared target"):
+        service.update_memory_record(
+            str(saved["id"]),
+            patch=persistence.MemoryPatch(what="after"),
+            actor="dashboard",
+        )
+    service.persistence.fault = lambda _phase: None
+    journal = next((Path(service.memory_home) / "transactions").glob("*.json"))
+    payload = json.loads(journal.read_text(encoding="utf-8"))
+    temporary = Path(service.memory_home) / payload["targets"][0]["temporary"]
+    prepared_payload = temporary.read_bytes()
+    outside = tmp_path / "outside-prepared.md"
+    outside.write_bytes(prepared_payload)
+    temporary.unlink()
+    try:
+        temporary.symlink_to(outside)
+    except (NotImplementedError, OSError):
+        pytest.skip("symlinks are not supported on this platform")
+
+    with pytest.raises(persistence.JournalRecoveryConflict):
+        service.persistence.recover_pending_operations(("p--1",))
+    target = Path(str(saved["file_path"]))
+    assert not target.is_symlink()
+    assert parse_session_file(target).entries[0].what == "before"
+    assert journal.exists()
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFO is POSIX-specific")
+def test_recovery_rejects_fifo_prepared_target_without_blocking(
+    service: MemoryService,
+) -> None:
+    saved = service.save(
+        RawMemoryInput(title="Prepared FIFO", what="before"),
+        project="p--1",
+    )
+
+    def inject(phase: str) -> None:
+        if phase == "after_journal_fsync":
+            raise RuntimeError("leave prepared fifo")
+
+    service.persistence.fault = inject
+    with pytest.raises(RuntimeError, match="leave prepared fifo"):
+        service.update_memory_record(
+            str(saved["id"]),
+            patch=persistence.MemoryPatch(what="after"),
+            actor="dashboard",
+        )
+    journal = next((Path(service.memory_home) / "transactions").glob("*.json"))
+    payload = json.loads(journal.read_text(encoding="utf-8"))
+    temporary = Path(service.memory_home) / payload["targets"][0]["temporary"]
+    temporary.unlink()
+    os.mkfifo(temporary)
+    service.close()
+    script = (
+        "from memory.core import MemoryService\n"
+        "from memory.persistence import JournalRecoveryConflict\n"
+        f"home={service.memory_home!r}\n"
+        "try:\n"
+        "    MemoryService(home)\n"
+        "except JournalRecoveryConflict:\n"
+        "    raise SystemExit(0)\n"
+        "raise SystemExit(1)\n"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).parents[1],
+        env={**os.environ, "MEMORY_HOME": service.memory_home},
+        text=True,
+        capture_output=True,
+        timeout=2,
+        check=False,
+    )
+    assert completed.returncode == 0
 
 
 def test_recovered_vector_is_rebuilt_when_following_mutation_fails(
@@ -389,8 +669,8 @@ def test_journal_publication_collision_race_preserves_winner(
         operation_id=operation_id,
         action="update",
         project_keys=("p--1",),
-        affected_memory_ids=("memory-id",),
-        canonical_memory_id="memory-id",
+        affected_memory_ids=("66666666-6666-4666-8666-666666666666",),
+        canonical_memory_id="66666666-6666-4666-8666-666666666666",
         targets=(
             persistence.JournalTarget(
                 target="vault/p--1/2026-07-14-session.md",
@@ -707,3 +987,35 @@ def test_doctor_reads_live_wal_via_private_snapshot_without_writes(
     assert result.exit_code == 0
     assert "memories: 1" in result.stdout
     assert file_snapshot() == before
+
+
+def test_doctor_retries_if_checkpoint_changes_files_during_snapshot(
+    service: MemoryService,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service.save(
+        RawMemoryInput(title="Checkpoint race", what="must remain visible"),
+        project="p--1",
+    )
+    memory_home = Path(service.memory_home)
+    database_path = memory_home / "index.db"
+    wal_path = Path(str(database_path) + "-wal")
+    assert wal_path.exists() and wal_path.stat().st_size > 0
+    original_copy = health.shutil.copy2
+    checkpointed = False
+
+    def copy_with_checkpoint(source, destination, *args, **kwargs):
+        nonlocal checkpointed
+        result = original_copy(source, destination, *args, **kwargs)
+        if Path(source) == database_path and not checkpointed:
+            checkpointed = True
+            service.db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
+        return result
+
+    monkeypatch.setattr(health.shutil, "copy2", copy_with_checkpoint)
+
+    report = health.doctor_home(memory_home)
+
+    assert checkpointed is True
+    assert report.get("database_error") is None
+    assert report["memories"] == 1

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -237,13 +238,59 @@ def doctor_home(memory_home: Path, project: str | None = None) -> dict:
     if not wal_path.exists() or wal_path.stat().st_size == 0:
         return inspect_database(database_path, immutable=True)
 
-    # A live WAL must not be ignored.  Inspect a private point-in-time copy so
-    # SQLite may create lock sidecars without touching the canonical home.
-    with tempfile.TemporaryDirectory(prefix="echovault-doctor-") as temp_dir:
-        copied_database = Path(temp_dir) / database_path.name
-        shutil.copy2(database_path, copied_database)
-        for suffix in ("-wal", "-shm"):
-            source = Path(str(database_path) + suffix)
-            if source.exists() and source.is_file():
-                shutil.copy2(source, Path(str(copied_database) + suffix))
-        return inspect_database(copied_database, immutable=False)
+    # A live WAL must not be ignored.  Copy only across a verified stable
+    # interval; a checkpoint between the database and WAL copies otherwise
+    # produces a private database that never represented a real SQLite state.
+    # The SHM wal-index is derived; omitting it makes SQLite rebuild a private
+    # index instead of combining a transient shared-memory view with the copy.
+    snapshot_paths = (
+        database_path,
+        Path(str(database_path) + "-wal"),
+    )
+
+    def snapshot_signature() -> tuple[tuple[str, int, int, str] | None, ...]:
+        signatures: list[tuple[str, int, int, str] | None] = []
+        for path in snapshot_paths:
+            if not os.path.lexists(path):
+                signatures.append(None)
+                continue
+            metadata = path.lstat()
+            if path.is_symlink() or not stat.S_ISREG(metadata.st_mode):
+                raise OSError("snapshot path is not a regular file")
+            digest = hashlib.sha256()
+            with path.open("rb") as handle:
+                while chunk := handle.read(1024 * 1024):
+                    digest.update(chunk)
+            final = path.lstat()
+            if (
+                (metadata.st_dev, metadata.st_ino)
+                != (final.st_dev, final.st_ino)
+                or metadata.st_size != final.st_size
+                or metadata.st_mtime_ns != final.st_mtime_ns
+            ):
+                raise OSError("snapshot path changed while it was read")
+            signatures.append(
+                (str(path), final.st_size, final.st_mtime_ns, digest.hexdigest())
+            )
+        return tuple(signatures)
+
+    for _attempt in range(3):
+        try:
+            before = snapshot_signature()
+            with tempfile.TemporaryDirectory(prefix="echovault-doctor-") as temp_dir:
+                copied_database = Path(temp_dir) / database_path.name
+                for source in snapshot_paths:
+                    if os.path.lexists(source):
+                        suffix = str(source)[len(str(database_path)) :]
+                        shutil.copy2(source, Path(str(copied_database) + suffix))
+                after = snapshot_signature()
+                if before != after:
+                    continue
+                return inspect_database(copied_database, immutable=False)
+        except OSError:
+            continue
+    return _empty_doctor_report(
+        memory_home,
+        project,
+        database_error="index_snapshot_unstable",
+    )
