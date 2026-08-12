@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from memory.evaluation import evaluate, sweep_thresholds
 from memory.health import doctor, lifecycle_review
 from memory.models import RawMemoryInput
@@ -97,3 +99,32 @@ def test_lifecycle_and_doctor_are_non_mutating(env_home):
     assert report["memories"] >= 1
     assert "vectors" in report
     svc.close()
+
+
+def test_lifecycle_review_prunes_impossible_title_pairs_before_sequence_match(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ReviewDB:
+        def list_memories(self, **_kwargs):
+            return [
+                {
+                    "id": str(index),
+                    "title": chr(0x1000 + index) * 12,
+                    "what": "distinct",
+                    "status": "active",
+                    "structured_data": "{}",
+                }
+                for index in range(500)
+            ]
+
+    def impossible_match(*_args, **_kwargs):
+        raise AssertionError(
+            "SequenceMatcher must not inspect an impossible title pair"
+        )
+
+    monkeypatch.setattr("memory.health.SequenceMatcher", impossible_match)
+
+    review = lifecycle_review(ReviewDB())
+
+    assert review["duplicates"] == []
+    assert review["contradictions"] == []

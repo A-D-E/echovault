@@ -126,10 +126,28 @@ class TestClaudeCodeSetup:
         assert skill_path.read_text() == first
         assert result["message"] == "Already installed"
 
-    def test_packaged_fallback_skill_is_task_aware(self, claude_home, monkeypatch):
+    def test_crlf_packaged_skill_is_byte_stable(
+        self,
+        claude_home,
+        monkeypatch,
+    ):
         import memory.setup as setup_module
 
-        monkeypatch.setattr(setup_module, "_get_skill_md_path", lambda: "")
+        real_read = setup_module.read_package_asset
+
+        def read_crlf_asset(relative_path: str) -> bytes:
+            return real_read(relative_path).replace(b"\n", b"\r\n")
+
+        monkeypatch.setattr(setup_module, "read_package_asset", read_crlf_asset)
+        setup_module.setup_claude_code(str(claude_home), project=True)
+
+        result = setup_module.setup_claude_code(str(claude_home), project=True)
+
+        assert result["message"] == "Already installed"
+
+    def test_packaged_skill_is_task_aware(self, claude_home):
+        import memory.setup as setup_module
+
         setup_module.setup_claude_code(str(claude_home), project=True)
 
         content = (claude_home / "skills" / "echovault" / "SKILL.md").read_text()
@@ -185,7 +203,7 @@ class TestCursorSetup:
     def test_writes_mcp_config(self, cursor_home):
         from memory.setup import setup_cursor
         setup_cursor(str(cursor_home))
-        mcp_path = cursor_home / "mcp.json"
+        mcp_path = cursor_home / "plugins/local/echovault/mcp.json"
         assert mcp_path.exists()
         data = json.loads(mcp_path.read_text())
         assert "mcpServers" in data
@@ -195,7 +213,9 @@ class TestCursorSetup:
         from memory.setup import setup_cursor
         setup_cursor(str(cursor_home))
         setup_cursor(str(cursor_home))
-        data = json.loads((cursor_home / "mcp.json").read_text())
+        data = json.loads(
+            (cursor_home / "plugins/local/echovault/mcp.json").read_text()
+        )
         assert "echovault" in data["mcpServers"]
 
     def test_returns_success_result(self, cursor_home):
@@ -435,6 +455,7 @@ class TestUninstall:
         from memory.setup import setup_cursor, uninstall_cursor
         setup_cursor(str(cursor_home))
         uninstall_cursor(str(cursor_home))
+        assert not (cursor_home / "plugins/local/echovault").exists()
         mcp_path = cursor_home / "mcp.json"
         if mcp_path.exists():
             data = json.loads(mcp_path.read_text())
@@ -452,3 +473,25 @@ class TestUninstall:
         from memory.setup import uninstall_claude_code
         result = uninstall_claude_code(str(claude_home), project=True)
         assert result["status"] == "ok"
+
+
+class TestGeminiSetupCompatibility:
+    def test_user_direct_setup_and_uninstall_use_managed_adapter(
+        self,
+        tmp_path,
+        fake_memory,
+    ):
+        from memory.setup import setup_gemini, uninstall_gemini
+
+        gemini_home = tmp_path / ".gemini"
+        installed = setup_gemini(
+            str(gemini_home),
+            direct=True,
+            command=str(fake_memory),
+        )
+        assert installed["status"] == "ok"
+        assert (gemini_home / ".echovault-managed.json").is_file()
+
+        removed = uninstall_gemini(str(gemini_home), direct=True)
+        assert removed["status"] == "ok"
+        assert not (gemini_home / ".echovault-managed.json").exists()

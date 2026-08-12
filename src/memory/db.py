@@ -1,9 +1,12 @@
 """SQLite database layer with FTS5 and sqlite-vec for memory storage."""
 
+from contextlib import contextmanager
+from dataclasses import asdict
 import json
+from pathlib import Path
 import re
 import struct
-from typing import Optional
+from typing import Callable, Iterator, Optional
 
 # Try pysqlite3-binary first (has extension support), fall back to sqlite3
 try:
@@ -13,7 +16,9 @@ except ImportError:
 
 import sqlite_vec
 
-from memory.models import Memory, MemoryDetail
+from memory.models import Memory, MemoryDetail, MemoryOperation
+from memory.projects import ProjectScope
+from memory.safe_io import ProcessFileLock
 
 
 _FTS_STOPWORDS = {
@@ -39,6 +44,55 @@ _FTS_STOPWORDS = {
     "to",
     "with",
 }
+
+
+class AmbiguousMemoryIdError(ValueError):
+    """Raised when a memory ID prefix identifies more than one record."""
+
+
+class InvalidMemoryIdPrefix(ValueError):
+    """Raised before querying with an invalid memory ID prefix."""
+
+
+ProjectFilter = ProjectScope | str | tuple[str, ...] | None
+
+
+def _project_keys(project: ProjectFilter) -> tuple[str, ...]:
+    if project is None:
+        return ()
+    if isinstance(project, ProjectScope):
+        return tuple(dict.fromkeys(project.storage_keys))
+    if isinstance(project, str):
+        return (project,)
+    return tuple(dict.fromkeys(project))
+
+
+def _append_project_filter(
+    where_clauses: list[str],
+    params: list[object],
+    project: ProjectFilter,
+    *,
+    column: str,
+) -> None:
+    keys = _project_keys(project)
+    if not keys:
+        return
+    placeholders = ",".join("?" for _ in keys)
+    where_clauses.append(f"{column} IN ({placeholders})")
+    params.extend(keys)
+
+
+def _literal_like_prefix(memory_id: str) -> str:
+    if not memory_id:
+        raise InvalidMemoryIdPrefix(
+            "Memory ID or prefix must not be empty"
+        )
+    escaped = (
+        memory_id.replace("\\", "\\\\")
+        .replace("%", "\\%")
+        .replace("_", "\\_")
+    )
+    return escaped + "%"
 
 
 def _build_fts_query(query: str) -> str:
@@ -68,23 +122,45 @@ def _build_fts_query(query: str) -> str:
 class MemoryDB:
     """SQLite database for storing and searching memories."""
 
-    def __init__(self, db_path: str) -> None:
+    def __init__(
+        self,
+        db_path: str,
+        *,
+        read_only: bool = False,
+        immutable: bool = False,
+    ) -> None:
         """Initialize database connection and create schema.
 
         Args:
             db_path: Path to SQLite database file
         """
         self.db_path = db_path
-        self.conn = sqlite3.connect(db_path)
+        if read_only:
+            query = "mode=ro&immutable=1" if immutable else "mode=ro"
+            database_uri = Path(db_path).resolve().as_uri() + "?" + query
+            self.conn = sqlite3.connect(database_uri, uri=True)
+        else:
+            self.conn = sqlite3.connect(db_path)
         self.conn.row_factory = sqlite3.Row
+        self.conn.execute("PRAGMA busy_timeout = 5000")
+        self.conn.execute("PRAGMA foreign_keys = ON")
+        if read_only:
+            self.conn.execute("PRAGMA query_only = ON")
+        self._vector_cas_test_barrier: Optional[Callable[[], object]] = None
 
         # Enable extension loading and load sqlite-vec extension
         self.conn.enable_load_extension(True)
         sqlite_vec.load(self.conn)
         self.conn.enable_load_extension(False)
 
-        # Create schema (vec table is deferred until dimension is known)
-        self._create_schema()
+        # Schema bootstrap and additive migrations must be single-writer across
+        # processes. SQLite serializes transactions, but the PRAGMA-table-info
+        # then ALTER sequence otherwise races between fresh agent processes.
+        if not read_only:
+            schema_lock = Path(f"{db_path}.schema.lock")
+            with ProcessFileLock(schema_lock):
+                self.conn.execute("PRAGMA journal_mode = WAL")
+                self._create_schema()
 
     def _create_schema(self) -> None:
         """Create database tables and indexes (excluding vec table)."""
@@ -131,6 +207,34 @@ class MemoryDB:
             )
         """)
 
+        # Project-scoped idempotency ledger for canonical save operations.
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS save_operations (
+                project TEXT NOT NULL,
+                operation_id TEXT NOT NULL,
+                memory_id TEXT NOT NULL,
+                request_fingerprint TEXT NOT NULL,
+                action TEXT NOT NULL,
+                source TEXT,
+                timestamp TEXT NOT NULL,
+                branch TEXT,
+                commit_sha TEXT,
+                PRIMARY KEY (project, operation_id)
+            )
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS save_operations_memory_id
+            ON save_operations(memory_id)
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS pending_vector_repairs (
+                memory_id TEXT PRIMARY KEY,
+                content_fingerprint TEXT NOT NULL,
+                queued_at TEXT NOT NULL
+            )
+        """)
+
         # FTS5 virtual table
         cursor.execute("""
             CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
@@ -158,6 +262,14 @@ class MemoryDB:
             END
         """)
 
+        # FTS5 auto-sync trigger for DELETE
+        cursor.execute("""
+            CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
+                INSERT INTO memories_fts(memories_fts, rowid, title, what, why, impact, tags, category, project, source)
+                VALUES ('delete', old.rowid, old.title, old.what, old.why, old.impact, old.tags, old.category, old.project, old.source);
+            END
+        """)
+
         # Migration: add updated_count column if missing
         cursor.execute("PRAGMA table_info(memories)")
         columns = {row[1] for row in cursor.fetchall()}
@@ -177,6 +289,11 @@ class MemoryDB:
             "branch": "TEXT", "links": "TEXT DEFAULT '[]'", "last_verified": "TEXT",
             "retrieved_count": "INTEGER DEFAULT 0", "details_opened_count": "INTEGER DEFAULT 0",
             "dismissed_count": "INTEGER DEFAULT 0", "last_used_at": "TEXT",
+            "creator_source": "TEXT", "last_updated_by": "TEXT",
+            "contributors": "TEXT DEFAULT '[]'",
+            "operation_history": "TEXT DEFAULT '[]'",
+            "content_fingerprint": "TEXT",
+            "history_complete": "INTEGER DEFAULT 1",
         }
         for name, sql_type in additive_columns.items():
             if name not in columns:
@@ -188,6 +305,31 @@ class MemoryDB:
             self._create_vec_table(dim)
 
         self.conn.commit()
+
+    @contextmanager
+    def transaction(self) -> Iterator["MemoryDB"]:
+        """Own one immediate write transaction for a group of projection writes."""
+        if self.conn.in_transaction:
+            raise RuntimeError("Nested MemoryDB transactions are not supported")
+
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            yield self
+        except BaseException:
+            self.conn.rollback()
+            raise
+        else:
+            self.conn.commit()
+
+    @contextmanager
+    def _write_scope(self) -> Iterator["MemoryDB"]:
+        """Join an active owner transaction or create one for a public write."""
+        if self.conn.in_transaction:
+            yield self
+            return
+
+        with self.transaction():
+            yield self
 
     def _create_vec_table(self, dim: int) -> None:
         """Create the vector table with the given dimension.
@@ -202,7 +344,6 @@ class MemoryDB:
                 embedding float[{dim}]
             )
         """)
-        self.conn.commit()
 
     def has_vec_table(self) -> bool:
         """Check if the vector table exists."""
@@ -215,9 +356,13 @@ class MemoryDB:
 
     def drop_vec_table(self) -> None:
         """Drop the vector table."""
+        with self._write_scope():
+            self._drop_vec_table()
+
+    def _drop_vec_table(self) -> None:
+        """Drop the vector table without committing the owner transaction."""
         cursor = self.conn.cursor()
         cursor.execute("DROP TABLE IF EXISTS memories_vec")
-        self.conn.commit()
 
     def get_embedding_dim(self) -> Optional[int]:
         """Get the stored embedding dimension from meta table.
@@ -244,13 +389,20 @@ class MemoryDB:
         Args:
             dim: Embedding vector dimension
         """
+        with self._write_scope():
+            self._ensure_vec_table(dim)
+
+    def _ensure_vec_table(self, dim: int) -> None:
+        """Ensure vector metadata and schema without committing."""
         stored_dim = self.get_embedding_dim()
         if stored_dim is None:
-            self.set_embedding_dim(dim)
+            self._set_meta("embedding_dim", str(dim))
             self._create_vec_table(dim)
         elif stored_dim != dim:
             # Dimension mismatch — caller should handle this
             raise DimensionMismatchError(stored_dim, dim)
+        elif not self.has_vec_table():
+            self._create_vec_table(dim)
 
     def insert_memory(self, mem: Memory, details: Optional[str] = None) -> int:
         """Insert a memory into the database.
@@ -262,11 +414,18 @@ class MemoryDB:
         Returns:
             The rowid of the inserted memory
         """
+        with self._write_scope():
+            return self._insert_memory(mem, details)
+
+    def _insert_memory(self, mem: Memory, details: Optional[str] = None) -> int:
+        """Insert a memory projection without committing."""
         cursor = self.conn.cursor()
 
         # Serialize lists as JSON
         tags_json = json.dumps(mem.tags)
         related_files_json = json.dumps(mem.related_files)
+        contributors_json = json.dumps(mem.contributors)
+        operations_json = json.dumps([asdict(operation) for operation in mem.operations])
 
         cursor.execute("""
             INSERT INTO memories (
@@ -274,28 +433,91 @@ class MemoryDB:
                 source, related_files, file_path, section_anchor,
                 created_at, updated_at, status, archived_at, archive_reason, superseded_by,
                 structured_data, confidence, valid_from, valid_until, commit_sha, branch,
-                links, last_verified
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                links, last_verified, creator_source, last_updated_by, contributors,
+                operation_history, content_fingerprint, history_complete, updated_count
+            ) VALUES (
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            )
         """, (
             mem.id, mem.title, mem.what, mem.why, mem.impact,
             tags_json, mem.category, mem.project, mem.source,
             related_files_json, mem.file_path, mem.section_anchor,
             mem.created_at, mem.updated_at, mem.status, mem.archived_at, mem.archive_reason, mem.superseded_by,
             json.dumps(mem.structured_data), mem.confidence, mem.valid_from, mem.valid_until,
-            mem.commit_sha, mem.branch, json.dumps(mem.links), mem.last_verified
+            mem.commit_sha, mem.branch, json.dumps(mem.links), mem.last_verified,
+            mem.creator_source, mem.last_updated_by, contributors_json, operations_json,
+            mem.content_fingerprint, mem.history_complete, mem.updated_count,
         ))
 
-        rowid = cursor.lastrowid
+        rowid = int(cursor.lastrowid)
 
         # Insert details if provided
         if details:
-            cursor.execute("""
-                INSERT INTO memory_details (memory_id, body)
-                VALUES (?, ?)
-            """, (mem.id, details))
+            self._replace_details(mem.id, details)
 
-        self.conn.commit()
         return rowid
+
+    def upsert_memory(self, mem: Memory, details: Optional[str]) -> int:
+        """Insert or replace a canonical memory projection and its details."""
+        with self._write_scope():
+            return self._upsert_memory(mem, details)
+
+    def _upsert_memory(self, mem: Memory, details: Optional[str]) -> int:
+        """Upsert a memory projection without committing."""
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT rowid FROM memories WHERE id = ?", (mem.id,))
+        existing = cursor.fetchone()
+
+        if existing is None:
+            rowid = self._insert_memory(mem)
+        else:
+            rowid = int(existing["rowid"])
+            cursor.execute("""
+                UPDATE memories SET
+                    title = ?, what = ?, why = ?, impact = ?, tags = ?, category = ?,
+                    project = ?, source = ?, related_files = ?, file_path = ?,
+                    section_anchor = ?, created_at = ?, updated_at = ?, status = ?,
+                    archived_at = ?, archive_reason = ?, superseded_by = ?,
+                    structured_data = ?, confidence = ?, valid_from = ?, valid_until = ?,
+                    commit_sha = ?, branch = ?, links = ?, last_verified = ?,
+                    creator_source = ?, last_updated_by = ?, contributors = ?,
+                    operation_history = ?, content_fingerprint = ?, history_complete = ?,
+                    updated_count = ?
+                WHERE id = ?
+            """, (
+                mem.title, mem.what, mem.why, mem.impact, json.dumps(mem.tags),
+                mem.category, mem.project, mem.source, json.dumps(mem.related_files),
+                mem.file_path, mem.section_anchor, mem.created_at, mem.updated_at,
+                mem.status, mem.archived_at, mem.archive_reason, mem.superseded_by,
+                json.dumps(mem.structured_data), mem.confidence, mem.valid_from,
+                mem.valid_until, mem.commit_sha, mem.branch, json.dumps(mem.links),
+                mem.last_verified, mem.creator_source, mem.last_updated_by,
+                json.dumps(mem.contributors),
+                json.dumps([asdict(operation) for operation in mem.operations]),
+                mem.content_fingerprint, mem.history_complete, mem.updated_count, mem.id,
+            ))
+
+        self._replace_details(mem.id, details)
+        return rowid
+
+    def replace_details(self, memory_id: str, details: Optional[str]) -> None:
+        """Replace or remove the derived detail body for a memory."""
+        with self._write_scope():
+            self._replace_details(memory_id, details)
+
+    def _replace_details(self, memory_id: str, details: Optional[str]) -> None:
+        """Replace projected details without committing."""
+        cursor = self.conn.cursor()
+        if details is None:
+            cursor.execute("DELETE FROM memory_details WHERE memory_id = ?", (memory_id,))
+            return
+
+        cursor.execute("""
+            INSERT INTO memory_details (memory_id, body)
+            VALUES (?, ?)
+            ON CONFLICT(memory_id) DO UPDATE SET body = excluded.body
+        """, (memory_id, details))
 
     def insert_vector(self, rowid: int, embedding: list[float]) -> None:
         """Insert an embedding vector for a memory.
@@ -307,6 +529,12 @@ class MemoryDB:
         if not self.has_vec_table():
             return
 
+        with self._write_scope():
+            self._insert_vector(rowid, embedding)
+
+    def _insert_vector(self, rowid: int, embedding: list[float]) -> None:
+        """Insert a vector without committing."""
+
         vec_bytes = struct.pack(f"{len(embedding)}f", *embedding)
 
         cursor = self.conn.cursor()
@@ -315,9 +543,187 @@ class MemoryDB:
             VALUES (?, ?)
         """, (rowid, vec_bytes))
 
-        self.conn.commit()
+    def invalidate_vector(self, memory_id: str) -> None:
+        """Remove a derived vector for a memory if one exists."""
+        if not self.has_vec_table():
+            return
 
-    def get_memory(self, memory_id: str) -> Optional[dict]:
+        with self._write_scope():
+            self._invalidate_vector(memory_id)
+
+    def _invalidate_vector(self, memory_id: str) -> None:
+        """Remove a vector without committing."""
+        if not self.has_vec_table():
+            return
+
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT rowid FROM memories WHERE id = ?", (memory_id,))
+        memory_row = cursor.fetchone()
+        if memory_row is not None:
+            cursor.execute(
+                "DELETE FROM memories_vec WHERE rowid = ?", (memory_row["rowid"],)
+            )
+
+    def has_vector(self, memory_id: str) -> bool:
+        """Return whether a memory currently has a derived vector."""
+        if not self.has_vec_table():
+            return False
+
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            SELECT 1
+            FROM memories_vec v
+            JOIN memories m ON m.rowid = v.rowid
+            WHERE m.id = ?
+            LIMIT 1
+        """, (memory_id,))
+        return cursor.fetchone() is not None
+
+    def upsert_vector_if_current(
+        self,
+        memory_id: str,
+        expected_fingerprint: str,
+        embedding: list[float],
+    ) -> bool:
+        """Replace a vector only while its canonical fingerprint is current."""
+        with self._write_scope():
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "SELECT rowid, content_fingerprint, status FROM memories WHERE id = ?",
+                (memory_id,),
+            )
+            memory_row = cursor.fetchone()
+
+            barrier = self._vector_cas_test_barrier
+            if barrier is not None:
+                barrier()
+
+            if (
+                memory_row is None
+                or memory_row["content_fingerprint"] != expected_fingerprint
+                or (memory_row["status"] or "active") != "active"
+            ):
+                return False
+
+            self._ensure_vec_table(len(embedding))
+            self._invalidate_vector(memory_id)
+            self._insert_vector(int(memory_row["rowid"]), embedding)
+            return True
+
+    def queue_vector_repair(
+        self,
+        memory_id: str,
+        content_fingerprint: str,
+        queued_at: str,
+    ) -> None:
+        """Durably queue vector work in the caller's projection transaction."""
+        with self._write_scope():
+            self.conn.execute(
+                """
+                INSERT INTO pending_vector_repairs (
+                    memory_id, content_fingerprint, queued_at
+                ) VALUES (?, ?, ?)
+                ON CONFLICT(memory_id) DO UPDATE SET
+                    content_fingerprint = excluded.content_fingerprint,
+                    queued_at = excluded.queued_at
+                """,
+                (memory_id, content_fingerprint, queued_at),
+            )
+
+    def clear_vector_repair(
+        self,
+        memory_id: str,
+        expected_fingerprint: str | None = None,
+    ) -> bool:
+        """Clear only the repair generation the caller actually completed."""
+        with self._write_scope():
+            if expected_fingerprint is None:
+                cursor = self.conn.execute(
+                    "DELETE FROM pending_vector_repairs WHERE memory_id = ?",
+                    (memory_id,),
+                )
+            else:
+                cursor = self.conn.execute(
+                    """
+                    DELETE FROM pending_vector_repairs
+                    WHERE memory_id = ? AND content_fingerprint = ?
+                    """,
+                    (memory_id, expected_fingerprint),
+                )
+            return cursor.rowcount > 0
+
+    def list_vector_repairs(self) -> list[dict]:
+        """List queued vector work deterministically without mutating it."""
+        cursor = self.conn.execute(
+            """
+            SELECT memory_id, content_fingerprint, queued_at
+            FROM pending_vector_repairs
+            ORDER BY queued_at, memory_id
+            """
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
+    def get_operation(self, project: str, operation_id: str) -> Optional[dict]:
+        """Get one project-scoped idempotency ledger record."""
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            SELECT project, operation_id, memory_id, request_fingerprint, action,
+                   source, timestamp, branch, commit_sha
+            FROM save_operations
+            WHERE project = ? AND operation_id = ?
+        """, (project, operation_id))
+        row = cursor.fetchone()
+        return dict(row) if row is not None else None
+
+    def upsert_operation(
+        self, project: str, memory_id: str, operation: MemoryOperation
+    ) -> None:
+        """Upsert one project-scoped operation ledger record."""
+        with self._write_scope():
+            self._upsert_operation(project, memory_id, operation)
+
+    def _upsert_operation(
+        self, project: str, memory_id: str, operation: MemoryOperation
+    ) -> None:
+        """Upsert an operation ledger record without committing."""
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT 1 FROM memories WHERE id = ?", (memory_id,))
+        if cursor.fetchone() is None:
+            raise ValueError(
+                f"Cannot record operation for missing memory: {memory_id}"
+            )
+
+        cursor.execute("""
+            INSERT INTO save_operations (
+                project, operation_id, memory_id, request_fingerprint, action,
+                source, timestamp, branch, commit_sha
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(project, operation_id) DO UPDATE SET
+                memory_id = excluded.memory_id,
+                request_fingerprint = excluded.request_fingerprint,
+                action = excluded.action,
+                source = excluded.source,
+                timestamp = excluded.timestamp,
+                branch = excluded.branch,
+                commit_sha = excluded.commit_sha
+        """, (
+            project,
+            operation.operation_id,
+            memory_id,
+            operation.request_fingerprint,
+            operation.action,
+            operation.source,
+            operation.timestamp,
+            operation.branch,
+            operation.commit_sha,
+        ))
+
+    def get_memory(
+        self,
+        memory_id: str,
+        *,
+        projects: tuple[str, ...] | None = None,
+    ) -> Optional[dict]:
         """Get a memory by ID.
 
         Args:
@@ -327,19 +733,33 @@ class MemoryDB:
             Dictionary with memory data and has_details flag, or None if not found
         """
         cursor = self.conn.cursor()
-        cursor.execute("""
+        where_clauses = ["m.id = ?"]
+        params: list[object] = [memory_id]
+        _append_project_filter(
+            where_clauses,
+            params,
+            projects,
+            column="m.project",
+        )
+        cursor.execute(f"""
             SELECT m.*,
                    EXISTS(SELECT 1 FROM memory_details WHERE memory_id = m.id) as has_details
             FROM memories m
-            WHERE m.id = ?
-        """, (memory_id,))
+            WHERE {" AND ".join(where_clauses)}
+        """, params)
 
         row = cursor.fetchone()
         if row:
             return dict(row)
         return None
 
-    def get_details(self, memory_id: str) -> Optional[MemoryDetail]:
+    def get_details(
+        self,
+        memory_id: str,
+        *,
+        projects: tuple[str, ...] | None = None,
+        record_feedback: bool = True,
+    ) -> Optional[MemoryDetail]:
         """Get full details for a memory.
 
         Args:
@@ -348,20 +768,61 @@ class MemoryDB:
         Returns:
             MemoryDetail object or None if no details exist
         """
-        cursor = self.conn.cursor()
-        cursor.execute("""
-            SELECT memory_id, body
-            FROM memory_details
-            WHERE memory_id LIKE ?
-        """, (memory_id + "%",))
-
-        row = cursor.fetchone()
-        if row:
+        where_clauses = ["m.id LIKE ? ESCAPE '\\'"]
+        params: list[object] = [_literal_like_prefix(memory_id)]
+        _append_project_filter(
+            where_clauses,
+            params,
+            projects,
+            column="m.project",
+        )
+        rows = self.conn.execute(
+            f"""
+            SELECT m.id AS memory_id, d.body
+            FROM memories m
+            JOIN memory_details d ON d.memory_id = m.id
+            WHERE {" AND ".join(where_clauses)}
+            ORDER BY m.id
+            LIMIT 2
+            """,
+            params,
+        ).fetchall()
+        if len(rows) > 1:
+            raise AmbiguousMemoryIdError(
+                f"Ambiguous memory prefix: {memory_id}"
+            )
+        if not rows:
+            return None
+        row = rows[0]
+        if record_feedback:
             self.record_feedback([row["memory_id"]], "details_opened")
-            return MemoryDetail(memory_id=row["memory_id"], body=row["body"])
-        return None
+        return MemoryDetail(memory_id=row["memory_id"], body=row["body"])
 
     def update_memory(
+        self,
+        memory_id: str,
+        what: str | None = None,
+        why: str | None = None,
+        impact: str | None = None,
+        tags: list[str] | None = None,
+        details_append: str | None = None,
+        structured_data: dict | None = None,
+        provenance: dict | None = None,
+    ) -> bool:
+        """Update a memory, owning a transaction only when called standalone."""
+        with self._write_scope():
+            return self._update_memory(
+                memory_id,
+                what=what,
+                why=why,
+                impact=impact,
+                tags=tags,
+                details_append=details_append,
+                structured_data=structured_data,
+                provenance=provenance,
+            )
+
+    def _update_memory(
         self,
         memory_id: str,
         what: str | None = None,
@@ -436,7 +897,6 @@ class MemoryDB:
             else:
                 cursor.execute("INSERT INTO memory_details (memory_id, body) VALUES (?, ?)", (full_id, details_append))
 
-        self.conn.commit()
         return True
 
     def delete_memory(self, memory_id: str) -> bool:
@@ -450,27 +910,56 @@ class MemoryDB:
         Returns:
             True if a memory was deleted, False if no match found
         """
+        with self._write_scope():
+            return self._delete_memory(memory_id)
+
+    def delete_memory_exact(self, memory_id: str) -> bool:
+        """Delete exactly one projected canonical UUID, never a prefix."""
+        with self._write_scope():
+            cursor = self.conn.cursor()
+            row = cursor.execute(
+                "SELECT id FROM memories WHERE id = ?",
+                (memory_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            self._delete_full_memory(str(row["id"]))
+            return True
+
+    def _delete_memory(self, memory_id: str) -> bool:
+        """Delete a projected memory without committing."""
+        if not memory_id:
+            return False
         cursor = self.conn.cursor()
 
-        # Resolve the full ID from prefix
-        cursor.execute(
-            "SELECT id FROM memories WHERE id LIKE ?", (memory_id + "%",)
-        )
-        row = cursor.fetchone()
-        if not row:
+        rows = cursor.execute(
+            "SELECT id FROM memories WHERE id = ?",
+            (memory_id,),
+        ).fetchall()
+        if not rows:
+            rows = cursor.execute(
+                "SELECT id FROM memories "
+                "WHERE substr(id, 1, length(?)) = ? ORDER BY id",
+                (memory_id, memory_id),
+            ).fetchall()
+        if len(rows) != 1:
             return False
 
-        full_id = row["id"]
-        cursor.execute("DELETE FROM memory_details WHERE memory_id = ?", (full_id,))
-        cursor.execute("DELETE FROM memories WHERE id = ?", (full_id,))
-        self.conn.commit()
+        self._delete_full_memory(str(rows[0]["id"]))
         return True
+
+    def _delete_full_memory(self, full_id: str) -> None:
+        """Delete a previously resolved full projection ID."""
+        cursor = self.conn.cursor()
+        cursor.execute("DELETE FROM memory_details WHERE memory_id = ?", (full_id,))
+        self._invalidate_vector(full_id)
+        cursor.execute("DELETE FROM memories WHERE id = ?", (full_id,))
 
     def fts_search(
         self,
         query: str,
         limit: int = 10,
-        project: Optional[str] = None,
+        project: ProjectScope | str | None = None,
         source: Optional[str] = None,
         include_archived: bool = False,
     ) -> list[dict]:
@@ -492,9 +981,12 @@ class MemoryDB:
         where_clauses = []
         params = [fts_query]
 
-        if project:
-            where_clauses.append("m.project = ?")
-            params.append(project)
+        _append_project_filter(
+            where_clauses,
+            params,
+            project,
+            column="m.project",
+        )
 
         if source:
             where_clauses.append("m.source = ?")
@@ -524,6 +1016,14 @@ class MemoryDB:
 
     def record_feedback(self, memory_ids: list[str], event: str = "retrieved") -> int:
         """Record local, aggregate retrieval feedback without storing prompts."""
+        if not memory_ids:
+            return 0
+
+        with self._write_scope():
+            return self._record_feedback(memory_ids, event)
+
+    def _record_feedback(self, memory_ids: list[str], event: str = "retrieved") -> int:
+        """Record feedback counters without committing."""
         columns = {
             "retrieved": "retrieved_count", "details_opened": "details_opened_count",
             "dismissed": "dismissed_count", "referenced": "retrieved_count",
@@ -541,14 +1041,13 @@ class MemoryDB:
                 (now, memory_id + "%"),
             )
             count += cursor.rowcount
-        self.conn.commit()
         return count
 
     def vector_search(
         self,
         query_embedding: list[float],
         limit: int = 10,
-        project: Optional[str] = None,
+        project: ProjectScope | str | None = None,
         source: Optional[str] = None,
         include_archived: bool = False,
     ) -> list[dict]:
@@ -572,15 +1071,18 @@ class MemoryDB:
         # source, over-fetch candidate vectors so the final filtered set still has
         # relevant rows from the desired slice.
         fetch_k = limit
-        if project or source:
+        if project is not None or source:
             fetch_k = max(limit * 20, 100)
 
         where_clauses = ["v.embedding MATCH ?", "k = ?"]
         params: list = [vec_bytes, fetch_k]
 
-        if project:
-            where_clauses.append("m.project = ?")
-            params.append(project)
+        _append_project_filter(
+            where_clauses,
+            params,
+            project,
+            column="m.project",
+        )
 
         if source:
             where_clauses.append("m.source = ?")
@@ -615,7 +1117,7 @@ class MemoryDB:
     def list_recent(
         self,
         limit: int = 10,
-        project: Optional[str] = None,
+        project: ProjectScope | str | None = None,
         source: Optional[str] = None,
         include_archived: bool = False,
     ) -> list[dict]:
@@ -632,9 +1134,12 @@ class MemoryDB:
         where_clauses = []
         params: list = []
 
-        if project:
-            where_clauses.append("m.project = ?")
-            params.append(project)
+        _append_project_filter(
+            where_clauses,
+            params,
+            project,
+            column="m.project",
+        )
 
         if source:
             where_clauses.append("m.source = ?")
@@ -676,7 +1181,7 @@ class MemoryDB:
 
     def count_memories(
         self,
-        project: Optional[str] = None,
+        project: ProjectScope | str | None = None,
         source: Optional[str] = None,
         include_archived: bool = False,
     ) -> int:
@@ -692,9 +1197,12 @@ class MemoryDB:
         where_clauses = []
         params: list = []
 
-        if project:
-            where_clauses.append("project = ?")
-            params.append(project)
+        _append_project_filter(
+            where_clauses,
+            params,
+            project,
+            column="project",
+        )
 
         if source:
             where_clauses.append("source = ?")
@@ -716,7 +1224,7 @@ class MemoryDB:
     def list_memories(
         self,
         limit: int = 200,
-        project: Optional[str] = None,
+        project: ProjectScope | str | None = None,
         category: Optional[str] = None,
         file_path: Optional[str] = None,
         include_archived: bool = False,
@@ -725,9 +1233,12 @@ class MemoryDB:
         where_clauses = []
         params: list = []
 
-        if project:
-            where_clauses.append("m.project = ?")
-            params.append(project)
+        _append_project_filter(
+            where_clauses,
+            params,
+            project,
+            column="m.project",
+        )
         if category:
             where_clauses.append("m.category = ?")
             params.append(category)
@@ -760,12 +1271,16 @@ class MemoryDB:
             key: Metadata key
             value: Metadata value
         """
+        with self._write_scope():
+            self._set_meta(key, value)
+
+    def _set_meta(self, key: str, value: str) -> None:
+        """Set metadata without committing."""
         cursor = self.conn.cursor()
         cursor.execute("""
             INSERT OR REPLACE INTO meta (key, value)
             VALUES (?, ?)
         """, (key, value))
-        self.conn.commit()
 
     def get_meta(self, key: str) -> Optional[str]:
         """Get a metadata value by key.

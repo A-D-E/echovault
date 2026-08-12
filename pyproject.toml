@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "echovault"
-version = "0.5.0"
+version = "0.6.0"
 description = "Local-first memory system for coding agents with Obsidian-native markdown storage"
 requires-python = ">=3.10"
 dependencies = [
@@ -15,6 +15,7 @@ dependencies = [
     "httpx>=0.27.0",
     "mcp>=1.0",
     "tomli>=2.0; python_version < '3.11'",
+    "tomlkit>=0.13",
 ]
 
 [project.optional-dependencies]
@@ -25,6 +26,16 @@ memory = "memory.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+memory = [
+    "integrations/assets/common/*.md",
+    "integrations/assets/cursor/*.json",
+    "integrations/assets/cursor/*.mdc",
+    "integrations/assets/gemini/*.json",
+    "integrations/assets/gemini/*.md",
+    "integrations/assets/schemas/*.json",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

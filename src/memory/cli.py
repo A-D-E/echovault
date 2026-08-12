@@ -4,8 +4,11 @@ This module provides the command-line interface for managing memories.
 All commands use the MemoryService for business logic.
 """
 
+import json
 import os
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Literal, cast
 
 import yaml
 
@@ -20,7 +23,21 @@ from memory.config import (
     resolve_context_mode,
 )
 from memory.core import MemoryService
+from memory.integrations.registry import get_adapter
+from memory.integrations.types import (
+    InstallMode,
+    InstallScope,
+    IntegrationOptions,
+)
 from memory.models import RawMemoryInput
+from memory.persistence import MemoryPatch
+from memory.projects import (
+    ProjectRegistry,
+    ProjectResolutionError,
+    build_project_identity,
+    discover_project_root,
+)
+from memory.safe_io import LockTimeoutError
 
 DETAILS_TEMPLATE = """\
 Context:
@@ -35,6 +52,308 @@ Tradeoffs:
 
 Follow-up:
 """
+
+
+AdminAction = Literal["create", "update", "archive", "restore", "merge", "delete"]
+
+
+@dataclass(frozen=True)
+class AdminMutationRequest:
+    """Validated local mutation request for the hidden dashboard bridge."""
+
+    action: AdminAction
+    payload: dict[str, object]
+
+
+class AdminMutationValidationError(ValueError):
+    """Raised when a local admin mutation does not match the closed schema."""
+
+
+_ADMIN_ALLOWED_FIELDS: dict[AdminAction, frozenset[str]] = {
+    "create": frozenset(
+        {
+            "action",
+            "title",
+            "what",
+            "why",
+            "impact",
+            "category",
+            "tags",
+            "source",
+            "project",
+            "details",
+            "actor",
+        }
+    ),
+    "update": frozenset(
+        {
+            "action",
+            "memory_id",
+            "title",
+            "what",
+            "why",
+            "impact",
+            "category",
+            "tags",
+            "details",
+            "actor",
+        }
+    ),
+    "archive": frozenset({"action", "memory_id", "reason", "actor"}),
+    "restore": frozenset({"action", "memory_id", "actor"}),
+    "merge": frozenset({"action", "canonical_id", "source_ids", "actor"}),
+    "delete": frozenset({"action", "memory_id", "actor"}),
+}
+
+_ADMIN_REQUIRED_FIELDS: dict[AdminAction, frozenset[str]] = {
+    "create": frozenset({"action", "title", "what", "project", "actor"}),
+    "update": frozenset({"action", "memory_id", "actor"}),
+    "archive": frozenset({"action", "memory_id", "reason", "actor"}),
+    "restore": frozenset({"action", "memory_id", "actor"}),
+    "merge": frozenset({"action", "canonical_id", "source_ids", "actor"}),
+    "delete": frozenset({"action", "memory_id", "actor"}),
+}
+
+_ADMIN_REQUIRED_STRINGS: dict[AdminAction, frozenset[str]] = {
+    "create": frozenset({"title", "what", "project"}),
+    "update": frozenset({"memory_id"}),
+    "archive": frozenset({"memory_id", "reason"}),
+    "restore": frozenset({"memory_id"}),
+    "merge": frozenset({"canonical_id"}),
+    "delete": frozenset({"memory_id"}),
+}
+
+_ADMIN_NULLABLE_STRINGS: dict[AdminAction, frozenset[str]] = {
+    "create": frozenset({"why", "impact", "category", "source", "details"}),
+    "update": frozenset({"why", "impact", "category", "details"}),
+    "archive": frozenset(),
+    "restore": frozenset(),
+    "merge": frozenset(),
+    "delete": frozenset(),
+}
+
+
+def parse_admin_request(payload: object) -> AdminMutationRequest:
+    """Validate one admin request without opening storage or running commands."""
+    if not isinstance(payload, dict) or not all(
+        isinstance(key, str) for key in payload
+    ):
+        raise AdminMutationValidationError("request must be one JSON object")
+    request_payload = cast(dict[str, object], payload)
+    raw_action = request_payload.get("action")
+    if not isinstance(raw_action, str) or raw_action not in _ADMIN_ALLOWED_FIELDS:
+        raise AdminMutationValidationError(
+            "action must be create, update, archive, restore, merge, or delete"
+        )
+    action = cast(AdminAction, raw_action)
+
+    unknown = sorted(set(request_payload) - _ADMIN_ALLOWED_FIELDS[action])
+    if unknown:
+        raise AdminMutationValidationError(f"unknown field: {unknown[0]}")
+    missing = sorted(_ADMIN_REQUIRED_FIELDS[action] - set(request_payload))
+    if missing:
+        raise AdminMutationValidationError(f"missing required field: {missing[0]}")
+
+    actor = request_payload["actor"]
+    if not isinstance(actor, str) or not actor.strip():
+        raise AdminMutationValidationError("actor must be a non-empty string")
+
+    for field in _ADMIN_REQUIRED_STRINGS[action]:
+        value = request_payload[field]
+        if not isinstance(value, str) or not value.strip():
+            raise AdminMutationValidationError(
+                f"{field} must be a non-empty string"
+            )
+
+    if action == "update":
+        for field in ("title", "what"):
+            if field in request_payload:
+                value = request_payload[field]
+                if not isinstance(value, str) or not value.strip():
+                    raise AdminMutationValidationError(
+                        f"{field} must be a non-empty string"
+                    )
+
+    for field in _ADMIN_NULLABLE_STRINGS[action]:
+        if field not in request_payload:
+            continue
+        value = request_payload[field]
+        if value is not None and not isinstance(value, str):
+            raise AdminMutationValidationError(f"{field} must be a string or null")
+
+    if "tags" in request_payload:
+        tags = request_payload["tags"]
+        if not isinstance(tags, list) or not all(
+            isinstance(tag, str) for tag in tags
+        ):
+            raise AdminMutationValidationError("tags must be a list of strings")
+
+    if action == "merge":
+        source_ids = request_payload["source_ids"]
+        if (
+            not isinstance(source_ids, list)
+            or not source_ids
+            or not all(
+                isinstance(source_id, str) and source_id.strip()
+                for source_id in source_ids
+            )
+        ):
+            raise AdminMutationValidationError(
+                "source_ids must be a non-empty list of strings"
+            )
+        if len(set(source_ids)) != len(source_ids):
+            raise AdminMutationValidationError("source_ids must be unique")
+        if request_payload["canonical_id"] in source_ids:
+            raise AdminMutationValidationError(
+                "canonical_id cannot also be a source_id"
+            )
+
+    return AdminMutationRequest(action=action, payload=dict(request_payload))
+
+
+def _parse_admin_json(payload: str) -> AdminMutationRequest:
+    def reject_constant(value: str) -> object:
+        raise AdminMutationValidationError(f"invalid JSON constant: {value}")
+
+    def reject_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise AdminMutationValidationError(f"duplicate field: {key}")
+            result[key] = value
+        return result
+
+    try:
+        decoded = json.loads(
+            payload,
+            parse_constant=reject_constant,
+            object_pairs_hook=reject_duplicates,
+        )
+    except (json.JSONDecodeError, AdminMutationValidationError) as error:
+        raise AdminMutationValidationError("request must be valid JSON") from error
+    return parse_admin_request(decoded)
+
+
+def _admin_result(
+    result: object,
+    *,
+    fallback_id: str | None,
+    default_status: str,
+) -> tuple[str, str]:
+    if result is False or result is None:
+        raise RuntimeError("Mutation did not report success")
+    status = default_status
+    memory_id = fallback_id
+    if isinstance(result, dict):
+        raw_status = result.get("action")
+        raw_memory_id = result.get("id")
+        if isinstance(raw_status, str) and raw_status:
+            status = raw_status
+        if isinstance(raw_memory_id, str) and raw_memory_id:
+            memory_id = raw_memory_id
+    if not isinstance(memory_id, str) or not memory_id:
+        raise RuntimeError("Mutation did not return a memory ID")
+    return status, memory_id
+
+
+def _apply_admin_request(
+    service: MemoryService,
+    request: AdminMutationRequest,
+) -> tuple[str, str]:
+    payload = request.payload
+    actor = cast(str, payload["actor"])
+
+    if request.action == "create":
+        raw = RawMemoryInput(
+            title=cast(str, payload["title"]),
+            what=cast(str, payload["what"]),
+            why=cast(str | None, payload.get("why")),
+            impact=cast(str | None, payload.get("impact")),
+            category=cast(str | None, payload.get("category")),
+            tags=list(cast(list[str], payload.get("tags", []))),
+            source=cast(str | None, payload.get("source")),
+            details=cast(str | None, payload.get("details")),
+        )
+        result = service.save(
+            raw,
+            cast(str, payload["project"]),
+            authoritative_source=actor,
+        )
+        return _admin_result(
+            result,
+            fallback_id=None,
+            default_status="created",
+        )
+
+    if request.action == "update":
+        patch_fields = {
+            field: payload[field]
+            for field in (
+                "title",
+                "what",
+                "why",
+                "impact",
+                "category",
+                "tags",
+                "details",
+            )
+            if field in payload
+        }
+        memory_id = cast(str, payload["memory_id"])
+        result = service.update_memory_record(
+            memory_id,
+            patch=MemoryPatch(**patch_fields),
+            actor=actor,
+        )
+        return _admin_result(
+            result,
+            fallback_id=memory_id,
+            default_status="updated",
+        )
+
+    if request.action == "archive":
+        memory_id = cast(str, payload["memory_id"])
+        result = service.archive_memory(
+            memory_id,
+            reason=cast(str, payload["reason"]),
+            actor=actor,
+        )
+        return _admin_result(
+            result,
+            fallback_id=memory_id,
+            default_status="archived",
+        )
+
+    if request.action == "restore":
+        memory_id = cast(str, payload["memory_id"])
+        result = service.restore_memory(memory_id, actor=actor)
+        return _admin_result(
+            result,
+            fallback_id=memory_id,
+            default_status="restored",
+        )
+
+    if request.action == "merge":
+        canonical_id = cast(str, payload["canonical_id"])
+        result = service.merge_memories(
+            canonical_id,
+            list(cast(list[str], payload["source_ids"])),
+            actor=actor,
+        )
+        return _admin_result(
+            result,
+            fallback_id=canonical_id,
+            default_status="merged",
+        )
+
+    memory_id = cast(str, payload["memory_id"])
+    canonical_id = service.resolve_memory_id(memory_id)
+    result = service.delete(canonical_id, actor=actor)
+    return _admin_result(
+        result,
+        fallback_id=canonical_id,
+        default_status="deleted",
+    )
 
 
 def _redact_api_keys(data: dict) -> dict:
@@ -52,6 +371,42 @@ def main():
     pass
 
 
+@main.group(hidden=True)
+def admin():
+    """Trusted local mutation bridge."""
+    pass
+
+
+@admin.command("apply", hidden=True)
+@click.option("--json-stdin", is_flag=True, required=True, hidden=True)
+def admin_apply(json_stdin):
+    """Apply one strictly validated JSON mutation from stdin."""
+    if not json_stdin:  # pragma: no cover - enforced by Click
+        raise click.ClickException("Invalid admin mutation request.")
+    try:
+        request = _parse_admin_json(click.get_text_stream("stdin").read())
+    except AdminMutationValidationError:
+        raise click.ClickException("Invalid admin mutation request.") from None
+
+    try:
+        service = MemoryService()
+        try:
+            status, memory_id = _apply_admin_request(service, request)
+        finally:
+            service.close()
+    except Exception:
+        raise click.ClickException("Admin mutation failed.") from None
+
+    click.echo(
+        json.dumps(
+            {"status": status, "memory_id": memory_id},
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    )
+
+
 @main.command()
 def init():
     """Initialize the memory vault."""
@@ -59,6 +414,42 @@ def init():
     vault_dir = os.path.join(home, "vault")
     os.makedirs(vault_dir, exist_ok=True)
     click.echo(f"Memory vault initialized at {home}")
+
+
+@main.group()
+def project():
+    """Manage collision-safe project identities."""
+    pass
+
+
+@project.command("adopt-legacy")
+@click.argument("legacy_key")
+@click.option(
+    "--project-root",
+    required=True,
+    type=click.Path(path_type=Path, exists=True, file_okay=False),
+    help="Project directory that should own the legacy alias.",
+)
+@click.option(
+    "--force-reassign",
+    is_flag=True,
+    default=False,
+    help="Reassign an alias that belongs to another project.",
+)
+def project_adopt_legacy(legacy_key, project_root, force_reassign):
+    """Assign LEGACY_KEY to a collision-safe project identity."""
+    memory_home, _ = resolve_memory_home()
+    try:
+        discovered = discover_project_root(project_root)
+        identity = build_project_identity(*discovered)
+        scope = ProjectRegistry(Path(memory_home)).adopt_legacy(
+            legacy_key,
+            identity,
+            force_reassign=force_reassign,
+        )
+    except (ProjectResolutionError, LockTimeoutError, OSError) as error:
+        raise click.ClickException(str(error)) from error
+    click.echo(f"Adopted legacy alias {legacy_key} for {scope.identity.key}")
 
 
 @main.group(invoke_without_command=True)
@@ -521,19 +912,70 @@ def review_cmd(project):
 
 @main.command("doctor")
 @click.option("--project", default=None)
-def doctor_cmd(project):
+@click.option("--agent", default=None, help="Inspect one agent integration")
+@click.option(
+    "--project-root",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=None,
+    help="Project root for agent integration diagnostics",
+)
+def doctor_cmd(project, agent, project_root):
     """Check vault, index, vectors, references, and lifecycle health."""
-    from memory.health import doctor
-    svc = MemoryService()
-    report = doctor(svc, project)
-    svc.close()
+    from memory.health import doctor_home
+
+    report = doctor_home(
+        Path(get_memory_home()),
+        project,
+        agent=agent,
+        project_root=project_root,
+    )
+    click.echo(yaml.safe_dump(report, sort_keys=False))
+
+
+@main.group()
+def migrate():
+    """Run explicit, lossless storage migrations."""
+    pass
+
+
+@migrate.command("vault-metadata")
+@click.option("--project", default=None, help="Migrate one project scope")
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    default=False,
+    help="Report migratable files without changing storage",
+)
+def migrate_vault_metadata_cmd(project, dry_run):
+    """Enrich schema-v1 sessions from unambiguous SQLite metadata."""
+    svc = (
+        MemoryService(recover_pending=False, read_only=True)
+        if dry_run
+        else MemoryService()
+    )
+    try:
+        report = svc.migrate_vault_metadata(project=project, dry_run=dry_run)
+    finally:
+        svc.close()
     click.echo(yaml.safe_dump(report, sort_keys=False))
 
 
 @main.command("import")
 @click.option("--dry-run", is_flag=True, default=False, help="Show what would be imported without changing anything")
 @click.option("--reindex", "do_reindex", is_flag=True, default=False, help="Run reindex after importing")
-def import_vault(dry_run, do_reindex):
+@click.option(
+    "--reconcile",
+    is_flag=True,
+    default=False,
+    help="Repair the derived index from complete canonical v2 Markdown",
+)
+@click.option(
+    "--project",
+    type=str,
+    default=None,
+    help="Limit reconciliation to one project",
+)
+def import_vault(dry_run, do_reindex, reconcile, project):
     """Import memories from vault markdown files into the local index.
 
     Scans all .md files in vault/ sub-directories, parses H3 memory
@@ -543,7 +985,14 @@ def import_vault(dry_run, do_reindex):
 
     Deduplication is by (project, file_path, section_anchor) — existing memories are skipped.
     """
-    svc = MemoryService()
+    if dry_run and reconcile:
+        raise click.UsageError("--dry-run cannot be combined with --reconcile")
+    if project is not None and not reconcile:
+        raise click.UsageError("--project requires --reconcile")
+    if do_reindex and reconcile:
+        raise click.UsageError("--reindex cannot be combined with --reconcile")
+
+    svc = MemoryService(recover_pending=not reconcile)
 
     if dry_run:
         click.echo("Dry run — no changes will be made.\n")
@@ -552,28 +1001,38 @@ def import_vault(dry_run, do_reindex):
         if dry_run:
             click.echo(f"  [new] {project}/{title}")
 
-    result = svc.import_from_vault(dry_run=dry_run, progress_callback=progress)
-
-    click.echo(f"\nImported: {result['imported']}, Skipped (already exists): {result['skipped']}")
-    if result["projects"]:
-        click.echo(f"Projects with new imports: {', '.join(result['projects'])}")
-
-    if do_reindex and result["imported"] > 0 and not dry_run:
-        total = svc.db.count_memories()
-        click.echo(f"\nReindexing {total} memories with {svc.config.embedding.provider}/{svc.config.embedding.model}...")
-
-        def reindex_progress(current, count):
-            click.echo(f"  {current}/{count}", nl=(current == count))
-            if current < count:
-                click.echo("\r", nl=False)
-
-        reindex_result = svc.reindex(progress_callback=reindex_progress)
-        click.echo(
-            f"Re-indexed {reindex_result['count']} memories with "
-            f"{reindex_result['model']} ({reindex_result['dim']} dims)"
+    try:
+        result = svc.import_from_vault(
+            dry_run=dry_run,
+            progress_callback=progress,
+            reconcile=reconcile,
+            project=project,
         )
 
-    svc.close()
+        if reconcile:
+            click.echo(yaml.safe_dump(result, sort_keys=False).rstrip())
+            return
+
+        click.echo(f"\nImported: {result['imported']}, Skipped (already exists): {result['skipped']}")
+        if result["projects"]:
+            click.echo(f"Projects with new imports: {', '.join(result['projects'])}")
+
+        if do_reindex and result["imported"] > 0 and not dry_run:
+            total = svc.db.count_memories()
+            click.echo(f"\nReindexing {total} memories with {svc.config.embedding.provider}/{svc.config.embedding.model}...")
+
+            def reindex_progress(current, count):
+                click.echo(f"  {current}/{count}", nl=(current == count))
+                if current < count:
+                    click.echo("\r", nl=False)
+
+            reindex_result = svc.reindex(progress_callback=reindex_progress)
+            click.echo(
+                f"Re-indexed {reindex_result['count']} memories with "
+                f"{reindex_result['model']} ({reindex_result['dim']} dims)"
+            )
+    finally:
+        svc.close()
 
 
 @main.command()
@@ -649,6 +1108,11 @@ def dashboard(project, include_archived):
         click.echo("Build it: cd dashboard && cargo build --release")
         click.echo("Install it: cp dashboard/target/release/memory-dashboard ~/.local/bin/")
         raise SystemExit(1)
+    memory_executable = shutil.which("memory")
+    if memory_executable is None:
+        click.echo("Error: memory console script not found on PATH.")
+        raise SystemExit(1)
+    memory_executable = str(Path(memory_executable).resolve())
 
     cmd = [binary]
     if project:
@@ -658,6 +1122,7 @@ def dashboard(project, include_archived):
 
     memory_home = get_memory_home()
     os.environ["MEMORY_HOME"] = memory_home
+    os.environ["ECHOVAULT_MEMORY_EXECUTABLE"] = memory_executable
     os.execvp(binary, cmd)
 
 
@@ -697,13 +1162,120 @@ def setup_claude_code_cmd(config_dir, project):
 @setup.command("cursor")
 @click.option("--config-dir", default=None, help="Path to .cursor directory")
 @click.option("--project", is_flag=True, default=False, help="Install in current project instead of globally")
-def setup_cursor_cmd(config_dir, project):
-    """Install hooks into Cursor hooks.json."""
-    from memory.setup import setup_cursor
+@click.option(
+    "--command",
+    default=None,
+    help="Exact EchoVault command (portable for project, executable for user)",
+)
+@click.option(
+    "--force-managed",
+    is_flag=True,
+    default=False,
+    help="Replace modified EchoVault-managed assets",
+)
+def setup_cursor_cmd(config_dir, project, command, force_managed):
+    """Install curated EchoVault memory into Cursor."""
+    explicit_root = config_dir is not None
+    result = get_adapter("cursor").setup(
+        IntegrationOptions(
+            scope=(InstallScope.PROJECT if project else InstallScope.USER),
+            mode=(InstallMode.DIRECT if project else InstallMode.NATIVE),
+            config_root=(
+                Path(config_dir)
+                if config_dir is not None
+                else (None if project else Path.home() / ".cursor")
+            ),
+            project_root=Path.cwd() if project else None,
+            command=command,
+            force_managed=force_managed,
+            config_root_explicit=explicit_root,
+        )
+    )
+    click.echo(result.message)
+    for warning in result.warnings:
+        click.echo(f"Warning: {warning}")
 
-    target = _resolve_config_dir(".cursor", config_dir, project)
-    result = setup_cursor(target)
-    click.echo(result["message"])
+
+def _gemini_integration_options(
+    *,
+    config_dir: Path | None,
+    direct: bool,
+    project: bool,
+    command: str | None,
+    force_managed: bool,
+) -> IntegrationOptions:
+    if config_dir is not None and not (direct or project):
+        raise click.UsageError(
+            "--config-dir requires --direct or --project"
+        )
+    scope = InstallScope.PROJECT if project else InstallScope.USER
+    mode = InstallMode.DIRECT if direct or project else InstallMode.NATIVE
+    if config_dir is not None:
+        config_root = config_dir.expanduser().resolve()
+    elif project:
+        config_root = None
+    else:
+        config_root = Path.home() / ".gemini"
+    return IntegrationOptions(
+        scope=scope,
+        mode=mode,
+        config_root=config_root,
+        project_root=Path.cwd().resolve() if project else None,
+        command=command,
+        force_managed=force_managed,
+        config_root_explicit=config_dir is not None,
+    )
+
+
+@setup.command("gemini")
+@click.option(
+    "--config-dir",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=None,
+    help="Exact .gemini directory for a direct target",
+)
+@click.option(
+    "--direct",
+    is_flag=True,
+    default=False,
+    help="Install user-direct instead of the native extension",
+)
+@click.option(
+    "--project",
+    is_flag=True,
+    default=False,
+    help="Install direct integration in the current project",
+)
+@click.option(
+    "--command",
+    default=None,
+    help="Exact EchoVault command",
+)
+@click.option(
+    "--force-managed",
+    is_flag=True,
+    default=False,
+    help="Replace modified EchoVault-managed assets",
+)
+def setup_gemini_cmd(
+    config_dir: Path | None,
+    direct: bool,
+    project: bool,
+    command: str | None,
+    force_managed: bool,
+) -> None:
+    """Install curated EchoVault memory into Gemini CLI."""
+    options = _gemini_integration_options(
+        config_dir=config_dir,
+        direct=direct,
+        project=project,
+        command=command,
+        force_managed=force_managed,
+    )
+    result = get_adapter("gemini").setup(options)
+    click.echo(result.message)
+    for warning in result.warnings:
+        click.echo(f"Warning: {warning}")
 
 
 @setup.command("codex")
@@ -749,13 +1321,74 @@ def uninstall_claude_code_cmd(config_dir, project):
 @uninstall.command("cursor")
 @click.option("--config-dir", default=None, help="Path to .cursor directory")
 @click.option("--project", is_flag=True, default=False, help="Uninstall from current project instead of globally")
-def uninstall_cursor_cmd(config_dir, project):
-    """Remove hooks from Cursor hooks.json."""
-    from memory.setup import uninstall_cursor
+@click.option(
+    "--force-managed",
+    is_flag=True,
+    default=False,
+    help="Remove modified EchoVault-managed assets",
+)
+def uninstall_cursor_cmd(config_dir, project, force_managed):
+    """Remove one curated EchoVault Cursor scope."""
+    explicit_root = config_dir is not None
+    result = get_adapter("cursor").uninstall(
+        IntegrationOptions(
+            scope=(InstallScope.PROJECT if project else InstallScope.USER),
+            mode=(InstallMode.DIRECT if project else InstallMode.NATIVE),
+            config_root=(
+                Path(config_dir)
+                if config_dir is not None
+                else (None if project else Path.home() / ".cursor")
+            ),
+            project_root=Path.cwd() if project else None,
+            command=None,
+            force_managed=force_managed,
+            config_root_explicit=explicit_root,
+        )
+    )
+    click.echo(result.message)
 
-    target = _resolve_config_dir(".cursor", config_dir, project)
-    result = uninstall_cursor(target)
-    click.echo(result["message"])
+
+@uninstall.command("gemini")
+@click.option(
+    "--config-dir",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=None,
+    help="Exact .gemini directory for a direct target",
+)
+@click.option(
+    "--direct",
+    is_flag=True,
+    default=False,
+    help="Remove the user-direct integration",
+)
+@click.option(
+    "--project",
+    is_flag=True,
+    default=False,
+    help="Remove direct integration from the current project",
+)
+@click.option(
+    "--force-managed",
+    is_flag=True,
+    default=False,
+    help="Remove modified EchoVault-managed assets",
+)
+def uninstall_gemini_cmd(
+    config_dir: Path | None,
+    direct: bool,
+    project: bool,
+    force_managed: bool,
+) -> None:
+    """Remove one curated EchoVault Gemini scope."""
+    options = _gemini_integration_options(
+        config_dir=config_dir,
+        direct=direct,
+        project=project,
+        command=None,
+        force_managed=force_managed,
+    )
+    result = get_adapter("gemini").uninstall(options)
+    click.echo(result.message)
 
 
 @uninstall.command("codex")
@@ -780,13 +1413,61 @@ def uninstall_opencode_cmd(project):
     click.echo(result["message"])
 
 
+@main.group()
+def hook() -> None:
+    """Run supported agent lifecycle hooks."""
+    pass
+
+
+@hook.group("gemini")
+def hook_gemini() -> None:
+    """Run Gemini CLI hooks."""
+    pass
+
+
+@hook_gemini.command("before-agent")
+def hook_gemini_before_agent_cmd() -> None:
+    """Read one BeforeAgent event from stdin and emit one JSON response."""
+    from memory.integrations.gemini_hook import handle_before_agent
+
+    response: dict[str, object] = {}
+    try:
+        payload = json.loads(click.get_text_stream("stdin").read())
+        if isinstance(payload, dict):
+            observed = handle_before_agent(payload)
+            if isinstance(observed, dict):
+                response = observed
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        response = {}
+    click.echo(
+        json.dumps(
+            response,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    )
+
+
 @main.command()
-def mcp():
+@click.option("--agent", envvar="MEMORY_AGENT", default=None)
+@click.option(
+    "--project-root",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=None,
+)
+def mcp(agent: str | None, project_root: Path | None) -> None:
     """Start the EchoVault MCP server (stdio transport)."""
     import asyncio
     from memory.mcp_server import run_server
 
-    asyncio.run(run_server())
+    asyncio.run(
+        run_server(
+            agent=agent,
+            project_root=project_root,
+            startup_cwd=Path.cwd(),
+        )
+    )
 
 
 if __name__ == "__main__":

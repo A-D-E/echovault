@@ -24,6 +24,8 @@ def is_model_loaded(model: str, base_url: str, timeout: float = 0.5) -> bool:
 
 
 class OllamaEmbedding(EmbeddingProvider):
+    is_remote = False
+
     def __init__(self, model: str = "nomic-embed-text",
                  base_url: str = "http://localhost:11434"):
         self.model = model

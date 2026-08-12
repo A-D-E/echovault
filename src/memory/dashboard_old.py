@@ -23,6 +23,7 @@ from textual.widgets import (
 
 from memory.core import MemoryService
 from memory.models import RawMemoryInput
+from memory.persistence import MemoryPatch
 
 
 def _stringify_tags(tags: object) -> str:
@@ -557,14 +558,16 @@ class MemoryDashboardApp(App[None]):
             if self.editing_memory_id:
                 result = self.service.update_memory_record(
                     self.editing_memory_id,
-                    title=title,
-                    what=what,
-                    why=why,
-                    impact=impact,
-                    category=category,
-                    tags=tags,
-                    source=source,
-                    details=details,
+                    patch=MemoryPatch(
+                        title=title,
+                        what=what,
+                        why=why,
+                        impact=impact,
+                        category=category,
+                        tags=tags,
+                        details=details,
+                    ),
+                    actor="dashboard",
                 )
             else:
                 raw = RawMemoryInput(
@@ -577,7 +580,11 @@ class MemoryDashboardApp(App[None]):
                     details=details,
                     source=source,
                 )
-                result = self.service.save(raw, project=project)
+                result = self.service.save(
+                    raw,
+                    project=project,
+                    authoritative_source="dashboard",
+                )
                 self.editing_memory_id = result["id"]
             self._append_log(f"{result['action'].title()}: {title}")
             self.action_refresh_all()
@@ -594,9 +601,13 @@ class MemoryDashboardApp(App[None]):
             return
         try:
             if record.get("status") == "archived":
-                result = self.service.restore_memory(memory_id)
+                result = self.service.restore_memory(memory_id, actor="dashboard")
             else:
-                result = self.service.archive_memory(memory_id, reason="dashboard")
+                result = self.service.archive_memory(
+                    memory_id,
+                    reason="dashboard",
+                    actor="dashboard",
+                )
             self._append_log(f"{result['action'].title()}: {record['title']}")
             self.action_refresh_all()
         except Exception as exc:  # pragma: no cover - defensive UI logging
@@ -607,7 +618,11 @@ class MemoryDashboardApp(App[None]):
         if not pair:
             return
         try:
-            result = self.service.merge_memories(pair["left_id"], [pair["right_id"]])
+            result = self.service.merge_memories(
+                pair["left_id"],
+                [pair["right_id"]],
+                actor="dashboard",
+            )
             self._append_log(f"Merged 1 memory into {result['id'][:12]}")
             self.action_refresh_all()
         except Exception as exc:  # pragma: no cover - defensive UI logging
@@ -618,7 +633,11 @@ class MemoryDashboardApp(App[None]):
         if not pair:
             return
         try:
-            result = self.service.archive_memory(pair["right_id"], reason="duplicate-review")
+            result = self.service.archive_memory(
+                pair["right_id"],
+                reason="duplicate-review",
+                actor="dashboard",
+            )
             self._append_log(f"Archived duplicate: {result['id'][:12]}")
             self.action_refresh_all()
         except Exception as exc:  # pragma: no cover - defensive UI logging

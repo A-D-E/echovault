@@ -8,8 +8,12 @@ are never stored in agent memories:
 3. Layer 3: Custom patterns from .memoryignore - Project-specific sensitive data
 """
 
+import copy
+from dataclasses import fields
 import re
 from typing import Optional
+
+from memory.models import RawMemoryInput
 
 # Regex patterns for known sensitive data formats
 SENSITIVE_PATTERNS = [
@@ -64,6 +68,25 @@ def redact(text: str, extra_patterns: Optional[list[str]] = None) -> str:
         text = re.sub(pattern, "[REDACTED]", text, flags=re.IGNORECASE)
 
     return text
+
+
+def redact_memory_input(
+    raw: RawMemoryInput,
+    patterns: Optional[list[str]] = None,
+) -> RawMemoryInput:
+    """Return a deeply copied input with every nested text value redacted."""
+    redacted = copy.deepcopy(raw)
+    for field_info in fields(redacted):
+        value = getattr(redacted, field_info.name)
+        if isinstance(value, str):
+            setattr(redacted, field_info.name, redact(value, patterns))
+        elif isinstance(value, list):
+            setattr(
+                redacted,
+                field_info.name,
+                [redact(item, patterns) if isinstance(item, str) else item for item in value],
+            )
+    return redacted
 
 
 def load_memoryignore(path: str) -> list[str]:

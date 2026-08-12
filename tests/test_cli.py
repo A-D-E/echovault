@@ -1,12 +1,87 @@
 """Tests for CLI commands."""
 
+import json
 import os
+import shutil
+from dataclasses import dataclass
+from pathlib import Path
 
+import pytest
 from click.testing import CliRunner
 
+import memory.cli as cli_module
 from memory.cli import main
 from memory.core import MemoryService
+from memory.mcp_authority import MCPServerBinding
+from memory.mcp_server import tool_definitions
 from memory.models import RawMemoryInput
+from memory.integrations.types import (
+    InstallMode,
+    InstallScope,
+    IntegrationOptions,
+    IntegrationResult,
+)
+from memory.persistence import MemoryPatch
+from memory.projects import ProjectRegistry, build_project_identity, discover_project_root
+from memory.safe_io import LockTimeoutError
+
+
+def test_mcp_cli_passes_explicit_binding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    async def fake_run_server(**kwargs) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr("memory.mcp_server.run_server", fake_run_server)
+    project_root = Path("/tmp/repo")
+    result = CliRunner().invoke(
+        main,
+        [
+            "mcp",
+            "--agent",
+            "cursor",
+            "--project-root",
+            str(project_root),
+        ],
+    )
+    assert result.exit_code == 0
+    assert captured["agent"] == "cursor"
+    assert captured["project_root"] == project_root
+    assert isinstance(captured["startup_cwd"], Path)
+
+
+def test_explicit_agent_overrides_memory_agent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    async def fake_run_server(**kwargs) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setenv("MEMORY_AGENT", "gemini-cli")
+    monkeypatch.setattr("memory.mcp_server.run_server", fake_run_server)
+    result = CliRunner().invoke(main, ["mcp", "--agent", "cursor"])
+    assert result.exit_code == 0
+    assert captured["agent"] == "cursor"
+
+
+@pytest.mark.anyio
+async def test_bound_save_schema_requires_idempotency(tmp_path: Path) -> None:
+    binding = MCPServerBinding("cursor", tmp_path, tmp_path)
+    tools = tool_definitions(binding)
+    save = next(tool for tool in tools if tool.name == "memory_save")
+    details = next(tool for tool in tools if tool.name == "memory_details")
+    context = next(tool for tool in tools if tool.name == "memory_context")
+    assert "idempotency_key" in save.inputSchema["required"]
+    assert "cwd" in save.inputSchema["properties"]
+    assert "source" in save.inputSchema["properties"]
+    assert "authoritative" in save.inputSchema["properties"]["source"][
+        "description"
+    ]
+    assert "agent" in context.inputSchema["properties"]
+    assert details.inputSchema["properties"]["memory_id"]["minLength"] == 1
 
 
 def test_cli_help():
@@ -22,6 +97,176 @@ def test_cli_help():
     assert "details" in result.output
     assert "sessions" in result.output
     assert "dashboard" in result.output
+
+
+def test_project_adopt_legacy_assigns_alias_and_refuses_reassignment(
+    env_home,
+    tmp_path,
+):
+    left = tmp_path / "left"
+    right = tmp_path / "right"
+    left.mkdir()
+    right.mkdir()
+    (left / "package.json").write_text("{}")
+    (right / "package.json").write_text("{}")
+    runner = CliRunner()
+
+    first = runner.invoke(
+        main,
+        [
+            "project",
+            "adopt-legacy",
+            "legacy",
+            "--project-root",
+            str(left),
+        ],
+    )
+
+    assert first.exit_code == 0
+    registry_path = env_home / "projects.json"
+    data = json.loads(registry_path.read_text(encoding="utf-8"))
+    assigned_key = data["legacy_aliases"]["legacy"]
+    left_identity = build_project_identity(*discover_project_root(left))
+    assert assigned_key == left_identity.key
+    assert assigned_key in data["projects"]
+
+    second = runner.invoke(
+        main,
+        [
+            "project",
+            "adopt-legacy",
+            "legacy",
+            "--project-root",
+            str(right),
+        ],
+    )
+
+    assert second.exit_code == 1
+    assert second.output == (
+        "Error: Legacy alias 'legacy' is already assigned to another project\n"
+    )
+    assert isinstance(second.exception, SystemExit)
+    assert second.exception.code == 1
+    unchanged = json.loads(registry_path.read_text(encoding="utf-8"))
+    assert unchanged["legacy_aliases"]["legacy"] == assigned_key
+
+    forced = runner.invoke(
+        main,
+        [
+            "project",
+            "adopt-legacy",
+            "legacy",
+            "--project-root",
+            str(right),
+            "--force-reassign",
+        ],
+    )
+
+    right_identity = build_project_identity(*discover_project_root(right))
+    assert forced.exit_code == 0
+    assert forced.output == f"Adopted legacy alias legacy for {right_identity.key}\n"
+    reassigned = json.loads(registry_path.read_text(encoding="utf-8"))
+    assert reassigned["legacy_aliases"] == {"legacy": right_identity.key}
+    assert reassigned["legacy_aliases"]["legacy"] != left_identity.key
+
+
+def test_project_root_must_exist_without_creating_registry_state(env_home, tmp_path):
+    missing = tmp_path / "missing"
+    runner = CliRunner()
+
+    result = runner.invoke(
+        main,
+        [
+            "project",
+            "adopt-legacy",
+            "legacy",
+            "--project-root",
+            str(missing),
+        ],
+    )
+
+    assert result.exit_code == 2
+    display_missing = str(missing).replace("\\", "\\\\")
+    assert result.output == (
+        "Usage: main project adopt-legacy [OPTIONS] LEGACY_KEY\n"
+        "Try 'main project adopt-legacy --help' for help.\n\n"
+        f"Error: Invalid value for '--project-root': Directory '{display_missing}' "
+        "does not exist.\n"
+    )
+    assert isinstance(result.exception, SystemExit)
+    assert result.exception.code == 2
+    assert not (env_home / "projects.json").exists()
+
+
+@pytest.mark.parametrize(
+    ('error_type', 'message'),
+    [
+        (LockTimeoutError, 'simulated registry lock timeout'),
+        (OSError, 'simulated registry file failure'),
+    ],
+)
+def test_project_adopt_legacy_formats_expected_operational_errors(
+    env_home,
+    tmp_path,
+    monkeypatch,
+    error_type,
+    message,
+):
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "package.json").write_text("{}")
+
+    def fail_adoption(self, legacy_key, identity, force_reassign=False):
+        raise error_type(message)
+
+    monkeypatch.setattr(ProjectRegistry, "adopt_legacy", fail_adoption)
+    result = CliRunner().invoke(
+        main,
+        [
+            "project",
+            "adopt-legacy",
+            "legacy",
+            "--project-root",
+            str(root),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert result.output == f"Error: {message}\n"
+    assert isinstance(result.exception, SystemExit)
+    assert result.exception.code == 1
+    assert not (env_home / "projects.json").exists()
+
+
+def test_project_adopt_legacy_does_not_mask_programming_errors(
+    env_home,
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "package.json").write_text("{}")
+
+    def fail_adoption(self, legacy_key, identity, force_reassign=False):
+        raise RuntimeError('simulated programming error')
+
+    monkeypatch.setattr(ProjectRegistry, "adopt_legacy", fail_adoption)
+    result = CliRunner().invoke(
+        main,
+        [
+            "project",
+            "adopt-legacy",
+            "legacy",
+            "--project-root",
+            str(root),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert result.output == ""
+    assert isinstance(result.exception, RuntimeError)
+    assert str(result.exception) == 'simulated programming error'
+    assert not (env_home / "projects.json").exists()
 
 
 def test_init_creates_vault_dir(env_home):
@@ -48,6 +293,367 @@ def test_dashboard_help():
     assert "Launch the EchoVault terminal dashboard." in result.output
     assert "--project" in result.output
     assert "--include-archived" in result.output
+
+
+def test_dashboard_passes_absolute_memory_executable_to_rust(
+    monkeypatch,
+    tmp_path,
+):
+    resolved = {
+        "memory-dashboard": str(tmp_path / "bin" / "memory-dashboard"),
+        "memory": str(tmp_path / "bin" / "memory"),
+    }
+    memory_home = str(tmp_path / "echo-home")
+    monkeypatch.setattr(shutil, "which", lambda name: resolved.get(name))
+    monkeypatch.setattr(cli_module, "get_memory_home", lambda: memory_home)
+    monkeypatch.delenv("MEMORY_HOME", raising=False)
+    monkeypatch.delenv("ECHOVAULT_MEMORY_EXECUTABLE", raising=False)
+
+    def capture_exec(binary, command):
+        assert binary == resolved["memory-dashboard"]
+        assert command == [resolved["memory-dashboard"]]
+        assert os.environ["MEMORY_HOME"] == memory_home
+        assert os.environ["ECHOVAULT_MEMORY_EXECUTABLE"] == resolved["memory"]
+        raise SystemExit(0)
+
+    monkeypatch.setattr(cli_module.os, "execvp", capture_exec)
+    result = CliRunner().invoke(main, ["dashboard"])
+
+    assert result.exit_code == 0
+
+
+def test_dashboard_resolves_relative_path_executable_before_bridge_handoff(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.chdir(tmp_path)
+    relative_memory = os.path.join("relative-bin", "memory")
+    resolved = {
+        "memory-dashboard": "/opt/echovault/bin/memory-dashboard",
+        "memory": relative_memory,
+    }
+    monkeypatch.setattr(shutil, "which", lambda name: resolved.get(name))
+    monkeypatch.setattr(cli_module, "get_memory_home", lambda: "/tmp/echo-home")
+
+    def capture_exec(binary, command):
+        assert binary == resolved["memory-dashboard"]
+        assert command == [resolved["memory-dashboard"]]
+        assert os.environ["ECHOVAULT_MEMORY_EXECUTABLE"] == str(
+            (tmp_path / relative_memory).resolve()
+        )
+        raise SystemExit(0)
+
+    monkeypatch.setattr(cli_module.os, "execvp", capture_exec)
+
+    result = CliRunner().invoke(main, ["dashboard"])
+
+    assert result.exit_code == 0
+
+
+def test_migrate_vault_metadata_cli_forwards_scope_and_closes(monkeypatch):
+    instances = []
+
+    class RecordingService:
+        def __init__(self, *, recover_pending=True, read_only=False):
+            self.calls = []
+            self.closed = False
+            self.recover_pending = recover_pending
+            self.read_only = read_only
+            instances.append(self)
+
+        def migrate_vault_metadata(self, *, project, dry_run):
+            self.calls.append((project, dry_run))
+            return {
+                "migrated": 0,
+                "would_migrate": 2,
+                "unresolved": [],
+                "dry_run": True,
+            }
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(cli_module, "MemoryService", RecordingService)
+
+    result = CliRunner().invoke(
+        main,
+        ["migrate", "vault-metadata", "--project", "legacy", "--dry-run"],
+    )
+
+    assert result.exit_code == 0
+    assert instances[0].calls == [("legacy", True)]
+    assert instances[0].recover_pending is False
+    assert instances[0].read_only is True
+    assert instances[0].closed is True
+    assert "would_migrate: 2" in result.output
+
+
+def test_admin_bridge_is_hidden_from_top_level_help():
+    result = CliRunner().invoke(main, ["--help"])
+
+    assert result.exit_code == 0
+    assert "admin" not in result.stdout
+
+
+def test_admin_create_emits_exact_compact_json_and_closes_service(monkeypatch):
+    instances = []
+
+    class RecordingService:
+        def __init__(self):
+            self.closed = False
+            self.calls = []
+            instances.append(self)
+
+        def save(self, raw, project, *, authoritative_source):
+            self.calls.append((raw, project, authoritative_source))
+            return {"id": "canonical-memory-id", "action": "created"}
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(cli_module, "MemoryService", RecordingService)
+    result = CliRunner().invoke(
+        main,
+        ["admin", "apply", "--json-stdin"],
+        input=json.dumps(
+            {
+                "action": "create",
+                "title": "Bridge create",
+                "what": "Use the canonical writer",
+                "why": None,
+                "impact": None,
+                "category": "decision",
+                "tags": ["bridge"],
+                "source": "caller-supplied",
+                "project": "bridge--111111111111",
+                "details": "Created through the bridge",
+                "actor": "dashboard",
+            }
+        ),
+    )
+
+    assert result.exit_code == 0
+    assert result.stdout == (
+        '{"status":"created","memory_id":"canonical-memory-id"}\n'
+    )
+    assert result.stderr == ""
+    assert len(instances) == 1
+    assert instances[0].closed is True
+    raw, project, actor = instances[0].calls[0]
+    assert raw == RawMemoryInput(
+        title="Bridge create",
+        what="Use the canonical writer",
+        why=None,
+        impact=None,
+        category="decision",
+        tags=["bridge"],
+        source="caller-supplied",
+        details="Created through the bridge",
+    )
+    assert project == "bridge--111111111111"
+    assert actor == "dashboard"
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_call", "expected_stdout"),
+    [
+        (
+            {
+                "action": "update",
+                "memory_id": "memory-1",
+                "title": "Renamed",
+                "impact": None,
+                "tags": [],
+                "actor": "dashboard",
+            },
+            (
+                "update",
+                "memory-1",
+                MemoryPatch(title="Renamed", impact=None, tags=[]),
+                "dashboard",
+            ),
+            '{"status":"updated","memory_id":"memory-1"}\n',
+        ),
+        (
+            {
+                "action": "archive",
+                "memory_id": "memory-2",
+                "reason": "reviewed",
+                "actor": "dashboard",
+            },
+            ("archive", "memory-2", "reviewed", "dashboard"),
+            '{"status":"archived","memory_id":"memory-2"}\n',
+        ),
+        (
+            {
+                "action": "restore",
+                "memory_id": "memory-3",
+                "actor": "dashboard",
+            },
+            ("restore", "memory-3", "dashboard"),
+            '{"status":"restored","memory_id":"memory-3"}\n',
+        ),
+        (
+            {
+                "action": "merge",
+                "canonical_id": "memory-4",
+                "source_ids": ["memory-5"],
+                "actor": "dashboard",
+            },
+            ("merge", "memory-4", ["memory-5"], "dashboard"),
+            '{"status":"merged","memory_id":"memory-4"}\n',
+        ),
+        (
+            {
+                "action": "delete",
+                "memory_id": "memory-6",
+                "actor": "dashboard",
+            },
+            ("delete", "memory-6", "dashboard"),
+            '{"status":"deleted","memory_id":"memory-6"}\n',
+        ),
+    ],
+)
+def test_admin_bridge_routes_canonical_mutations(
+    monkeypatch,
+    payload,
+    expected_call,
+    expected_stdout,
+):
+    instances = []
+
+    class RecordingService:
+        def __init__(self):
+            self.closed = False
+            self.calls = []
+            instances.append(self)
+
+        def update_memory_record(self, memory_id, *, patch, actor):
+            self.calls.append(("update", memory_id, patch, actor))
+            return {"id": memory_id, "action": "updated"}
+
+        def archive_memory(self, memory_id, *, reason, actor):
+            self.calls.append(("archive", memory_id, reason, actor))
+            return {"id": memory_id, "action": "archived"}
+
+        def restore_memory(self, memory_id, *, actor):
+            self.calls.append(("restore", memory_id, actor))
+            return {"id": memory_id, "action": "restored"}
+
+        def merge_memories(self, canonical_id, source_ids, *, actor):
+            self.calls.append(("merge", canonical_id, source_ids, actor))
+            return {"id": canonical_id, "action": "merged"}
+
+        def delete(self, memory_id, *, actor):
+            self.calls.append(("delete", memory_id, actor))
+            return True
+
+        def resolve_memory_id(self, memory_id):
+            return memory_id
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(cli_module, "MemoryService", RecordingService)
+    result = CliRunner().invoke(
+        main,
+        ["admin", "apply", "--json-stdin"],
+        input=json.dumps(payload),
+    )
+
+    assert result.exit_code == 0
+    assert result.stdout == expected_stdout
+    assert result.stderr == ""
+    assert len(instances) == 1
+    assert instances[0].calls == [expected_call]
+    assert instances[0].closed is True
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "not-json",
+        "[]",
+        '{"action":"unknown","actor":"dashboard"}',
+        (
+            '{"action":"create","title":"secret title","what":"body",'
+            '"project":"bridge--111111111111","actor":"dashboard",'
+            '"memory_id":"caller-id"}'
+        ),
+        (
+            '{"action":"create","title":"secret title","what":"body",'
+            '"project":"bridge--111111111111","actor":"dashboard",'
+            '"command":"sh -c secret"}'
+        ),
+        (
+            '{"action":"delete","action":"restore",'
+            '"memory_id":"memory-1","actor":"dashboard"}'
+        ),
+        (
+            '{"action":"create","title":"secret title","what":"body",'
+            '"project":"bridge--111111111111","actor":"dashboard",'
+            '"tags":[NaN]}'
+        ),
+    ],
+)
+def test_admin_bridge_rejects_invalid_input_without_stdout(
+    monkeypatch,
+    payload,
+):
+    constructed = []
+
+    class UnexpectedService:
+        def __init__(self):
+            constructed.append(self)
+
+    monkeypatch.setattr(cli_module, "MemoryService", UnexpectedService)
+    result = CliRunner().invoke(
+        main,
+        ["admin", "apply", "--json-stdin"],
+        input=payload,
+    )
+
+    assert result.exit_code != 0
+    assert result.stdout == ""
+    assert result.stderr == "Error: Invalid admin mutation request.\n"
+    assert "secret" not in result.stderr
+    assert constructed == []
+
+
+def test_admin_bridge_closes_service_and_sanitizes_mutation_errors(monkeypatch):
+    instances = []
+
+    class FailingService:
+        def __init__(self):
+            self.closed = False
+            instances.append(self)
+
+        def archive_memory(self, memory_id, *, reason, actor):
+            raise RuntimeError("sensitive mutation payload")
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(cli_module, "MemoryService", FailingService)
+    result = CliRunner().invoke(
+        main,
+        ["admin", "apply", "--json-stdin"],
+        input=json.dumps(
+            {
+                "action": "archive",
+                "memory_id": "memory-1",
+                "reason": "reviewed",
+                "actor": "dashboard",
+            }
+        ),
+    )
+
+    assert result.exit_code != 0
+    assert result.stdout == ""
+    assert result.stderr == "Error: Admin mutation failed.\n"
+    assert "sensitive" not in result.stderr
+    assert len(instances) == 1
+    assert instances[0].closed is True
 
 
 def test_config_set_home_persists_path(tmp_path, monkeypatch):
@@ -1009,6 +1615,258 @@ def test_setup_cursor_project_flag(env_home, tmp_path, monkeypatch):
     assert result.exit_code == 0
     mcp_path = tmp_path / ".cursor" / "mcp.json"
     assert mcp_path.exists()
+
+
+def test_cursor_cli_option_matrix(
+    env_home,
+    tmp_path,
+    fake_memory,
+    monkeypatch,
+):
+    monkeypatch.chdir(tmp_path)
+    result = CliRunner().invoke(
+        main,
+        [
+            "setup",
+            "cursor",
+            "--project",
+            "--config-dir",
+            str(tmp_path / ".cursor-explicit"),
+            "--command",
+            str(fake_memory),
+            "--force-managed",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert (tmp_path / ".cursor-explicit/mcp.json").is_file()
+
+
+def test_cursor_uninstall_rejects_setup_only_command_option(env_home):
+    result = CliRunner().invoke(
+        main,
+        [
+            "uninstall",
+            "cursor",
+            "--project",
+            "--command",
+            "/opt/echovault/bin/memory",
+        ],
+    )
+    assert result.exit_code == 2
+    assert "No such option: --command" in result.output
+
+
+@dataclass
+class CapturedGeminiAdapter:
+    options: IntegrationOptions | None = None
+
+    def setup(self, options: IntegrationOptions) -> IntegrationResult:
+        self.options = options
+        return IntegrationResult("installed", "installed")
+
+    def uninstall(self, options: IntegrationOptions) -> IntegrationResult:
+        self.options = options
+        return IntegrationResult("removed", "removed")
+
+
+def install_fake_gemini_adapter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> CapturedGeminiAdapter:
+    captured = CapturedGeminiAdapter()
+    monkeypatch.setattr(cli_module, "get_adapter", lambda name: captured)
+    return captured
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected_mode", "expected_scope"),
+    [
+        (["setup", "gemini"], InstallMode.NATIVE, InstallScope.USER),
+        (
+            ["setup", "gemini", "--direct"],
+            InstallMode.DIRECT,
+            InstallScope.USER,
+        ),
+        (
+            ["setup", "gemini", "--project"],
+            InstallMode.DIRECT,
+            InstallScope.PROJECT,
+        ),
+        (
+            ["setup", "gemini", "--project", "--direct"],
+            InstallMode.DIRECT,
+            InstallScope.PROJECT,
+        ),
+    ],
+)
+def test_gemini_setup_cli_matrix(
+    argv: list[str],
+    expected_mode: InstallMode,
+    expected_scope: InstallScope,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured = install_fake_gemini_adapter(monkeypatch)
+    result = CliRunner().invoke(main, argv)
+    assert result.exit_code == 0, result.output
+    assert captured.options is not None
+    assert captured.options.mode is expected_mode
+    assert captured.options.scope is expected_scope
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["uninstall", "gemini"],
+        ["uninstall", "gemini", "--direct"],
+        ["uninstall", "gemini", "--project"],
+        ["uninstall", "gemini", "--project", "--direct"],
+    ],
+)
+def test_gemini_uninstall_cli_matrix(
+    argv: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured = install_fake_gemini_adapter(monkeypatch)
+    result = CliRunner().invoke(main, argv)
+    assert result.exit_code == 0, result.output
+    assert captured.options is not None
+    assert captured.options.scope is (
+        InstallScope.PROJECT if "--project" in argv else InstallScope.USER
+    )
+    assert captured.options.mode is (
+        InstallMode.DIRECT
+        if "--direct" in argv or "--project" in argv
+        else InstallMode.NATIVE
+    )
+
+
+@pytest.mark.parametrize("verb", ["setup", "uninstall"])
+def test_gemini_native_config_dir_is_usage_error(verb: str) -> None:
+    result = CliRunner().invoke(
+        main,
+        [verb, "gemini", "--config-dir", "/tmp/.gemini"],
+    )
+    assert result.exit_code == 2
+    assert "--config-dir requires --direct or --project" in result.output
+
+
+@pytest.mark.parametrize("verb", ["setup", "uninstall"])
+@pytest.mark.parametrize("scope_args", [[], ["--direct"], ["--project"]])
+def test_force_managed_reaches_every_gemini_variant(
+    verb: str,
+    scope_args: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured = install_fake_gemini_adapter(monkeypatch)
+    result = CliRunner().invoke(
+        main,
+        [verb, "gemini", *scope_args, "--force-managed"],
+    )
+    assert result.exit_code == 0, result.output
+    assert captured.options is not None
+    assert captured.options.force_managed is True
+
+
+@pytest.mark.parametrize("scope_args", [[], ["--direct"], ["--project"]])
+def test_gemini_command_is_setup_only(
+    scope_args: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured = install_fake_gemini_adapter(monkeypatch)
+    setup_result = CliRunner().invoke(
+        main,
+        [
+            "setup",
+            "gemini",
+            *scope_args,
+            "--command",
+            "/opt/echovault/bin/memory",
+        ],
+    )
+    assert setup_result.exit_code == 0, setup_result.output
+    assert captured.options is not None
+    assert captured.options.command == "/opt/echovault/bin/memory"
+    uninstall_result = CliRunner().invoke(
+        main,
+        [
+            "uninstall",
+            "gemini",
+            *scope_args,
+            "--command",
+            "/opt/echovault/bin/memory",
+        ],
+    )
+    assert uninstall_result.exit_code == 2
+    assert "No such option: --command" in uninstall_result.output
+
+
+@pytest.mark.parametrize("verb", ["setup", "uninstall"])
+@pytest.mark.parametrize("scope_args", [["--direct"], ["--project"]])
+def test_gemini_config_dir_is_valid_for_direct_targets(
+    verb: str,
+    scope_args: list[str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured = install_fake_gemini_adapter(monkeypatch)
+    target = tmp_path / ".gemini"
+    result = CliRunner().invoke(
+        main,
+        [verb, "gemini", *scope_args, "--config-dir", str(target)],
+    )
+    assert result.exit_code == 0, result.output
+    assert captured.options is not None
+    assert captured.options.config_root == target.resolve()
+    assert captured.options.config_root_explicit is True
+
+
+def test_gemini_hook_command_always_writes_one_json_document(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "memory.integrations.gemini_hook.handle_before_agent",
+        lambda payload: {},
+    )
+    event = {
+        "session_id": "session-1",
+        "cwd": "/workspace/repo",
+        "hook_event_name": "BeforeAgent",
+        "timestamp": "2026-07-14T12:00:00Z",
+        "prompt": "Find ALPHA-42",
+    }
+    result = CliRunner().invoke(
+        main,
+        ["hook", "gemini", "before-agent"],
+        input=json.dumps(event),
+    )
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output) == {}
+
+
+def test_doctor_cursor_accepts_project_root_and_reports_integration(
+    env_home,
+    tmp_path,
+    monkeypatch,
+):
+    from memory.integrations.process import CommandResult, SubprocessRunner
+
+    project = tmp_path / "repo"
+    project.mkdir()
+    monkeypatch.setattr(
+        SubprocessRunner,
+        "run",
+        lambda self, argv, **kwargs: CommandResult(
+            127,
+            "",
+            "agent unavailable",
+        ),
+    )
+    result = CliRunner().invoke(
+        main,
+        ["doctor", "--agent", "cursor", "--project-root", str(project)],
+    )
+    assert result.exit_code == 0, result.output
+    assert "integration_findings" in result.output
+    assert "cursor.cloud-boundary" in result.output
 
 
 def test_setup_codex_project_flag(env_home, tmp_path, monkeypatch):

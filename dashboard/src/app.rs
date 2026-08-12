@@ -182,7 +182,10 @@ impl App {
             Some(self.search_query.as_str())
         };
 
-        if let Ok(mems) = self.db.list_memories(300, project, category, self.include_archived, query) {
+        if let Ok(mems) =
+            self.db
+                .list_memories(300, project, category, self.include_archived, query)
+        {
             self.memories = mems;
             self.memory_selected = 0;
             self.update_detail();
@@ -196,11 +199,7 @@ impl App {
         } else {
             Some(self.project_filter.clone())
         };
-        self.duplicate_result = Some(find_duplicates_async(
-            self.db_path.clone(),
-            project,
-            100,
-        ));
+        self.duplicate_result = Some(find_duplicates_async(self.db_path.clone(), project, 100));
     }
 
     pub fn update_detail(&mut self) {
@@ -298,20 +297,24 @@ impl App {
         );
 
         if let Some(edit) = result {
-            if self.db.update_memory(
-                &mem.id,
-                &edit.title,
-                &edit.what,
-                edit.why.as_deref(),
-                edit.impact.as_deref(),
-                edit.category.as_deref(),
-                &edit.tags,
-                edit.source.as_deref(),
-                edit.details.as_deref(),
-            ).is_ok() {
+            if self
+                .db
+                .update_memory(
+                    &mem.id,
+                    &edit.title,
+                    &edit.what,
+                    edit.why.as_deref(),
+                    edit.impact.as_deref(),
+                    edit.category.as_deref(),
+                    &edit.tags,
+                    edit.details.as_deref(),
+                )
+                .is_ok()
+            {
                 self.notify(&format!("Updated: {}", edit.title));
                 self.log(&format!("Updated: {}", edit.title));
                 self.refresh_memories();
+                self.refresh_overview();
             }
             true
         } else {
@@ -327,7 +330,6 @@ impl App {
         };
         let result = editor::open_editor("", project, "", "", "", "", "", "", "");
         if let Some(edit) = result {
-            let id = uuid_v4();
             let project = if edit.project.is_empty() {
                 self.project_filter.clone()
             } else {
@@ -338,21 +340,25 @@ impl App {
             } else {
                 project
             };
-            if self.db.insert_memory(
-                &id,
-                &edit.title,
-                &edit.what,
-                edit.why.as_deref(),
-                edit.impact.as_deref(),
-                edit.category.as_deref(),
-                &edit.tags,
-                edit.source.as_deref(),
-                &project,
-                edit.details.as_deref(),
-            ).is_ok() {
+            if self
+                .db
+                .insert_memory(
+                    &edit.title,
+                    &edit.what,
+                    edit.why.as_deref(),
+                    edit.impact.as_deref(),
+                    edit.category.as_deref(),
+                    &edit.tags,
+                    Some("dashboard"),
+                    &project,
+                    edit.details.as_deref(),
+                )
+                .is_ok()
+            {
                 self.notify(&format!("Created: {}", edit.title));
                 self.log(&format!("Created: {}", edit.title));
                 self.refresh_memories();
+                self.refresh_overview();
             }
             true
         } else {
@@ -419,6 +425,7 @@ impl App {
                     self.notify("Archived.");
                     self.log("Archived memory.");
                     self.refresh_memories();
+                    self.refresh_overview();
                 }
             }
             Some(ConfirmAction::RestoreMemory(id)) => {
@@ -426,12 +433,15 @@ impl App {
                     self.notify("Restored.");
                     self.log("Restored memory.");
                     self.refresh_memories();
+                    self.refresh_overview();
                 }
             }
             Some(ConfirmAction::MergePair(keep, merge)) => {
                 if self.db.merge_memories(&keep, &merge).is_ok() {
                     self.notify("Merged.");
                     self.log("Merged duplicate pair.");
+                    self.refresh_memories();
+                    self.refresh_overview();
                     self.refresh_duplicates();
                 }
             }
@@ -439,6 +449,8 @@ impl App {
                 if self.db.archive_memory(&id, "duplicate-review").is_ok() {
                     self.notify("Archived duplicate.");
                     self.log("Archived duplicate.");
+                    self.refresh_memories();
+                    self.refresh_overview();
                     self.refresh_duplicates();
                 }
             }
@@ -457,7 +469,10 @@ impl App {
         self.input_mode = InputMode::Normal;
 
         let parts: Vec<&str> = cmd.splitn(2, ' ').collect();
-        let cmd_name = parts.first().map(|s| s.trim_start_matches(':')).unwrap_or("");
+        let cmd_name = parts
+            .first()
+            .map(|s| s.trim_start_matches(':'))
+            .unwrap_or("");
         let arg = parts.get(1).map(|s| s.trim()).unwrap_or("");
 
         match cmd_name {
@@ -467,7 +482,10 @@ impl App {
             "ops" | "4" => self.switch_mode(Mode::Operations),
             "project" => {
                 self.project_filter = arg.to_string();
-                self.notify(&format!("Project: {}", if arg.is_empty() { "all" } else { arg }));
+                self.notify(&format!(
+                    "Project: {}",
+                    if arg.is_empty() { "all" } else { arg }
+                ));
             }
             "q" | "quit" => self.should_quit = true,
             "refresh" => {
@@ -511,22 +529,6 @@ impl App {
     }
 }
 
-fn uuid_v4() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let d = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    let seed = d.as_nanos();
-    format!(
-        "{:08x}-{:04x}-4{:03x}-{:04x}-{:012x}",
-        (seed & 0xFFFFFFFF) as u32,
-        ((seed >> 32) & 0xFFFF) as u16,
-        ((seed >> 48) & 0x0FFF) as u16,
-        (0x8000 | ((seed >> 60) & 0x3FFF)) as u16,
-        ((seed >> 74).wrapping_mul(0x1234567890AB)) & 0xFFFFFFFFFFFF,
-    )
-}
-
 fn chrono_now() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let d = SystemTime::now()
@@ -538,4 +540,3 @@ fn chrono_now() -> String {
     let s = secs % 60;
     format!("{:02}:{:02}:{:02}", hours, mins, s)
 }
-

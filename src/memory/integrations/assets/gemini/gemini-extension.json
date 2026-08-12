@@ -1,0 +1,12 @@
+{
+  "name": "echovault",
+  "version": "{{VERSION}}",
+  "description": "Local-first curated memory for Gemini CLI",
+  "mcpServers": {
+    "echovault": {
+      "command": "{{MEMORY_COMMAND}}",
+      "args": ["mcp", "--agent", "gemini-cli"]
+    }
+  },
+  "contextFileName": "GEMINI.md"
+}

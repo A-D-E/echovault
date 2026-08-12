@@ -3,8 +3,18 @@
 import json
 import os
 import shutil
-import sys
+import copy
+from pathlib import Path
 from typing import Any
+
+from memory.integrations.config_io import (
+    ConfigMalformedError,
+    mutate_json_atomic,
+    mutate_toml_atomic,
+    read_json_strict,
+    read_toml_strict,
+)
+from memory.integrations.asset_io import read_package_asset
 
 
 # ---------------------------------------------------------------------------
@@ -12,20 +22,14 @@ from typing import Any
 # ---------------------------------------------------------------------------
 
 def _read_json(path: str) -> dict:
-    """Read a JSON file, returning empty dict if missing or empty."""
-    try:
-        with open(path) as f:
-            return json.load(f) or {}
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
+    """Read one JSON object without treating malformed input as empty."""
+    return copy.deepcopy(read_json_strict(Path(path)).data)
 
 
 def _write_json(path: str, data: dict) -> None:
-    """Write a dict as formatted JSON."""
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w") as f:
-        json.dump(data, f, indent=2)
-        f.write("\n")
+    """Atomically replace one JSON object with digest-CAS protection."""
+    snapshot = copy.deepcopy(data)
+    mutate_json_atomic(Path(path), lambda _current: copy.deepcopy(snapshot))
 
 
 # ---------------------------------------------------------------------------
@@ -33,53 +37,15 @@ def _write_json(path: str, data: dict) -> None:
 # ---------------------------------------------------------------------------
 
 def _read_toml(path: str) -> dict:
-    """Read a TOML file, returning empty dict if missing or empty."""
-    try:
-        with open(path, "rb") as f:
-            data = f.read()
-    except FileNotFoundError:
-        return {}
-    if not data.strip():
-        return {}
-    if sys.version_info >= (3, 11):
-        import tomllib
-        return tomllib.loads(data.decode())
-    else:
-        import tomli
-        return tomli.loads(data.decode())
+    """Read one TOML document without malformed-state fallback."""
+    document = read_toml_strict(Path(path)).data
+    return document.unwrap() if hasattr(document, "unwrap") else dict(document)
 
 
 def _write_toml(path: str, data: dict) -> None:
-    """Write a dict as TOML.
-
-    Only supports the subset we need: top-level key/value pairs and
-    one level of nested tables with string/list-of-string values.
-    """
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    lines: list[str] = []
-
-    # Write top-level scalar keys first
-    for key, value in data.items():
-        if not isinstance(value, dict):
-            lines.append(f"{key} = {_toml_value(value)}")
-
-    # Write tables
-    for key, value in data.items():
-        if isinstance(value, dict):
-            if lines and lines[-1] != "":
-                lines.append("")
-            lines.append(f"[{key}]")
-            for k, v in value.items():
-                if isinstance(v, dict):
-                    lines.append("")
-                    lines.append(f"[{key}.{k}]")
-                    for kk, vv in v.items():
-                        lines.append(f"{kk} = {_toml_value(vv)}")
-                else:
-                    lines.append(f"{k} = {_toml_value(v)}")
-
-    with open(path, "w") as f:
-        f.write("\n".join(lines) + "\n")
+    """Atomically replace one TOML document."""
+    snapshot = copy.deepcopy(data)
+    mutate_toml_atomic(Path(path), lambda _current: copy.deepcopy(snapshot))
 
 
 def _toml_value(v: object) -> str:
@@ -117,31 +83,33 @@ def _install_mcp_servers(path: str) -> bool:
 
     Used by Claude Code and Cursor.  Returns True if the entry was added.
     """
-    data = _read_json(path)
-    servers = data.setdefault("mcpServers", {})
-    if "echovault" in servers:
-        return False
-    servers["echovault"] = MCP_CONFIG
-    _write_json(path, data)
-    return True
+    def install(data: dict[str, Any]) -> dict[str, Any]:
+        servers = data.setdefault("mcpServers", {})
+        if not isinstance(servers, dict):
+            raise ConfigMalformedError("mcpServers must be a JSON object")
+        if "echovault" not in servers:
+            servers["echovault"] = copy.deepcopy(MCP_CONFIG)
+        return data
+
+    return mutate_json_atomic(Path(path), install).changed
 
 
 def _uninstall_mcp_servers(path: str) -> bool:
     """Remove echovault from a JSON ``mcpServers`` key.  Returns True if removed."""
-    if not os.path.exists(path):
-        return False
-    data = _read_json(path)
-    servers = data.get("mcpServers", {})
-    if "echovault" not in servers:
-        return False
-    del servers["echovault"]
-    if not servers:
-        del data["mcpServers"]
-    if data:
-        _write_json(path, data)
-    else:
-        os.remove(path)
-    return True
+    def uninstall(data: dict[str, Any]) -> dict[str, Any]:
+        servers = data.get("mcpServers", {})
+        if not isinstance(servers, dict):
+            raise ConfigMalformedError("mcpServers must be a JSON object")
+        servers.pop("echovault", None)
+        if not servers:
+            data.pop("mcpServers", None)
+        return data
+
+    return mutate_json_atomic(
+        Path(path),
+        uninstall,
+        remove_if_empty=True,
+    ).changed
 
 
 def _install_toml_mcp(path: str) -> bool:
@@ -151,18 +119,21 @@ def _install_toml_mcp(path: str) -> bool:
     If the existing file can't be parsed (e.g. Codex writes non-standard
     TOML keys), falls back to appending the section directly.
     """
-    try:
-        data = _read_toml(path)
-    except Exception:
-        # File exists but has non-standard TOML — append directly
-        return _append_toml_mcp_section(path)
+    def install(data: Any) -> Any:
+        servers = data.get("mcp_servers")
+        if servers is None:
+            data["mcp_servers"] = {}
+            servers = data["mcp_servers"]
+        if not hasattr(servers, "__setitem__"):
+            raise ConfigMalformedError("mcp_servers must be a TOML table")
+        if "echovault" not in servers:
+            servers["echovault"] = {
+                "command": "memory",
+                "args": ["mcp"],
+            }
+        return data
 
-    servers = data.setdefault("mcp_servers", {})
-    if "echovault" in servers:
-        return False
-    servers["echovault"] = {"command": "memory", "args": ["mcp"]}
-    _write_toml(path, data)
-    return True
+    return mutate_toml_atomic(Path(path), install).changed
 
 
 def _append_toml_mcp_section(path: str) -> bool:
@@ -186,35 +157,19 @@ def _append_toml_mcp_section(path: str) -> bool:
 
 def _uninstall_toml_mcp(path: str) -> bool:
     """Remove echovault from a TOML ``[mcp_servers]`` table.  Returns True if removed."""
-    import re
-
-    if not os.path.exists(path):
-        return False
-
-    try:
-        data = _read_toml(path)
-        servers = data.get("mcp_servers", {})
-        if "echovault" not in servers:
-            return False
-        del servers["echovault"]
+    def uninstall(data: Any) -> Any:
+        servers = data.get("mcp_servers")
+        if servers is None:
+            return data
+        if not hasattr(servers, "__delitem__"):
+            raise ConfigMalformedError("mcp_servers must be a TOML table")
+        if "echovault" in servers:
+            del servers["echovault"]
         if not servers:
             del data["mcp_servers"]
-        _write_toml(path, data)
-        return True
-    except Exception:
-        # Non-standard TOML — use regex removal
-        with open(path) as f:
-            content = f.read()
-        if "mcp_servers.echovault" not in content:
-            return False
-        cleaned = re.sub(
-            r"\n*\[mcp_servers\.echovault\]\n(?:(?!\[)[^\n]*\n?)*",
-            "",
-            content,
-        )
-        with open(path, "w") as f:
-            f.write(cleaned)
-        return True
+        return data
+
+    return mutate_toml_atomic(Path(path), uninstall).changed
 
 
 def _install_opencode_mcp(path: str) -> bool:
@@ -222,31 +177,33 @@ def _install_opencode_mcp(path: str) -> bool:
 
     Returns True if the entry was added.
     """
-    data = _read_json(path)
-    mcp = data.setdefault("mcp", {})
-    if "echovault" in mcp:
-        return False
-    mcp["echovault"] = OPENCODE_MCP_CONFIG
-    _write_json(path, data)
-    return True
+    def install(data: dict[str, Any]) -> dict[str, Any]:
+        mcp = data.setdefault("mcp", {})
+        if not isinstance(mcp, dict):
+            raise ConfigMalformedError("mcp must be a JSON object")
+        if "echovault" not in mcp:
+            mcp["echovault"] = copy.deepcopy(OPENCODE_MCP_CONFIG)
+        return data
+
+    return mutate_json_atomic(Path(path), install).changed
 
 
 def _uninstall_opencode_mcp(path: str) -> bool:
     """Remove echovault from a JSON ``mcp`` key.  Returns True if removed."""
-    if not os.path.exists(path):
-        return False
-    data = _read_json(path)
-    mcp = data.get("mcp", {})
-    if "echovault" not in mcp:
-        return False
-    del mcp["echovault"]
-    if not mcp:
-        del data["mcp"]
-    if data:
-        _write_json(path, data)
-    else:
-        os.remove(path)
-    return True
+    def uninstall(data: dict[str, Any]) -> dict[str, Any]:
+        mcp = data.get("mcp", {})
+        if not isinstance(mcp, dict):
+            raise ConfigMalformedError("mcp must be a JSON object")
+        mcp.pop("echovault", None)
+        if not mcp:
+            data.pop("mcp", None)
+        return data
+
+    return mutate_json_atomic(
+        Path(path),
+        uninstall,
+        remove_if_empty=True,
+    ).changed
 
 
 def _remove_old_hooks(settings: dict) -> list[str]:
@@ -277,26 +234,6 @@ def _remove_old_hooks(settings: dict) -> list[str]:
     return removed
 
 
-def _get_skill_md_path() -> str:
-    """Get the path to the bundled SKILL.md file."""
-    # Walk up from this file to find skills/echovault/SKILL.md in the package root.
-    # In an installed package, use importlib.resources; for dev, use relative path.
-    this_dir = os.path.dirname(os.path.abspath(__file__))
-    # Try dev layout: src/memory/setup.py -> ../../skills/echovault/SKILL.md
-    dev_path = os.path.join(this_dir, "..", "..", "skills", "echovault", "SKILL.md")
-    if os.path.exists(dev_path):
-        return os.path.abspath(dev_path)
-    # Try installed layout: check package data
-    try:
-        from importlib.resources import files
-        pkg_path = str(files("memory").joinpath("skill", "SKILL.md"))
-        if os.path.exists(pkg_path):
-            return pkg_path
-    except (ImportError, TypeError):
-        pass
-    return ""
-
-
 def _install_skill(agent_home: str, agent_name: str = "agent") -> bool:
     """Install the echovault SKILL.md into an agent's skills directory.
 
@@ -309,13 +246,15 @@ def _install_skill(agent_home: str, agent_name: str = "agent") -> bool:
     skill_dir = os.path.join(agent_home, "skills", "echovault")
     skill_path = os.path.join(skill_dir, "SKILL.md")
 
-    source = _get_skill_md_path()
-    if source:
-        with open(source) as f:
-            content = f.read()
-    else:
-        content = _FALLBACK_SKILL_MD
-    content = content.replace("{{AGENT_NAME}}", agent_name)
+    content = read_package_asset(
+        "common/echovault-skill.md"
+    ).decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
+    content = (
+        content.replace("{{AGENT_NAME}}", agent_name)
+        .replace("{{VERSION}}", "0.6.0")
+        .replace("<!-- echovault:unbound-compatibility:start -->\n", "")
+        .replace("<!-- echovault:unbound-compatibility:end -->\n", "")
+    )
 
     try:
         with open(skill_path) as f:
@@ -345,98 +284,6 @@ def _uninstall_skill(agent_home: str) -> bool:
         shutil.rmtree(skill_dir)
         return True
     return False
-
-
-_FALLBACK_SKILL_MD = """\
----
-name: echovault
-description: Local-first memory for coding agents. You MUST retrieve task-aware context before substantive work and save durable learnings before session end.
----
-
-# EchoVault — Agent Memory System
-
-You have persistent memory across sessions. USE IT.
-
-## Task-aware context — MANDATORY
-
-Before feature, planning, debugging, or architecture work, use `memory_context`
-with `agent="{{AGENT_NAME}}"` and `query` set to the current user request.
-
-CLI fallback:
-
-```bash
-memory context --project --agent {{AGENT_NAME}} --query "<current user request>"
-```
-
-If policy reports disabled, continue normally. Use explicit search when the
-context pack is insufficient.
-
-## Session end — MANDATORY
-
-Before ending your response to ANY task that involved making changes, debugging, deciding, or learning something, you MUST save a memory. This is not optional. If you did meaningful work, save it.
-
-```bash
-memory save \\
-  --title "Short descriptive title" \\
-  --what "What happened or was decided" \\
-  --why "Reasoning behind it" \\
-  --impact "What changed as a result" \\
-  --tags "tag1,tag2,tag3" \\
-  --category "<category>" \\
-  --related-files "path/to/file1,path/to/file2" \\
-  --source "{{AGENT_NAME}}" \\
-  --details "Context:
-
-             Options considered:
-             - Option A
-             - Option B
-
-             Decision:
-             Tradeoffs:
-             Follow-up:"
-```
-
-Categories: `decision`, `bug`, `pattern`, `learning`, `context`, `playbook`,
-`known_fix`, `constraint`, `project_state`, `active_work`.
-
-Use `--source {{AGENT_NAME}}` to identify the agent.
-
-### What to save
-
-You MUST save when any of these happen:
-
-- You made an architectural or design decision
-- You fixed a bug (include root cause and solution)
-- You discovered a non-obvious pattern or gotcha
-- You set up infrastructure, tooling, or configuration
-- You chose one approach over alternatives
-- You learned something about the codebase that isn't in the code
-- The user corrected you or clarified a requirement
-
-### What NOT to save
-
-- Trivial changes (typo fixes, formatting)
-- Information that's already obvious from reading the code
-- Duplicate of an existing memory (search first)
-
-## Other commands
-
-```bash
-memory config       # show current configuration
-memory sessions     # list session files
-memory reindex      # rebuild search index
-memory delete <id>  # remove a memory
-```
-
-## Rules
-
-- Retrieve before working. Save before finishing. No exceptions.
-- Always capture thorough details — write for a future agent with no context.
-- Never include API keys, secrets, or credentials.
-- Wrap sensitive values in `<redacted>` tags.
-- Search before saving to avoid duplicates.
-- One memory per distinct decision or event. Don't bundle unrelated things.
-"""
 
 
 def _get_claude_mcp_path(claude_home: str, project: bool) -> str:
@@ -486,36 +333,62 @@ def setup_claude_code(claude_home: str, *, project: bool = False) -> dict[str, s
 
 
 def setup_cursor(cursor_home: str) -> dict[str, str]:
-    """Install EchoVault MCP server into Cursor mcp.json."""
-    installed = []
+    """Install the managed EchoVault local plugin for Cursor."""
+    from memory.integrations.registry import get_adapter
+    from memory.integrations.types import (
+        InstallMode,
+        InstallScope,
+        IntegrationOptions,
+    )
 
-    # Remove old hooks if present
-    old_hooks_path = os.path.join(cursor_home, "hooks.json")
-    if os.path.exists(old_hooks_path):
-        old_data = _read_json(old_hooks_path)
-        hooks = old_data.get("hooks", {})
-        for event in list(hooks.keys()):
-            event_hooks = hooks[event]
-            filtered = [h for h in event_hooks if "memory context" not in h.get("command", "")]
-            if len(filtered) != len(event_hooks):
-                installed.append(f"removed old hook: {event}")
-                if filtered:
-                    hooks[event] = filtered
-                else:
-                    del hooks[event]
-        _write_json(old_hooks_path, old_data)
+    result = get_adapter("cursor").setup(
+        IntegrationOptions(
+            scope=InstallScope.USER,
+            mode=InstallMode.NATIVE,
+            config_root=Path(cursor_home),
+            project_root=None,
+            command=None,
+            config_root_explicit=True,
+        )
+    )
+    return {"status": "ok", "message": result.message}
 
-    # Remove old skill if present
-    _uninstall_skill(cursor_home)
 
-    # Add MCP server config
-    mcp_path = os.path.join(cursor_home, "mcp.json")
-    if _install_mcp_servers(mcp_path):
-        installed.append("mcpServers")
+def setup_gemini(
+    gemini_home: str,
+    *,
+    direct: bool = False,
+    project_root: str | None = None,
+    command: str | None = None,
+    force_managed: bool = False,
+) -> dict[str, str]:
+    """Install one managed Gemini integration through the canonical adapter."""
+    from memory.integrations.registry import get_adapter
+    from memory.integrations.types import (
+        InstallMode,
+        InstallScope,
+        IntegrationOptions,
+    )
 
-    if installed:
-        return {"status": "ok", "message": f"Installed: {', '.join(installed)}"}
-    return {"status": "ok", "message": "Already installed"}
+    project = Path(project_root).expanduser().resolve() if project_root else None
+    result = get_adapter("gemini").setup(
+        IntegrationOptions(
+            scope=(
+                InstallScope.PROJECT if project is not None else InstallScope.USER
+            ),
+            mode=(
+                InstallMode.DIRECT
+                if direct or project is not None
+                else InstallMode.NATIVE
+            ),
+            config_root=Path(gemini_home).expanduser().resolve(),
+            project_root=project,
+            command=command,
+            force_managed=force_managed,
+            config_root_explicit=True,
+        )
+    )
+    return {"status": "ok", "message": result.message}
 
 
 CODEX_AGENTS_MD_SECTION = """\
@@ -658,35 +531,61 @@ def uninstall_claude_code(claude_home: str, *, project: bool = False) -> dict[st
 
 
 def uninstall_cursor(cursor_home: str) -> dict[str, str]:
-    """Remove EchoVault from Cursor (MCP config + old hooks)."""
-    removed = []
+    """Remove the managed EchoVault local plugin from Cursor."""
+    from memory.integrations.registry import get_adapter
+    from memory.integrations.types import (
+        InstallMode,
+        InstallScope,
+        IntegrationOptions,
+    )
 
-    mcp_path = os.path.join(cursor_home, "mcp.json")
-    if _uninstall_mcp_servers(mcp_path):
-        removed.append("mcpServers")
+    result = get_adapter("cursor").uninstall(
+        IntegrationOptions(
+            scope=InstallScope.USER,
+            mode=InstallMode.NATIVE,
+            config_root=Path(cursor_home),
+            project_root=None,
+            command=None,
+            config_root_explicit=True,
+        )
+    )
+    return {"status": "ok", "message": result.message}
 
-    # Remove old hooks
-    old_hooks_path = os.path.join(cursor_home, "hooks.json")
-    if os.path.exists(old_hooks_path):
-        old_data = _read_json(old_hooks_path)
-        hooks = old_data.get("hooks", {})
-        for event in list(hooks.keys()):
-            event_hooks = hooks[event]
-            filtered = [h for h in event_hooks if "memory context" not in h.get("command", "")]
-            if len(filtered) != len(event_hooks):
-                removed.append(event)
-                if filtered:
-                    hooks[event] = filtered
-                else:
-                    del hooks[event]
-        _write_json(old_hooks_path, old_data)
 
-    if _uninstall_skill(cursor_home):
-        removed.append("skill")
+def uninstall_gemini(
+    gemini_home: str,
+    *,
+    direct: bool = False,
+    project_root: str | None = None,
+    force_managed: bool = False,
+) -> dict[str, str]:
+    """Remove one managed Gemini integration through the canonical adapter."""
+    from memory.integrations.registry import get_adapter
+    from memory.integrations.types import (
+        InstallMode,
+        InstallScope,
+        IntegrationOptions,
+    )
 
-    if removed:
-        return {"status": "ok", "message": f"Removed: {', '.join(removed)}"}
-    return {"status": "ok", "message": "Nothing to remove"}
+    project = Path(project_root).expanduser().resolve() if project_root else None
+    result = get_adapter("gemini").uninstall(
+        IntegrationOptions(
+            scope=(
+                InstallScope.PROJECT if project is not None else InstallScope.USER
+            ),
+            mode=(
+                InstallMode.DIRECT
+                if direct or project is not None
+                else InstallMode.NATIVE
+            ),
+            config_root=Path(gemini_home).expanduser().resolve(),
+            project_root=project,
+            command=None,
+            force_managed=force_managed,
+            config_root_explicit=True,
+        )
+    )
+    return {"status": "ok", "message": result.message}
 
 
 def uninstall_codex(codex_home: str) -> dict[str, str]:

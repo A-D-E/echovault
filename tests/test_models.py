@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import re
+from dataclasses import FrozenInstanceError
 from datetime import datetime, timezone
 
-from memory.models import Memory, MemoryDetail, RawMemoryInput, SearchResult
+import pytest
+
+from memory.models import Memory, MemoryDetail, MemoryOperation, RawMemoryInput, SearchResult
 
 
 def test_raw_memory_input_with_required_fields_only():
@@ -137,6 +140,33 @@ def test_memory_from_raw_preserves_all_fields():
     assert memory.source == "user"
     assert memory.project == "test-project"
     assert memory.file_path == "/path/to/session.md"
+
+
+def test_memory_from_raw_initializes_provenance_defaults():
+    raw = RawMemoryInput(title="Provenance", what="Track the creator", source="cursor")
+
+    memory = Memory.from_raw(raw, project="test-project")
+
+    assert memory.creator_source == "cursor"
+    assert memory.last_updated_by == "cursor"
+    assert memory.contributors == ["cursor"]
+    assert memory.operations == []
+    assert memory.content_fingerprint is None
+    assert memory.history_complete is True
+    assert memory.updated_count == 0
+
+
+def test_memory_operation_is_immutable():
+    operation = MemoryOperation(
+        operation_id="op-1",
+        source="cursor",
+        action="created",
+        request_fingerprint="request-1",
+        timestamp="2026-07-14T10:00:00+00:00",
+    )
+
+    with pytest.raises(FrozenInstanceError):
+        operation.action = "updated"
 
 
 def test_memory_detail():

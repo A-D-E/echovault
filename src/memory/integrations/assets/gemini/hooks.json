@@ -1,0 +1,18 @@
+{
+  "hooks": {
+    "BeforeAgent": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "name": "echovault-context",
+            "type": "command",
+            "command": "{{HOOK_COMMAND}}",
+            "timeout": 5000,
+            "description": "Inject curated EchoVault context"
+          }
+        ]
+      }
+    ]
+  }
+}

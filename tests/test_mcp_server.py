@@ -186,3 +186,21 @@ class TestMemoryContextTool:
         data = json.loads(result)
         assert data["total"] == 0
         assert len(data["memories"]) == 0
+
+    def test_context_pack_formatter_is_shared(self, seeded_service):
+        from memory.context_pack import build_context_pack
+        from memory.mcp_server import handle_memory_context
+
+        results, total = seeded_service.get_context(
+            project="test-project",
+            record_feedback=False,
+        )
+        expected = build_context_pack(results, total=total)
+        actual = json.loads(
+            handle_memory_context(
+                seeded_service,
+                project="test-project",
+                record_feedback=False,
+            )
+        )
+        assert actual == expected

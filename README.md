@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="#install">Install</a> · <a href="#features">Features</a> · <a href="#how-it-works">How it works</a> · <a href="#commands">Commands</a> · <a href="CHANGELOG.md">Changelog</a> · <a href="https://github.com/mraza007/echovault/releases">Releases</a> · <a href="https://muhammadraza.me/2026/building-local-memory-for-coding-agents/">Blog post</a>
+  <a href="#install">Install</a> · <a href="#features">Features</a> · <a href="#how-it-works">How it works</a> · <a href="#commands">Commands</a> · <a href="docs/integrations/cursor.md">Cursor guide</a> · <a href="docs/integrations/gemini-cli.md">Gemini guide</a> · <a href="CHANGELOG.md">Changelog</a> · <a href="https://github.com/mraza007/echovault/releases">Releases</a> · <a href="https://muhammadraza.me/2026/building-local-memory-for-coding-agents/">Blog post</a>
 </p>
 
 ---
@@ -26,9 +26,9 @@ I built EchoVault to solve this: local memory persistence for coding agents that
 
 ## Features
 
-**Works with 4 agents** — Claude Code, Cursor, Codex, OpenCode. One command sets up MCP config for your agent.
+**Works with 5 agents** — Claude Code, Cursor, Gemini CLI, Codex, and OpenCode. One command sets up curated memory for your agent.
 
-**MCP native** — Runs as an MCP server exposing `memory_save`, `memory_search`, and `memory_context` as tools. Agents call them directly — no shell hooks needed.
+**MCP native** — Runs as an MCP server exposing `memory_context`, `memory_search`, `memory_details`, and `memory_save` as tools. Agents call them directly — no shell hooks needed.
 
 **Local-first** — Everything stays on your machine. Memories are stored as Markdown in `~/.memory/vault/`, readable in Obsidian or any editor. No data leaves your machine unless you opt into cloud embeddings.
 
@@ -44,7 +44,7 @@ I built EchoVault to solve this: local memory persistence for coding agents that
 
 **Secret redaction** — 3-layer redaction strips API keys, passwords, and credentials before anything hits disk. Supports explicit `<redacted>` tags, pattern detection, and custom `.memoryignore` rules.
 
-**Cross-agent** — Memories saved by Claude Code are searchable in Cursor, Codex, and OpenCode. One vault, many agents.
+**Cross-agent** — Memories saved by one supported agent are searchable from every other supported agent. One vault, many agents.
 
 **Obsidian-compatible** — Session files are valid Markdown with YAML frontmatter. Point Obsidian at `~/.memory/vault/` and browse your agent's memory visually.
 
@@ -57,7 +57,7 @@ Install the latest stable release:
 ```bash
 pip install git+https://github.com/mraza007/echovault.git@v0.5.0
 memory init
-memory setup claude-code   # or: cursor, codex, opencode
+memory setup claude-code   # or: cursor, gemini, codex, opencode
 ```
 
 That's it. `memory setup` installs MCP server config automatically.
@@ -70,14 +70,154 @@ pip install git+https://github.com/mraza007/echovault.git@main
 
 Release notes live in [CHANGELOG.md](CHANGELOG.md) and on the [GitHub Releases](https://github.com/mraza007/echovault/releases) page.
 
+Every change is gated in CI across Python 3.10–3.14 on Linux, the boundary
+versions on macOS and Windows, the Rust dashboard suite, an installed-wheel
+black-box check, Cursor bundle validation, and Gemini CLI 0.50.0 extension
+validation. CI uses no agent credentials and does not claim authenticated model
+behavior.
+
 By default config is installed globally. To install for a specific project:
 
 ```bash
 cd ~/my-project
 memory setup claude-code --project   # writes .mcp.json in project root
+memory setup cursor --project        # writes bound MCP + rule + skill in .cursor/
+memory setup gemini --project        # writes bound MCP + hook + skill in .gemini/
 memory setup opencode --project      # writes opencode.json in project root
 memory setup codex --project         # writes .codex/config.toml + AGENTS.md
 ```
+
+### Cursor: IDE, CLI, and Agents Window
+
+EchoVault supports Cursor's local IDE agent, Cursor Agent CLI, and local runs
+from the Agents Window through one bound MCP identity. Choose one or both
+scopes:
+
+```bash
+# Global: managed local plugin, available across local Cursor projects
+memory setup cursor
+
+# Project: portable, version-controlled fallback in PROJECT/.cursor
+cd ~/my-project
+memory setup cursor --project
+
+# Optional explicit locations/commands
+memory setup cursor --config-dir /path/to/cursor-config \
+  --command /absolute/path/to/memory
+memory setup cursor --project --config-dir /path/to/project/.cursor \
+  --command memory
+```
+
+Reload or restart Cursor after changing the global plugin. Project setup
+installs `.cursor/mcp.json`, `.cursor/rules/echovault.mdc`, and
+`.cursor/skills/echovault/SKILL.md`. The MCP command is bound to
+`--agent cursor`; model calls cannot spoof another agent, source, or project.
+An exact legacy direct `mcpServers.echovault` entry is migrated automatically.
+A custom same-named entry, malformed configuration, or unowned plugin directory
+is left untouched and reported as a conflict.
+
+Inspect the effective installation without modifying it:
+
+```bash
+cd ~/my-project
+memory doctor --agent cursor
+memory doctor --agent cursor --project-root /path/to/project
+```
+
+Remove exactly one scope; installing or removing a project integration never
+removes the global plugin, and vice versa:
+
+```bash
+memory uninstall cursor
+cd ~/my-project && memory uninstall cursor --project
+```
+
+Cursor project MCP configuration is shared by the IDE and Agent CLI. Local
+Agents Window runs (including a session steered through Mobile Remote Control)
+can reach the machine's local vault. A true Cursor Cloud Agent runs in an
+isolated environment: it can use the portable project configuration only when
+EchoVault and its vault storage are provisioned there. EchoVault does not
+silently upload or mirror a local vault to Cursor Cloud.
+
+The installer and doctor deterministically verify files, ownership hashes,
+the bound MCP definition, executable resolution, and tool availability. The
+always-applied rule instructs Cursor to retrieve task context and save curated
+learnings, but Cursor ultimately decides whether a model issues an MCP call.
+End-to-end proof of actual retrieval therefore requires an authenticated Cursor
+smoke test; installed files alone are not evidence that a particular model turn
+called `memory_context`.
+
+### Gemini CLI: native extension and direct fallbacks
+
+EchoVault supports Gemini CLI through three explicit installation targets:
+
+```bash
+# Recommended global target: managed native Gemini extension
+memory setup gemini
+
+# Global fallback: merge only EchoVault's entries into ~/.gemini
+memory setup gemini --direct
+
+# Project fallback: portable PROJECT/.gemini plus PROJECT/GEMINI.md
+cd ~/my-project
+memory setup gemini --project
+
+# Direct targets may use an explicit .gemini directory and command
+memory setup gemini --direct --config-dir /path/to/.gemini \
+  --command /absolute/path/to/memory
+memory setup gemini --project --config-dir /path/to/project/.gemini \
+  --command memory
+```
+
+Native setup renders an owned local extension source, validates it with the
+Gemini extension manager, and lets Gemini present its normal install-consent
+prompt. Rerunning the same command is a byte-stable no-op; rerunning after an
+EchoVault asset change performs a managed update. User-direct setup installs
+the same bound MCP identity, curated skill, static `GEMINI.md` context, and—on
+Gemini CLI 0.50.0 or newer—the named `BeforeAgent` hook. Older clients remain
+usable through MCP and static context but are reported as degraded.
+
+Native (`N`) and user-direct (`U`) are alternative global modes and cannot be
+enabled together. Project-direct (`P`) may coexist with either global mode; in
+that project its MCP configuration takes precedence. Both valid hooks may
+remain installed because a local digest claim guarantees that the same event
+injects context and records feedback at most once. Start a new Gemini CLI
+session after changing an integration so the client reloads its configuration.
+
+Inspect all three states without installing, updating, or repairing anything:
+
+```bash
+memory doctor --agent gemini-cli
+memory doctor --agent gemini-cli --project-root /path/to/project
+```
+
+Remove exactly the selected scope:
+
+```bash
+memory uninstall gemini             # native extension
+memory uninstall gemini --direct    # user-direct
+cd ~/my-project && memory uninstall gemini --project
+```
+
+`--force-managed` may replace or remove only content claimed by EchoVault's
+ownership manifest. Custom same-named entries, malformed configuration, and
+unowned trees are never overwritten—even with force. Removing a project target
+does not touch the global target, and removing the global target leaves a
+project target standalone.
+
+The `BeforeAgent` hook consumes the validated prompt and working directory; it
+never opens Gemini's transcript path. Retrieval runs in a bounded worker and
+fails open with `{}`. The ten-minute duplicate claim stores only a SHA-256
+digest, integration version, and expiry—not the prompt, context, session ID,
+working directory, or transcript. Automatic query embeddings remain local by
+default. A configured remote embedding provider is used for automatic queries
+only after `context.allow_remote_query_embeddings: true`; otherwise retrieval
+uses local FTS for the query.
+
+The deterministic test gate verifies assets, ownership, state transitions,
+manager commands, hook privacy, deduplication, and isolated lifecycle behavior
+without a Gemini account. It does not claim an authenticated model-session
+smoke test or prove that a particular Gemini turn chose to call an MCP tool.
 
 ### Configure embeddings (optional)
 
@@ -317,14 +457,20 @@ Keybindings:
 
 ## Supported agents
 
-| Agent | Setup command | What gets installed |
-|-------|-------------|-------------------|
-| Claude Code | `memory setup claude-code` | MCP server plus refreshed task-aware skill; `.mcp.json` (project) or `~/.claude.json` (global) |
-| Cursor | `memory setup cursor` | MCP server in `.cursor/mcp.json` |
-| Codex | `memory setup codex` | MCP server in `.codex/config.toml` + `AGENTS.md` fallback |
-| OpenCode | `memory setup opencode` | MCP server in `opencode.json` (project) or `~/.config/opencode/opencode.json` (global) |
+| Agent | Setup command | Integration behavior |
+|-------|-------------|----------------------|
+| Claude Code | `memory setup claude-code` | MCP server plus refreshed task-aware skill |
+| Cursor | `memory setup cursor` | Bound MCP plus curated rule/skill; retrieval is policy-guided |
+| Gemini CLI | `memory setup gemini` | Bound MCP plus deterministic `BeforeAgent` injection when the hook succeeds |
+| Codex | `memory setup codex` | MCP server plus `AGENTS.md` fallback |
+| OpenCode | `memory setup opencode` | MCP server in user or project configuration |
 
-All agents share the same memory vault at your effective `memory_home` path (default `~/.memory/`). A memory saved by Claude Code is searchable from Cursor, Codex, or OpenCode.
+All agents share the same memory vault at your effective `memory_home` path (default `~/.memory/`). A memory saved by Claude Code is searchable from Cursor, Gemini CLI, Codex, or OpenCode.
+
+Operational details and recovery steps are in the [Cursor guide](docs/integrations/cursor.md),
+[Gemini CLI guide](docs/integrations/gemini-cli.md),
+[0.6 migration guide](docs/migrations/cross-agent-v0.6.md), and
+[security and privacy guide](docs/security-and-privacy.md).
 
 For Claude Code, rerun `memory setup claude-code --project` after upgrading
 EchoVault. Setup preserves the MCP registration and installs or refreshes the
@@ -349,6 +495,9 @@ task-aware skill that tells Claude to pass the current request as `query` and
 | `memory feedback <referenced\|dismissed> <ids>...` | Record local aggregate retrieval feedback |
 | `memory review` | Propose lifecycle cleanup without changing memories |
 | `memory doctor` | Diagnose vault, index, vectors, references, and lifecycle health |
+| `memory doctor --agent cursor` | Read-only Cursor scope, ownership, MCP, policy, and client capability diagnostics |
+| `memory doctor --agent gemini-cli` | Read-only Gemini version, N/U/P state, ownership, hook, privacy, and policy diagnostics |
+| `memory hook gemini before-agent` | Gemini-managed prompt hook; reads one JSON event and emits one JSON response |
 | `memory import` | Import markdown memories into the SQLite index |
 | `memory sessions` | List session files |
 | `memory dashboard` | Launch the terminal dashboard |
@@ -362,7 +511,7 @@ task-aware skill that tells Claude to pass the current request as `query` and
 ## Uninstall
 
 ```bash
-memory uninstall claude-code   # or: cursor, codex, opencode
+memory uninstall claude-code   # or: cursor, gemini, codex, opencode
 pip uninstall echovault
 ```
 

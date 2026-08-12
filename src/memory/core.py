@@ -14,10 +14,9 @@ All CLI commands use this service as the main entry point.
 import json
 import os
 import re
-import sys
 import uuid
 from difflib import SequenceMatcher
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -30,11 +29,18 @@ from memory.markdown import (
     assign_entry_anchors,
     make_section_anchor,
     parse_session_file,
-    read_markdown_text,
     write_session_document,
     write_session_memory,
 )
 from memory.models import Memory, MemoryDetail, RawMemoryInput
+from memory.persistence import (
+    UNSET,
+    CanonicalPersistence,
+    MemoryPatch,
+    SaveRequest,
+    _Unset,
+)
+from memory.projects import ProjectScope
 from memory.redaction import load_memoryignore, redact
 from memory.search import hybrid_search, tiered_search
 
@@ -46,7 +52,13 @@ class MemoryService:
     All operations are coordinated through this service.
     """
 
-    def __init__(self, memory_home: Optional[str] = None):
+    def __init__(
+        self,
+        memory_home: Optional[str] = None,
+        *,
+        recover_pending: bool = True,
+        read_only: bool = False,
+    ):
         """Initialize the memory service.
 
         Args:
@@ -59,17 +71,32 @@ class MemoryService:
         self.config_path = os.path.join(self.memory_home, "config.yaml")
         self.ignore_path = os.path.join(self.memory_home, ".memoryignore")
 
-        # Ensure vault directory exists
-        os.makedirs(self.vault_dir, exist_ok=True)
+        # Read-only inspection must not initialize missing storage.
+        if not read_only:
+            os.makedirs(self.vault_dir, exist_ok=True)
 
         # Load configuration and initialize database
         self.config = load_config(self.config_path)
-        self.db = MemoryDB(self.db_path)
+        self.db = MemoryDB(self.db_path, read_only=read_only)
+        self._closed = False
 
         # Lazy-load embedding provider (expensive operation)
         self._embedding_provider: Optional[EmbeddingProvider] = None
         self._ignore_patterns: Optional[list[str]] = None
         self._vectors_available: Optional[bool] = None
+        self.persistence = CanonicalPersistence(
+            Path(self.memory_home),
+            self.db,
+            self.ignore_patterns,
+        )
+        self.persistence.embed = lambda text: self.embedding_provider.embed(text)
+        if recover_pending and not read_only:
+            self.persistence.startup_recoveries = tuple(
+                self.persistence.recover_pending_operations(())
+            )
+            self.persistence.startup_vector_repairs = (
+                self.persistence.repair_pending_vectors()
+            )
 
     @property
     def embedding_provider(self) -> EmbeddingProvider:
@@ -200,7 +227,12 @@ class MemoryService:
         return warnings
 
     def save(
-        self, raw: RawMemoryInput, project: Optional[str] = None
+        self,
+        raw: RawMemoryInput,
+        project: Optional[str] = None,
+        *,
+        authoritative_source: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
     ) -> dict[str, object]:
         """Save a memory with full pipeline: redact, write markdown, index, embed.
 
@@ -211,148 +243,32 @@ class MemoryService:
         Returns:
             Dictionary with 'id' (memory UUID) and 'file_path' (markdown file path)
         """
-        # Use current directory name as project if not specified
-        project = project or os.path.basename(os.getcwd())
-        today = date.today().isoformat()
-        vault_project_dir = os.path.join(self.vault_dir, project)
-
-        # Ensure project directory exists
-        os.makedirs(vault_project_dir, exist_ok=True)
-
+        project = os.path.basename(os.getcwd()) if project is None else project
         warnings = self._details_warnings(raw)
-
-        # Redact all text fields
-        raw.what = redact(raw.what, self.ignore_patterns)
-        if raw.why:
-            raw.why = redact(raw.why, self.ignore_patterns)
-        if raw.impact:
-            raw.impact = redact(raw.impact, self.ignore_patterns)
-        if raw.details:
-            raw.details = redact(raw.details, self.ignore_patterns)
-
-        # --- Dedup check: look for similar existing memory in same project ---
-        dedup_query = f"{raw.title} {raw.what}"
-        try:
-            candidates = self.db.fts_search(dedup_query, limit=5, project=project)
-        except Exception:
-            candidates = []
-
-        if candidates:
-            # Normalize: divide top score by max score across broader search
-            broad = candidates
-            if len(broad) == 1:
-                # Single result — get unfiltered results for normalization
-                try:
-                    broad = self.db.fts_search(dedup_query, limit=5) or broad
-                except Exception:
-                    pass
-            max_score = max(c["score"] for c in broad) if broad else 0.0
-            top = candidates[0]
-            normalized = top["score"] / max_score if max_score > 0 else 0.0
-            # Also require title similarity (case-insensitive)
-            title_match = raw.title.strip().lower() == top["title"].strip().lower()
-            if normalized >= 0.7 and title_match:
-                # Update existing memory instead of creating duplicate
-                existing_id = top["id"]
-                existing_file_path = top.get("file_path", "")
-
-                merged_tags = self._merge_tags(
-                    json.loads(top["tags"]) if isinstance(top["tags"], str) else (top["tags"] or []),
-                    raw.tags,
-                )
-
-                details_append = None
-                if raw.details:
-                    details_append = f"--- updated {today} ---\n{raw.details}"
-
-                self.db.update_memory(
-                    memory_id=existing_id,
-                    what=raw.what,
-                    why=raw.why,
-                    impact=raw.impact,
-                    tags=merged_tags,
-                    details_append=details_append,
-                    structured_data={
-                        "triggers": raw.triggers, "prerequisites": raw.prerequisites,
-                        "steps": raw.steps, "verification": raw.verification,
-                        "follow_ups": raw.follow_ups, "constraints": raw.constraints,
-                        "alternatives_rejected": raw.alternatives_rejected,
-                        "open_questions": raw.open_questions,
-                    } if any((raw.triggers, raw.prerequisites, raw.steps, raw.verification,
-                              raw.follow_ups, raw.constraints, raw.alternatives_rejected,
-                              raw.open_questions)) else None,
-                    provenance={
-                        "confidence": raw.confidence, "valid_from": raw.valid_from,
-                        "valid_until": raw.valid_until, "commit_sha": raw.commit_sha,
-                        "branch": raw.branch, "links": raw.links,
-                        "last_verified": raw.last_verified,
-                    } if any((raw.confidence is not None, raw.valid_from, raw.valid_until,
-                              raw.commit_sha, raw.branch, raw.links, raw.last_verified)) else None,
-                )
-
-                # Re-embed the updated memory (non-fatal)
-                try:
-                    embed_text = f"{top['title']} {raw.what} {raw.why or ''} {raw.impact or ''} {' '.join(merged_tags)}"
-                    embedding = self.embedding_provider.embed(embed_text)
-                    if self._ensure_vectors(embedding):
-                        # Get rowid for the existing memory
-                        cursor = self.db.conn.cursor()
-                        cursor.execute("SELECT rowid FROM memories WHERE id = ?", (existing_id,))
-                        row = cursor.fetchone()
-                        if row:
-                            self.db.insert_vector(row["rowid"], embedding)
-                except Exception:
-                    pass
-
-                return {
-                    "id": existing_id,
-                    "file_path": existing_file_path,
-                    "action": "updated",
-                    "warnings": warnings,
-                }
-
-        # --- Normal save path: create new memory ---
-        # Create memory object with generated metadata
-        file_path = os.path.join(vault_project_dir, f"{today}-session.md")
-        mem = Memory.from_raw(raw, project=project, file_path=file_path)
-
-        # Write markdown file
-        write_session_memory(vault_project_dir, mem, today, details=raw.details)
-
-        # Insert into database
-        rowid = self.db.insert_memory(mem, details=raw.details)
-
-        # Generate and store embedding
-        embed_text = f"{mem.title} {mem.what} {mem.why or ''} {mem.impact or ''} {' '.join(mem.tags)}"
-        try:
-            embedding = self.embedding_provider.embed(embed_text)
-            if self._ensure_vectors(embedding):
-                self.db.insert_vector(rowid, embedding)
-            else:
-                print(
-                    "Warning: vector dimension mismatch. Memory saved without vector. "
-                    "Run 'memory reindex' to rebuild.",
-                    file=sys.stderr,
-                )
-        except Exception as e:
-            # Embedding failed (provider down, network error, etc.)
-            # Memory is still saved to DB and markdown — just no vector
-            print(
-                f"Warning: embedding failed ({e}). Memory saved without vector.",
-                file=sys.stderr,
-            )
-
-        return {"id": mem.id, "file_path": file_path, "action": "created", "warnings": warnings}
+        request = SaveRequest(
+            raw=raw,
+            project=project,
+            source=(authoritative_source if authoritative_source is not None else raw.source),
+            operation_id=idempotency_key or str(uuid.uuid4()),
+            timestamp=datetime.now(timezone.utc).isoformat(),
+        )
+        result = self.persistence.save(request)
+        vector_warning = result.get("warning")
+        if isinstance(vector_warning, str) and vector_warning not in warnings:
+            warnings.append(vector_warning)
+        return {**result, "warnings": warnings}
 
     def search(
         self,
         query: str,
         limit: int = 5,
-        project: Optional[str] = None,
+        project: ProjectScope | str | None = None,
         source: Optional[str] = None,
         use_vectors: bool = True,
         include_archived: bool = False,
         record_feedback: bool = True,
+        *,
+        embedding_query: str | None = None,
     ) -> list[dict]:
         """Search memories using hybrid FTS + vector search.
 
@@ -386,9 +302,23 @@ class MemoryService:
         # Use tiered search: FTS first, embed only if sparse results
         if self.vectors_available:
             try:
+                provider: EmbeddingProvider | None = self.embedding_provider
+                effective_embedding_query = embedding_query
+                if provider.is_remote:
+                    if not self.config.context.allow_remote_query_embeddings:
+                        provider = None
+                    else:
+                        effective_embedding_query = redact(
+                            (
+                                query
+                                if effective_embedding_query is None
+                                else effective_embedding_query
+                            ),
+                            self.ignore_patterns,
+                        )
                 results = tiered_search(
                     self.db,
-                    self.embedding_provider,
+                    provider,
                     query,
                     limit=limit,
                     project=project,
@@ -396,6 +326,7 @@ class MemoryService:
                     include_archived=include_archived,
                     min_relevance=self.config.context.min_relevance,
                     min_vector_similarity=self.config.context.min_vector_similarity,
+                    embedding_query=effective_embedding_query,
                 )
                 if record_feedback:
                     self.db.record_feedback([r["id"] for r in results])
@@ -441,13 +372,14 @@ class MemoryService:
     def get_context(
         self,
         limit: int = 10,
-        project: Optional[str] = None,
+        project: ProjectScope | str | None = None,
         source: Optional[str] = None,
         query: Optional[str] = None,
         semantic_mode: Optional[str] = None,
         topup_recent: Optional[bool] = None,
         agent: Optional[str] = None,
         token_budget: Optional[int] = None,
+        record_feedback: bool = True,
     ) -> tuple[list[dict], int]:
         """Get memory pointers for context injection.
 
@@ -485,6 +417,7 @@ class MemoryService:
                 source=source,
                 use_vectors=use_vectors,
                 include_archived=False,
+                record_feedback=False,
             )
             if topup_recent and len(results) < limit:
                 # Fill unused space with operationally useful living memory before
@@ -536,7 +469,8 @@ class MemoryService:
             used += estimated
             if len(packed) >= limit:
                 break
-        self.db.record_feedback([r["id"] for r in packed])
+        if record_feedback:
+            self.db.record_feedback([r["id"] for r in packed])
         return packed, total
 
     def context_policy(self, agent: Optional[str] = None) -> dict[str, object]:
@@ -547,7 +481,7 @@ class MemoryService:
         self,
         *,
         query: Optional[str] = None,
-        project: Optional[str] = None,
+        project: ProjectScope | str | None = None,
         category: Optional[str] = None,
         include_archived: bool = False,
         limit: int = 200,
@@ -577,9 +511,20 @@ class MemoryService:
         record = self._get_full_memory(memory_id)
         if not record:
             return None
-        detail = self.get_details(memory_id)
+        detail = self.get_details(memory_id, record_feedback=False)
         record["details"] = detail.body if detail else ""
         return record
+
+    def migrate_vault_metadata(
+        self,
+        *,
+        project: Optional[str] = None,
+        dry_run: bool = False,
+    ) -> dict[str, object]:
+        """Explicitly enrich legacy vault files with per-memory metadata."""
+        from memory.reconcile import migrate_vault_metadata
+
+        return migrate_vault_metadata(self, project=project, dry_run=dry_run)
 
     def get_dashboard_stats(
         self,
@@ -653,65 +598,33 @@ class MemoryService:
         self,
         memory_id: str,
         *,
-        title: str,
-        what: str,
-        why: Optional[str],
-        impact: Optional[str],
-        category: Optional[str],
-        tags: list[str],
-        source: Optional[str],
-        details: Optional[str],
+        patch: Optional[MemoryPatch] = None,
+        actor: Optional[str] = None,
+        title: str | _Unset = UNSET,
+        what: str | _Unset = UNSET,
+        why: Optional[str] | _Unset = UNSET,
+        impact: Optional[str] | _Unset = UNSET,
+        category: Optional[str] | _Unset = UNSET,
+        tags: list[str] | _Unset = UNSET,
+        source: Optional[str] = None,
+        details: Optional[str] | _Unset = UNSET,
     ) -> dict[str, object]:
-        """Update a memory in markdown and SQLite."""
-        record = self._get_full_memory(memory_id)
-        if not record:
-            raise ValueError(f"Unknown memory: {memory_id}")
-
-        document, entry = self._load_document_entry(record)
-        entry.title = redact(title, self.ignore_patterns)
-        entry.what = redact(what, self.ignore_patterns)
-        entry.why = redact(why, self.ignore_patterns) if why else None
-        entry.impact = redact(impact, self.ignore_patterns) if impact else None
-        entry.category = category
-        entry.source = source
-        entry.details = redact(details, self.ignore_patterns) if details else None
-        entry.status = "active"
-        entry.archived_at = None
-        entry.archive_reason = None
-        entry.superseded_by = None
-
-        self._persist_document(
-            record["file_path"],
-            document,
-            tag_overrides={record["id"]: tags},
-            source_overrides={record["id"]: entry.source},
+        """Update a memory through the canonical mutation coordinator."""
+        if patch is None:
+            patch = MemoryPatch(
+                title=title,
+                what=what,
+                why=why,
+                impact=impact,
+                category=category,
+                tags=tags,
+                details=details,
+            )
+        return self.persistence.update(
+            memory_id,
+            patch,
+            actor=actor or source or "dashboard",
         )
-        updated_at = datetime.now(timezone.utc).isoformat()
-        cursor = self.db.conn.cursor()
-        cursor.execute(
-            """
-            UPDATE memories
-            SET title = ?, what = ?, why = ?, impact = ?, category = ?, tags = ?, source = ?,
-                section_anchor = ?, updated_at = ?, status = 'active',
-                archived_at = NULL, archive_reason = NULL, superseded_by = NULL
-            WHERE id = ?
-            """,
-            (
-                entry.title,
-                entry.what,
-                entry.why,
-                entry.impact,
-                entry.category,
-                json.dumps(tags),
-                entry.source,
-                entry.section_anchor,
-                updated_at,
-                record["id"],
-            ),
-        )
-        self._replace_details(record["id"], entry.details)
-        self.db.conn.commit()
-        return {"id": record["id"], "file_path": record["file_path"], "action": "updated"}
 
     def archive_memory(
         self,
@@ -719,111 +632,39 @@ class MemoryService:
         *,
         reason: str = "archived",
         superseded_by: Optional[str] = None,
+        actor: str = "dashboard",
     ) -> dict[str, object]:
-        """Archive a memory in markdown and SQLite."""
-        record = self._get_full_memory(memory_id)
-        if not record:
-            raise ValueError(f"Unknown memory: {memory_id}")
-
-        document, entry = self._load_document_entry(record)
-        entry.status = "archived"
-        entry.archived_at = datetime.now(timezone.utc).isoformat()
-        entry.archive_reason = reason
-        entry.superseded_by = superseded_by
-        self._persist_document(record["file_path"], document)
-
-        cursor = self.db.conn.cursor()
-        cursor.execute(
-            """
-            UPDATE memories
-            SET status = 'archived', archived_at = ?, archive_reason = ?, superseded_by = ?, section_anchor = ?, updated_at = ?
-            WHERE id = ?
-            """,
-            (entry.archived_at, reason, superseded_by, entry.section_anchor, entry.archived_at, record["id"]),
+        return self.persistence.archive(
+            memory_id,
+            reason=reason,
+            superseded_by=superseded_by,
+            actor=actor,
         )
-        self.db.conn.commit()
-        return {"id": record["id"], "file_path": record["file_path"], "action": "archived"}
 
-    def restore_memory(self, memory_id: str) -> dict[str, object]:
+    def restore_memory(
+        self,
+        memory_id: str,
+        *,
+        actor: str = "dashboard",
+    ) -> dict[str, object]:
         """Restore an archived memory."""
-        record = self._get_full_memory(memory_id)
-        if not record:
-            raise ValueError(f"Unknown memory: {memory_id}")
+        return self.persistence.restore(memory_id, actor=actor)
 
-        document, entry = self._load_document_entry(record)
-        entry.status = "active"
-        entry.archived_at = None
-        entry.archive_reason = None
-        entry.superseded_by = None
-        if not entry.category:
-            entry.category = record.get("category")
-        self._persist_document(record["file_path"], document)
-
-        updated_at = datetime.now(timezone.utc).isoformat()
-        cursor = self.db.conn.cursor()
-        cursor.execute(
-            """
-            UPDATE memories
-            SET status = 'active', archived_at = NULL, archive_reason = NULL, superseded_by = NULL,
-                section_anchor = ?, updated_at = ?
-            WHERE id = ?
-            """,
-            (entry.section_anchor, updated_at, record["id"]),
-        )
-        self.db.conn.commit()
-        return {"id": record["id"], "file_path": record["file_path"], "action": "restored"}
-
-    def merge_memories(self, canonical_id: str, source_ids: list[str]) -> dict[str, object]:
+    def merge_memories(
+        self,
+        canonical_id: str,
+        source_ids: list[str],
+        *,
+        actor: str = "dashboard",
+        operation_id: str | None = None,
+    ) -> dict[str, object]:
         """Merge source memories into a canonical memory and archive the sources."""
-        if canonical_id in source_ids:
-            raise ValueError("Canonical memory cannot also be a source memory")
-
-        canonical = self.get_memory_record(canonical_id)
-        if not canonical:
-            raise ValueError(f"Unknown memory: {canonical_id}")
-
-        merged_tags = set(json.loads(canonical["tags"]) if isinstance(canonical["tags"], str) else (canonical["tags"] or []))
-        merged_details_parts = [canonical.get("details", "").strip()]
-
-        for source_id in source_ids:
-            source = self.get_memory_record(source_id)
-            if not source:
-                continue
-            source_tags = json.loads(source["tags"]) if isinstance(source["tags"], str) else (source["tags"] or [])
-            merged_tags.update(source_tags)
-            if not canonical.get("why") and source.get("why"):
-                canonical["why"] = source["why"]
-            if not canonical.get("impact") and source.get("impact"):
-                canonical["impact"] = source["impact"]
-            merged_details_parts.append(
-                "\n".join(
-                    line
-                    for line in [
-                        f"Merged from: {source['title']} ({source['id'][:12]})",
-                        source.get("what", ""),
-                        source.get("details", "").strip(),
-                    ]
-                    if line
-                ).strip()
-            )
-
-        details = "\n\n".join(part for part in merged_details_parts if part)
-        self.update_memory_record(
+        return self.persistence.merge(
             canonical_id,
-            title=canonical["title"],
-            what=canonical["what"],
-            why=canonical.get("why"),
-            impact=canonical.get("impact"),
-            category=canonical.get("category"),
-            tags=sorted(merged_tags),
-            source=canonical.get("source"),
-            details=details,
+            source_ids,
+            actor=actor,
+            operation_id=operation_id,
         )
-
-        for source_id in source_ids:
-            self.archive_memory(source_id, reason="merged", superseded_by=canonical_id)
-
-        return {"id": canonical_id, "merged": len(source_ids), "action": "merged"}
 
     def find_duplicate_candidates(
         self,
@@ -869,7 +710,13 @@ class MemoryService:
         candidates.sort(key=lambda item: item["score"], reverse=True)
         return candidates[:limit]
 
-    def get_details(self, memory_id: str) -> Optional[MemoryDetail]:
+    def get_details(
+        self,
+        memory_id: str,
+        *,
+        project: ProjectScope | str | None = None,
+        record_feedback: bool = True,
+    ) -> Optional[MemoryDetail]:
         """Get full details for a memory by ID.
 
         Args:
@@ -878,9 +725,18 @@ class MemoryService:
         Returns:
             MemoryDetail object if details exist, None otherwise
         """
-        return self.db.get_details(memory_id)
+        projects = None
+        if isinstance(project, ProjectScope):
+            projects = project.storage_keys
+        elif isinstance(project, str):
+            projects = (project,)
+        return self.db.get_details(
+            memory_id,
+            projects=projects,
+            record_feedback=record_feedback,
+        )
 
-    def delete(self, memory_id: str) -> bool:
+    def delete(self, memory_id: str, *, actor: str = "cli") -> bool:
         """Delete a memory by ID or prefix.
 
         Args:
@@ -889,7 +745,11 @@ class MemoryService:
         Returns:
             True if deleted, False if not found
         """
-        return self.db.delete_memory(memory_id)
+        return self.persistence.delete(memory_id, actor=actor)
+
+    def resolve_memory_id(self, memory_id: str) -> str:
+        """Resolve one exact memory ID or unique literal prefix."""
+        return self.persistence.resolve_memory_id(memory_id)
 
     def _normalize_duplicate_text(self, value: str) -> str:
         return re.sub(r"\W+", " ", (value or "").lower()).strip()
@@ -1061,155 +921,13 @@ class MemoryService:
             "model": self.config.embedding.model,
         }
 
-    # ------------------------------------------------------------------
-    # Vault import — parse markdown session files into SQLite index
-    # ------------------------------------------------------------------
-
-    _HEADING_TO_CATEGORY: dict[str, str] = {
-        "Decisions": "decision",
-        "Patterns": "pattern",
-        "Bugs Fixed": "bug",
-        "Context": "context",
-        "Learnings": "learning",
-        "Archived": "__archived__",
-    }
-
-    @staticmethod
-    def _normalize_markdown_content(content: str) -> str:
-        """Normalize markdown text for line-oriented parsing."""
-        return content.lstrip("\ufeff").replace("\r\n", "\n").replace("\r", "\n")
-
-    @staticmethod
-    def _make_section_anchor(title: str, occurrence: int = 1) -> str:
-        """Create a stable section anchor, suffixing repeated titles."""
-        base = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-") or "memory"
-        if occurrence <= 1:
-            return base
-        return f"{base}-{occurrence}"
-
-    @staticmethod
-    def _parse_frontmatter(content: str) -> dict:
-        """Extract simple key-value frontmatter from ``---`` fenced block."""
-        fm: dict = {}
-        normalized = MemoryService._normalize_markdown_content(content)
-        if not normalized.startswith("---\n"):
-            return fm
-        parts = normalized.split("---\n", 2)
-        if len(parts) < 3:
-            return fm
-        for line in parts[1].strip().split("\n"):
-            if ":" not in line:
-                continue
-            key, val = line.split(":", 1)
-            key = key.strip()
-            val = val.strip()
-            if val.startswith("[") and val.endswith("]"):
-                val = [v.strip() for v in val[1:-1].split(",") if v.strip()]
-            fm[key] = val
-        return fm
-
-    @classmethod
-    def _parse_memories_from_md(cls, filepath: str, project: str) -> list[dict]:
-        """Parse H3 sections from a vault session markdown file.
-
-        Each ``### Title`` followed by ``**What:** …`` (and optional
-        ``**Why:**``, ``**Impact:**``, ``**Source:**``, ``<details>``)
-        becomes one memory dict.
-        """
-        content = cls._normalize_markdown_content(read_markdown_text(Path(filepath)))
-        fm = cls._parse_frontmatter(content)
-
-        date_match = re.match(r"(\d{4}-\d{2}-\d{2})", Path(filepath).stem)
-        date_str = date_match.group(1) if date_match else date.today().isoformat()
-
-        memories: list[dict] = []
-        current_category: Optional[str] = None
-        anchor_counts: dict[str, int] = {}
-        current_status = "active"
-
-        lines = content.split("\n")
-        i = 0
-        while i < len(lines):
-            line = lines[i]
-
-            if line.startswith("## "):
-                heading = line[3:].strip()
-                current_category = cls._HEADING_TO_CATEGORY.get(heading)
-                current_status = "archived" if current_category == "__archived__" else "active"
-
-            if line.startswith("### "):
-                title = line[4:].strip()
-                what: Optional[str] = None
-                why: Optional[str] = None
-                impact: Optional[str] = None
-                source: Optional[str] = None
-                living_data: dict = {}
-                details_lines: list[str] = []
-                in_details = False
-
-                i += 1
-                while i < len(lines) and not lines[i].startswith("### ") and not lines[i].startswith("## "):
-                    stripped = lines[i].strip()
-
-                    if stripped == "<details>":
-                        in_details = True
-                        i += 1
-                        continue
-                    if stripped == "</details>":
-                        in_details = False
-                        i += 1
-                        continue
-                    if in_details:
-                        details_lines.append(lines[i])
-                        i += 1
-                        continue
-
-                    if stripped.startswith("**What:**"):
-                        what = stripped[len("**What:**"):].strip()
-                    elif stripped.startswith("**Why:**"):
-                        why = stripped[len("**Why:**"):].strip()
-                    elif stripped.startswith("**Impact:**"):
-                        impact = stripped[len("**Impact:**"):].strip()
-                    elif stripped.startswith("**Source:**"):
-                        source = stripped[len("**Source:**"):].strip()
-                    elif stripped.startswith("**Living Memory:**"):
-                        try:
-                            living_data = json.loads(stripped[len("**Living Memory:**"):].strip())
-                        except json.JSONDecodeError:
-                            living_data = {}
-
-                    i += 1
-
-                if title and what and current_status != "archived":
-                    base_anchor = cls._make_section_anchor(title)
-                    occurrence = anchor_counts.get(base_anchor, 0) + 1
-                    anchor_counts[base_anchor] = occurrence
-                    fm_tags = fm.get("tags", [])
-                    memories.append({
-                        "title": title,
-                        "what": what,
-                        "why": why,
-                        "impact": impact,
-                        "source": source,
-                        "category": current_category,
-                        "project": project,
-                        "tags": fm_tags if isinstance(fm_tags, list) else [],
-                        "date": date_str,
-                        "file_path": filepath,
-                        "section_anchor": cls._make_section_anchor(title, occurrence),
-                        "details": "\n".join(details_lines).strip() or None,
-                        "living_data": living_data,
-                    })
-                continue
-
-            i += 1
-
-        return memories
-
     def import_from_vault(
         self,
         dry_run: bool = False,
         progress_callback=None,
+        *,
+        reconcile: bool = False,
+        project: str | None = None,
     ) -> dict:
         """Scan vault/ markdown files and import memories missing from SQLite.
 
@@ -1228,6 +946,15 @@ class MemoryService:
             Dict with ``imported`` (int), ``skipped`` (int), ``projects``
             (list of project names that had new imports).
         """
+        if reconcile:
+            if dry_run:
+                raise ValueError("Reconciliation cannot be combined with dry-run")
+            from memory.reconcile import reconcile_vault
+
+            return reconcile_vault(self, project=project)
+        if project is not None:
+            raise ValueError("Project selection requires reconciliation")
+
         if not os.path.isdir(self.vault_dir):
             return {"imported": 0, "skipped": 0, "projects": []}
 
@@ -1238,7 +965,7 @@ class MemoryService:
             (
                 row[0],
                 row[1],
-                row[2] or self._make_section_anchor(row[3]),
+                row[2] or make_section_anchor(row[3]),
             )
             for row in cursor.fetchall()
         }
@@ -1254,7 +981,56 @@ class MemoryService:
             project = project_dir.name
 
             for md_file in sorted(project_dir.glob("*.md")):
-                parsed = self._parse_memories_from_md(str(md_file), project)
+                document = parse_session_file(md_file)
+                if document.schema_version == 2:
+                    active_entries = [
+                        entry
+                        for entry in document.entries
+                        if entry.title and entry.what and entry.status != "archived"
+                    ]
+                    missing_ids = [
+                        entry.id
+                        for entry in active_entries
+                        if not isinstance(entry.id, str)
+                        or self.db.get_memory(entry.id) is None
+                    ]
+                    if missing_ids:
+                        raise ValueError(
+                            "Schema-v2 canonical Markdown requires "
+                            "import_from_vault(reconcile=True) or "
+                            "'memory import --reconcile'"
+                        )
+                    skipped += len(active_entries)
+                    for entry in active_entries:
+                        if progress_callback:
+                            progress_callback(
+                                imported,
+                                skipped,
+                                project,
+                                entry.title,
+                            )
+                    continue
+                parsed = [
+                    {
+                        "title": entry.title,
+                        "what": entry.what,
+                        "why": entry.why,
+                        "impact": entry.impact,
+                        "source": entry.source,
+                        "category": entry.category,
+                        "project": project,
+                        "tags": list(document.tags),
+                        "file_path": str(md_file),
+                        "section_anchor": (
+                            entry.section_anchor
+                            or make_section_anchor(entry.title)
+                        ),
+                        "details": entry.details,
+                        "living_data": dict(entry.living_data),
+                    }
+                    for entry in document.entries
+                    if entry.title and entry.what and entry.status != "archived"
+                ]
 
                 for mem_data in parsed:
                     key = (
@@ -1309,6 +1085,15 @@ class MemoryService:
             "projects": sorted(touched_projects),
         }
 
+    def doctor(self, project: str | None = None) -> dict:
+        """Return read-only health and canonical-drift diagnostics."""
+        from memory.health import doctor
+
+        return doctor(self, project)
+
     def close(self) -> None:
-        """Close database connection and clean up resources."""
+        """Close owned resources once; safe from every cleanup path."""
+        if self._closed:
+            return
         self.db.close()
+        self._closed = True

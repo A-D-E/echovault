@@ -1,0 +1,10 @@
+{
+  "name": "echovault",
+  "displayName": "EchoVault",
+  "version": "{{VERSION}}",
+  "description": "Local-first curated memory for coding agents",
+  "license": "MIT",
+  "skills": "./skills/",
+  "rules": "./rules/",
+  "mcpServers": "mcp.json"
+}

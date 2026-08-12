@@ -2,6 +2,8 @@ from abc import ABC, abstractmethod
 
 
 class EmbeddingProvider(ABC):
+    is_remote = False
+
     @abstractmethod
     def embed(self, text: str) -> list[float]:
         ...

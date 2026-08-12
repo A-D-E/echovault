@@ -6,6 +6,5 @@ build/
 .pytest_cache/
 *.pyc
 models/
-docs/
 target/
 .DS_Store

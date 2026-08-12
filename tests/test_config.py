@@ -30,6 +30,28 @@ def test_default_config_has_correct_defaults():
     assert config.context.token_budget == 1200
     assert config.context.min_relevance == 0.7
     assert config.context.min_vector_similarity == 0.05
+    assert config.context.allow_remote_query_embeddings is False
+
+
+def test_load_config_allows_remote_query_embeddings_only_by_explicit_boolean(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "context:\n  allow_remote_query_embeddings: true\n",
+        encoding="utf-8",
+    )
+    assert load_config(
+        str(config_path)
+    ).context.allow_remote_query_embeddings is True
+
+    config_path.write_text(
+        "context:\n  allow_remote_query_embeddings: 'true'\n",
+        encoding="utf-8",
+    )
+    assert load_config(
+        str(config_path)
+    ).context.allow_remote_query_embeddings is False
 
 
 def test_context_policy_precedence(monkeypatch):
@@ -130,9 +152,9 @@ def test_get_memory_home_defaults_to_home_directory():
             os.environ["MEMORY_HOME"] = old_value
 
 
-def test_get_memory_home_respects_env_var():
+def test_get_memory_home_respects_env_var(tmp_path):
     """Test that get_memory_home respects MEMORY_HOME env var."""
-    custom_path = "/custom/memory/path"
+    custom_path = str(tmp_path / "custom" / "memory" / "path")
     old_value = os.environ.get("MEMORY_HOME")
 
     try:

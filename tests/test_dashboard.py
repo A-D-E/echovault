@@ -8,6 +8,7 @@ import pytest
 from memory.core import MemoryService
 from memory.markdown import parse_session_file
 from memory.models import RawMemoryInput
+from memory.persistence import MemoryPatch
 
 
 @pytest.fixture
@@ -53,27 +54,36 @@ def test_update_archive_restore_and_merge_roundtrip(dashboard_service):
 
     dashboard_service.update_memory_record(
         auth_fix["id"],
-        title="Auth timeout regression",
-        what="Fixed the auth timeout regression thoroughly",
-        why="Sessions expired too early",
-        impact="Stability improved",
-        category="bug",
-        tags=["auth", "bug", "dashboard"],
-        source="dashboard",
-        details="Updated dashboard details",
+        patch=MemoryPatch(
+            title="Auth timeout regression",
+            what="Fixed the auth timeout regression thoroughly",
+            why="Sessions expired too early",
+            impact="Stability improved",
+            category="bug",
+            tags=["auth", "bug", "dashboard"],
+            details="Updated dashboard details",
+        ),
+        actor="dashboard",
     )
 
     updated = dashboard_service.get_memory_record(auth_fix["id"])
     assert updated is not None
     assert updated["title"] == "Auth timeout regression"
     assert "Updated dashboard details" in updated["details"]
+    assert updated["source"] == "codex"
+    assert updated["creator_source"] == "codex"
+    assert updated["last_updated_by"] == "dashboard"
 
     session_path = Path(updated["file_path"])
     content = session_path.read_text(encoding="utf-8")
     assert "<!-- memory-id:" in content
     assert "### Auth timeout regression" in content
 
-    dashboard_service.archive_memory(follow_up["id"], reason="dashboard-test", superseded_by=auth_fix["id"])
+    dashboard_service.archive_memory(
+        follow_up["id"],
+        reason="dashboard-test",
+        actor="dashboard",
+    )
     active_ids = {record["id"] for record in dashboard_service.list_memories(project="dashboard-project")}
     assert follow_up["id"] not in active_ids
 
@@ -83,12 +93,16 @@ def test_update_archive_restore_and_merge_roundtrip(dashboard_service):
     document = parse_session_file(archived["file_path"])
     assert any(entry.id == follow_up["id"] and entry.status == "archived" for entry in document.entries)
 
-    dashboard_service.restore_memory(follow_up["id"])
+    dashboard_service.restore_memory(follow_up["id"], actor="dashboard")
     restored = dashboard_service.get_memory_record(follow_up["id"])
     assert restored is not None
     assert restored["status"] == "active"
 
-    dashboard_service.merge_memories(auth_fix["id"], [follow_up["id"]])
+    dashboard_service.merge_memories(
+        auth_fix["id"],
+        [follow_up["id"]],
+        actor="dashboard",
+    )
     merged = dashboard_service.get_memory_record(auth_fix["id"])
     archived_follow_up = dashboard_service.get_memory_record(follow_up["id"])
 

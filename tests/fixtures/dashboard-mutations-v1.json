@@ -1,0 +1,8 @@
+[
+  {"name":"create","request":{"action":"create","title":"Golden create","what":"created through canonical bridge","why":null,"impact":null,"category":"decision","tags":["golden"],"source":"dashboard","project":"golden--111111111111","details":"Golden details","actor":"dashboard"}},
+  {"name":"update","request":{"action":"update","memory_id":"11111111-1111-4111-8111-111111111111","title":"Golden update","what":"updated through canonical bridge","why":null,"impact":null,"category":"decision","tags":["golden","updated"],"details":null,"actor":"dashboard"}},
+  {"name":"archive","request":{"action":"archive","memory_id":"11111111-1111-4111-8111-111111111111","reason":"golden archive","actor":"dashboard"}},
+  {"name":"restore","request":{"action":"restore","memory_id":"11111111-1111-4111-8111-111111111111","actor":"dashboard"}},
+  {"name":"merge","request":{"action":"merge","canonical_id":"11111111-1111-4111-8111-111111111111","source_ids":["22222222-2222-4222-8222-222222222222"],"actor":"dashboard"}},
+  {"name":"delete","request":{"action":"delete","memory_id":"22222222-2222-4222-8222-222222222222","actor":"dashboard"}}
+]
